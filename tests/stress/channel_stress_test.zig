@@ -1,40 +1,72 @@
-//! Stress tests for concurrent patterns
+//! Stress tests for blitz_io.Channel
 //!
-//! Tests high throughput concurrent operations using Scope.
+//! Tests the bounded MPSC channel under high contention scenarios.
 
 const std = @import("std");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
 const Scope = blitz_io.Scope;
+const Channel = blitz_io.Channel;
 
-test "Concurrent stress - high throughput atomic counter" {
+test "Channel stress - single producer single consumer" {
     const allocator = testing.allocator;
+
+    var channel = try Channel(u64).init(allocator, 64);
+    defer channel.deinit();
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var counter = std.atomic.Value(u64).init(0);
+    const num_items = 10000;
+    var sum_sent: u64 = 0;
+    var sum_received: u64 = 0;
 
-    const num_tasks = 100;
-    const increments_per_task = 100;
+    // Producer
+    try scope.spawnWithResult(singleProducer, .{ &channel, num_items }, &sum_sent);
 
-    for (0..num_tasks) |_| {
-        try scope.spawn(multiIncrement, .{ &counter, increments_per_task });
-    }
+    // Consumer
+    try scope.spawnWithResult(singleConsumer, .{ &channel, num_items }, &sum_received);
 
     try scope.wait();
 
-    try testing.expectEqual(@as(u64, num_tasks * increments_per_task), counter.load(.acquire));
+    try testing.expectEqual(sum_sent, sum_received);
 }
 
-fn multiIncrement(counter: *std.atomic.Value(u64), count: usize) void {
-    for (0..count) |_| {
-        _ = counter.fetchAdd(1, .acq_rel);
+fn singleProducer(channel: *Channel(u64), count: usize) u64 {
+    var sum: u64 = 0;
+    for (0..count) |i| {
+        const value: u64 = @intCast(i + 1);
+        // Spin until send succeeds
+        while (channel.trySend(value) != .ok) {
+            std.atomic.spinLoopHint();
+        }
+        sum += value;
     }
+    return sum;
 }
 
-test "Concurrent stress - multiple producers single consumer" {
+fn singleConsumer(channel: *Channel(u64), count: usize) u64 {
+    var sum: u64 = 0;
+    var received: usize = 0;
+    while (received < count) {
+        switch (channel.tryRecv()) {
+            .value => |value| {
+                sum += value;
+                received += 1;
+            },
+            .empty, .closed => {
+                std.atomic.spinLoopHint();
+            },
+        }
+    }
+    return sum;
+}
+
+test "Channel stress - multiple producers single consumer" {
     const allocator = testing.allocator;
+
+    var channel = try Channel(u64).init(allocator, 128);
+    defer channel.deinit();
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
@@ -42,115 +74,261 @@ test "Concurrent stress - multiple producers single consumer" {
     const num_producers = 10;
     const items_per_producer = 1000;
 
-    // Ring buffer for MPSC pattern
-    var buffer: [10000]u64 = undefined;
-    var write_pos = std.atomic.Value(usize).init(0);
-    var read_pos = std.atomic.Value(usize).init(0);
-    var items_written = std.atomic.Value(usize).init(0);
+    var producer_sums: [num_producers]u64 = undefined;
+    var consumer_sum: u64 = 0;
 
     // Spawn producers
-    for (0..num_producers) |producer_id| {
-        try scope.spawn(ringProducer, .{
-            &buffer,
-            &write_pos,
-            &items_written,
-            items_per_producer,
-            producer_id,
-        });
+    for (0..num_producers) |i| {
+        try scope.spawnWithResult(
+            multiProducer,
+            .{ &channel, items_per_producer, @as(u64, @intCast(i)) },
+            &producer_sums[i],
+        );
     }
 
-    var sum: u64 = 0;
-    try scope.spawnWithResult(ringConsumer, .{
-        &buffer,
-        &read_pos,
-        &items_written,
-        num_producers * items_per_producer,
-    }, &sum);
+    // Consumer
+    try scope.spawnWithResult(
+        singleConsumer,
+        .{ &channel, num_producers * items_per_producer },
+        &consumer_sum,
+    );
 
     try scope.wait();
 
-    // Each producer sends values 1..items_per_producer (summing to n*(n+1)/2)
-    // multiplied by (producer_id + 1)
-    // Actually, just verify we got something reasonable
-    try testing.expect(sum > 0);
-}
-
-fn ringProducer(
-    buffer: *[10000]u64,
-    write_pos: *std.atomic.Value(usize),
-    items_written: *std.atomic.Value(usize),
-    count: usize,
-    producer_id: usize,
-) void {
-    for (1..count + 1) |i| {
-        const pos = write_pos.fetchAdd(1, .acq_rel) % buffer.len;
-        buffer[pos] = @intCast(i * (producer_id + 1));
-        _ = items_written.fetchAdd(1, .release);
+    var expected_sum: u64 = 0;
+    for (producer_sums) |s| {
+        expected_sum += s;
     }
+
+    try testing.expectEqual(expected_sum, consumer_sum);
 }
 
-fn ringConsumer(
-    buffer: *[10000]u64,
-    read_pos: *std.atomic.Value(usize),
-    items_written: *std.atomic.Value(usize),
-    expected_items: usize,
-) u64 {
+fn multiProducer(channel: *Channel(u64), count: usize, producer_id: u64) u64 {
     var sum: u64 = 0;
-    var consumed: usize = 0;
-
-    while (consumed < expected_items) {
-        // Spin until item available
-        while (items_written.load(.acquire) <= consumed) {
-            std.Thread.yield() catch {};
+    for (0..count) |i| {
+        // Encode producer ID and sequence number
+        const value: u64 = producer_id * 1000000 + @as(u64, @intCast(i + 1));
+        while (channel.trySend(value) != .ok) {
+            std.atomic.spinLoopHint();
         }
-
-        const pos = read_pos.fetchAdd(1, .acq_rel) % buffer.len;
-        sum += buffer[pos];
-        consumed += 1;
+        sum += value;
     }
-
     return sum;
 }
 
-test "Concurrent stress - fan out fan in" {
+test "Channel stress - small buffer high contention" {
     const allocator = testing.allocator;
+
+    // Small buffer = high contention
+    var channel = try Channel(u32).init(allocator, 4);
+    defer channel.deinit();
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    // Fan out: spawn many tasks that do work
-    // Fan in: collect all results
+    const num_producers = 5;
+    const items_per_producer = 500;
 
-    var results: [50]u64 = undefined;
-    for (results[0..], 0..) |*r, i| {
-        try scope.spawnWithResult(fanOutWork, .{@as(u32, @intCast(i))}, r);
+    var sent_count = std.atomic.Value(usize).init(0);
+    var received_count = std.atomic.Value(usize).init(0);
+
+    // Spawn producers
+    for (0..num_producers) |_| {
+        try scope.spawn(countingProducer, .{ &channel, items_per_producer, &sent_count });
     }
+
+    // Consumer
+    try scope.spawn(countingConsumer, .{
+        &channel,
+        num_producers * items_per_producer,
+        &received_count,
+    });
 
     try scope.wait();
 
-    // Verify all results
-    var total: u64 = 0;
-    for (results, 0..) |r, i| {
-        // Each task returns i^2 + i
-        const expected: u64 = @as(u64, i) * @as(u64, i) + @as(u64, i);
-        try testing.expectEqual(expected, r);
-        total += r;
-    }
-
-    // Sum of i^2 + i for i = 0..49
-    // = sum(i^2) + sum(i)
-    // = n(n-1)(2n-1)/6 + n(n-1)/2 for n=50
-    // = 49*50*99/6 + 49*50/2
-    // = 40425 + 1225 = 41650
-    try testing.expectEqual(@as(u64, 41650), total);
+    try testing.expectEqual(@as(usize, num_producers * items_per_producer), sent_count.load(.acquire));
+    try testing.expectEqual(@as(usize, num_producers * items_per_producer), received_count.load(.acquire));
 }
 
-fn fanOutWork(id: u32) u64 {
-    // Simulate some work
-    var result: u64 = 0;
-    for (0..100) |_| {
-        result +%= @as(u64, id);
+fn countingProducer(channel: *Channel(u32), count: usize, sent: *std.atomic.Value(usize)) void {
+    for (0..count) |i| {
+        while (channel.trySend(@intCast(i)) != .ok) {
+            std.atomic.spinLoopHint();
+        }
+        _ = sent.fetchAdd(1, .acq_rel);
     }
-    // Return id^2 + id
-    return @as(u64, id) * @as(u64, id) + @as(u64, id);
+}
+
+fn countingConsumer(channel: *Channel(u32), expected: usize, received: *std.atomic.Value(usize)) void {
+    var count: usize = 0;
+    while (count < expected) {
+        switch (channel.tryRecv()) {
+            .value => |_| {
+                count += 1;
+                _ = received.fetchAdd(1, .acq_rel);
+            },
+            .empty, .closed => {
+                std.atomic.spinLoopHint();
+            },
+        }
+    }
+}
+
+test "Channel stress - close while sending" {
+    const allocator = testing.allocator;
+
+    var channel = try Channel(u32).init(allocator, 16);
+    defer channel.deinit();
+
+    var scope = Scope.init(allocator);
+    defer scope.deinit();
+
+    var sends_before_close = std.atomic.Value(usize).init(0);
+    var close_detected = std.atomic.Value(bool).init(false);
+
+    // Producer that sends until channel is closed
+    try scope.spawn(sendUntilClosed, .{ &channel, &sends_before_close, &close_detected });
+
+    // Let producer send some items
+    while (sends_before_close.load(.acquire) < 10) {
+        std.atomic.spinLoopHint();
+    }
+
+    // Close the channel
+    channel.close();
+
+    try scope.wait();
+
+    // Producer should have detected the close
+    try testing.expect(close_detected.load(.acquire));
+}
+
+fn sendUntilClosed(
+    channel: *Channel(u32),
+    sends: *std.atomic.Value(usize),
+    detected_close: *std.atomic.Value(bool),
+) void {
+    var i: u32 = 0;
+    while (true) {
+        const result = channel.trySend(i);
+        switch (result) {
+            .ok => {
+                _ = sends.fetchAdd(1, .acq_rel);
+                i += 1;
+            },
+            .full => {
+                std.atomic.spinLoopHint();
+            },
+            .closed => {
+                detected_close.store(true, .release);
+                break;
+            },
+        }
+    }
+}
+
+test "Channel stress - close while receiving" {
+    const allocator = testing.allocator;
+
+    var channel = try Channel(u32).init(allocator, 16);
+    defer channel.deinit();
+
+    var scope = Scope.init(allocator);
+    defer scope.deinit();
+
+    // Send some items
+    for (0..10) |i| {
+        try testing.expect(channel.trySend(@intCast(i)) == .ok);
+    }
+
+    // Close channel
+    channel.close();
+
+    var result: struct { usize, bool } = .{ 0, false };
+
+    // Receive all items and detect close
+    try scope.spawnWithResult(recvUntilClosed, .{&channel}, &result);
+
+    try scope.wait();
+
+    // Should have received all items before close
+    try testing.expectEqual(@as(usize, 10), result[0]);
+}
+
+fn recvUntilClosed(channel: *Channel(u32)) struct { usize, bool } {
+    var count: usize = 0;
+    while (true) {
+        switch (channel.tryRecv()) {
+            .value => |_| {
+                count += 1;
+            },
+            .empty => {
+                if (channel.isClosed()) {
+                    return .{ count, true };
+                }
+                std.atomic.spinLoopHint();
+            },
+            .closed => {
+                return .{ count, true };
+            },
+        }
+    }
+}
+
+test "Channel stress - throughput" {
+    const allocator = testing.allocator;
+
+    var channel = try Channel(u64).init(allocator, 256);
+    defer channel.deinit();
+
+    var scope = Scope.init(allocator);
+    defer scope.deinit();
+
+    const num_items = 100000;
+    var checksum_sent: u64 = 0;
+    var checksum_recv: u64 = 0;
+
+    // Producer
+    try scope.spawnWithResult(checksumProducer, .{ &channel, num_items }, &checksum_sent);
+
+    // Consumer
+    try scope.spawnWithResult(checksumConsumer, .{ &channel, num_items }, &checksum_recv);
+
+    try scope.wait();
+
+    // Verify data integrity
+    try testing.expectEqual(checksum_sent, checksum_recv);
+}
+
+fn checksumProducer(channel: *Channel(u64), count: usize) u64 {
+    var checksum: u64 = 0;
+    var prng = std.Random.DefaultPrng.init(12345);
+    const random = prng.random();
+
+    for (0..count) |_| {
+        const value = random.int(u64);
+        while (channel.trySend(value) != .ok) {
+            std.atomic.spinLoopHint();
+        }
+        checksum ^= value;
+    }
+    return checksum;
+}
+
+fn checksumConsumer(channel: *Channel(u64), count: usize) u64 {
+    var checksum: u64 = 0;
+    var received: usize = 0;
+
+    while (received < count) {
+        switch (channel.tryRecv()) {
+            .value => |value| {
+                checksum ^= value;
+                received += 1;
+            },
+            .empty, .closed => {
+                std.atomic.spinLoopHint();
+            },
+        }
+    }
+    return checksum;
 }

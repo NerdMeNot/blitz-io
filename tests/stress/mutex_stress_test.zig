@@ -1,22 +1,22 @@
-//! Stress tests for Mutex
+//! Stress tests for blitz_io.Mutex
 //!
-//! High-contention scenarios to verify correctness under load.
+//! Tests the async-aware mutex under high contention scenarios.
+//! Uses tryLock/unlock for synchronous stress testing.
 
 const std = @import("std");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
 const Scope = blitz_io.Scope;
+const Mutex = blitz_io.Mutex;
+const MutexWaiter = blitz_io.sync.MutexWaiter;
 
-// Use std.Thread.Mutex for stress testing since blitz_io.Mutex has waiter-based API
-const Mutex = std.Thread.Mutex;
-
-test "Mutex stress - many threads contending" {
+test "Mutex stress - many threads contending with tryLock" {
     const allocator = testing.allocator;
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var mutex = Mutex{};
+    var mutex = Mutex.init();
     var counter: usize = 0;
 
     const num_tasks = 100;
@@ -33,19 +33,22 @@ test "Mutex stress - many threads contending" {
 
 fn mutexIncrementer(mutex: *Mutex, counter: *usize, count: usize) void {
     for (0..count) |_| {
-        mutex.lock();
+        // Spin until we acquire the lock
+        while (!mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
         counter.* += 1;
         mutex.unlock();
     }
 }
 
-test "Mutex stress - lock/unlock rapid cycles" {
+test "Mutex stress - rapid lock/unlock cycles" {
     const allocator = testing.allocator;
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var mutex = Mutex{};
+    var mutex = Mutex.init();
     var total_locks = std.atomic.Value(usize).init(0);
 
     const num_tasks = 10;
@@ -62,19 +65,21 @@ test "Mutex stress - lock/unlock rapid cycles" {
 
 fn rapidLockUnlock(mutex: *Mutex, counter: *std.atomic.Value(usize), count: usize) void {
     for (0..count) |_| {
-        mutex.lock();
+        while (!mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
         _ = counter.fetchAdd(1, .acq_rel);
         mutex.unlock();
     }
 }
 
-test "Mutex stress - tryLock under contention" {
+test "Mutex stress - tryLock contention statistics" {
     const allocator = testing.allocator;
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var mutex = Mutex{};
+    var mutex = Mutex.init();
     var successes = std.atomic.Value(usize).init(0);
     var failures = std.atomic.Value(usize).init(0);
 
@@ -87,10 +92,10 @@ test "Mutex stress - tryLock under contention" {
 
     try scope.wait();
 
-    // Should have some successes and some failures
     const total_successes = successes.load(.acquire);
     const total_failures = failures.load(.acquire);
 
+    // Should have some successes and some failures under contention
     try testing.expect(total_successes > 0);
     try testing.expectEqual(@as(usize, num_tasks * attempts_per_task), total_successes + total_failures);
 }
@@ -119,31 +124,32 @@ test "Mutex stress - fairness (no starvation)" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var mutex = Mutex{};
+    var mutex = Mutex.init();
     const num_tasks = 10;
     var lock_counts: [num_tasks]std.atomic.Value(usize) = undefined;
     for (&lock_counts) |*c| {
         c.* = std.atomic.Value(usize).init(0);
     }
 
-    const total_locks = 1000;
+    const locks_per_task = 100;
 
     for (0..num_tasks) |i| {
-        try scope.spawn(fairnessWorker, .{ &mutex, &lock_counts[i], total_locks / num_tasks });
+        try scope.spawn(fairnessWorker, .{ &mutex, &lock_counts[i], locks_per_task });
     }
 
     try scope.wait();
 
-    // Each thread should have gotten some locks
-    // (not a strict fairness guarantee, but shouldn't be 0)
+    // Each thread should have gotten its locks (not starvation test, just completion)
     for (lock_counts) |c| {
-        try testing.expect(c.load(.acquire) > 0);
+        try testing.expectEqual(@as(usize, locks_per_task), c.load(.acquire));
     }
 }
 
 fn fairnessWorker(mutex: *Mutex, my_count: *std.atomic.Value(usize), target: usize) void {
     for (0..target) |_| {
-        mutex.lock();
+        while (!mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
         _ = my_count.fetchAdd(1, .acq_rel);
         mutex.unlock();
     }
@@ -155,7 +161,7 @@ test "Mutex stress - long critical section" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var mutex = Mutex{};
+    var mutex = Mutex.init();
     var value: u64 = 0;
 
     const num_tasks = 10;
@@ -171,11 +177,75 @@ test "Mutex stress - long critical section" {
 }
 
 fn longCriticalSection(mutex: *Mutex, value: *u64) void {
-    mutex.lock();
+    while (!mutex.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
     defer mutex.unlock();
 
     // Long critical section - do work while holding lock
     for (0..1000) |_| {
         value.* += 1;
     }
+}
+
+test "Mutex stress - waiter-based acquisition" {
+    const allocator = testing.allocator;
+
+    var scope = Scope.init(allocator);
+    defer scope.deinit();
+
+    var mutex = Mutex.init();
+    var counter: usize = 0;
+
+    const num_tasks = 50;
+    const increments_per_task = 20;
+
+    for (0..num_tasks) |_| {
+        try scope.spawn(waiterBasedIncrement, .{ &mutex, &counter, increments_per_task });
+    }
+
+    try scope.wait();
+
+    try testing.expectEqual(@as(usize, num_tasks * increments_per_task), counter);
+}
+
+fn waiterBasedIncrement(mutex: *Mutex, counter: *usize, count: usize) void {
+    for (0..count) |_| {
+        var waiter = MutexWaiter.init();
+
+        if (!mutex.lock(&waiter)) {
+            // Wait for lock to be granted via polling
+            while (!waiter.isAcquired()) {
+                std.atomic.spinLoopHint();
+            }
+        }
+
+        counter.* += 1;
+        mutex.unlock();
+    }
+}
+
+test "Mutex stress - mixed tryLock and waiter acquisition" {
+    const allocator = testing.allocator;
+
+    var scope = Scope.init(allocator);
+    defer scope.deinit();
+
+    var mutex = Mutex.init();
+    var counter: usize = 0;
+
+    const num_tasks = 40;
+    const increments_per_task = 50;
+
+    // Half use tryLock, half use waiter
+    for (0..num_tasks / 2) |_| {
+        try scope.spawn(mutexIncrementer, .{ &mutex, &counter, increments_per_task });
+    }
+    for (0..num_tasks / 2) |_| {
+        try scope.spawn(waiterBasedIncrement, .{ &mutex, &counter, increments_per_task });
+    }
+
+    try scope.wait();
+
+    try testing.expectEqual(@as(usize, num_tasks * increments_per_task), counter);
 }
