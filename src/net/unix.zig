@@ -67,6 +67,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Unix domain sockets are not available on Windows
+comptime {
+    if (builtin.os.tag == .windows) {
+        @compileError("Unix domain sockets are not supported on Windows. Use TCP sockets or named pipes instead.");
+    }
+}
+
 // Re-export all types
 pub const stream = @import("unix/stream.zig");
 pub const listener = @import("unix/listener.zig");

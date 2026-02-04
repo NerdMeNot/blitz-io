@@ -42,6 +42,9 @@ pub const Duration = struct {
         return .{ .nanos = n *| std.time.ns_per_s };
     }
 
+    /// Alias for fromSecs (more readable).
+    pub const fromSeconds = fromSecs;
+
     /// Create duration from minutes.
     pub fn fromMins(n: u64) Duration {
         return .{ .nanos = n *| (60 * std.time.ns_per_s) };

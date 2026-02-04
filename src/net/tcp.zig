@@ -24,7 +24,7 @@
 //! ```zig
 //! var socket = try TcpSocket.newV4();
 //! try socket.setRecvBufferSize(65536);
-//! try socket.setKeepalive(.{ .time = Duration.fromSeconds(60) });
+//! try socket.setKeepalive(.{ .time = Duration.fromSecs(60) });
 //!
 //! var stream = try socket.connect(addr);
 //! defer stream.close();
@@ -63,7 +63,7 @@ const IoDriver = @import("../io_driver.zig").IoDriver;
 /// var socket = try TcpSocket.newV4();
 /// try socket.setReuseAddr(true);
 /// try socket.setRecvBufferSize(65536);
-/// try socket.setKeepalive(.{ .time = Duration.fromSeconds(60) });
+/// try socket.setKeepalive(.{ .time = Duration.fromSecs(60) });
 ///
 /// // Connect consumes the socket
 /// var stream = try socket.connect(addr);
@@ -187,20 +187,20 @@ pub const TcpSocket = struct {
         const enabled = try getBoolOption(self.fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE);
         if (!enabled) return null;
 
-        var ka = Keepalive{ .time = Duration.fromSeconds(0) };
+        var ka = Keepalive{ .time = Duration.fromSecs(0) };
 
         if (comptime builtin.os.tag == .linux) {
             const idle = try getIntOption(self.fd, posix.IPPROTO.TCP, std.posix.TCP.KEEPIDLE);
-            ka.time = Duration.fromSeconds(idle);
+            ka.time = Duration.fromSecs(idle);
 
             const interval = try getIntOption(self.fd, posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL);
-            ka.interval = Duration.fromSeconds(interval);
+            ka.interval = Duration.fromSecs(interval);
 
             const retries = try getIntOption(self.fd, posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT);
             ka.retries = retries;
         } else if (comptime builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
             const idle = try getIntOption(self.fd, posix.IPPROTO.TCP, std.posix.TCP.KEEPALIVE);
-            ka.time = Duration.fromSeconds(idle);
+            ka.time = Duration.fromSecs(idle);
         }
 
         return ka;
@@ -222,7 +222,7 @@ pub const TcpSocket = struct {
         try posix.getsockopt(self.fd, posix.SOL.SOCKET, posix.SO.LINGER, mem.asBytes(&linger_val), &len);
 
         if (linger_val.enabled != 0) {
-            return Duration.fromSeconds(linger_val.seconds);
+            return Duration.fromSecs(linger_val.seconds);
         }
         return null;
     }
@@ -305,6 +305,108 @@ pub const TcpSocket = struct {
     pub fn close(self: *TcpSocket) void {
         posix.close(self.fd);
         self.fd = -1;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Builder Pattern
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Configure socket options using a builder pattern.
+    ///
+    /// Collects all option settings and applies them, returning the first error
+    /// encountered (if any). This provides a clean way to configure multiple options.
+    ///
+    /// ## Example
+    ///
+    /// ```zig
+    /// var socket = try TcpSocket.newV4();
+    /// errdefer socket.close();
+    ///
+    /// var builder = socket.configure();
+    /// _ = builder.reuseAddr(true);
+    /// _ = builder.recvBufferSize(65536);
+    /// _ = builder.sendBufferSize(65536);
+    /// _ = builder.keepalive(.{ .time = Duration.fromSecs(60) });
+    /// try builder.apply();
+    ///
+    /// var stream = try socket.connect(addr);
+    /// ```
+    pub fn configure(self: *TcpSocket) SocketConfigBuilder {
+        return .{ .socket = self, .err = null };
+    }
+};
+
+/// Fluent builder for socket configuration.
+///
+/// Collects configuration options and applies them atomically.
+/// If any option fails to set, the error is captured and returned by `apply()`.
+pub const SocketConfigBuilder = struct {
+    socket: *TcpSocket,
+    err: ?anyerror,
+
+    /// Set SO_REUSEADDR.
+    pub fn reuseAddr(self: *SocketConfigBuilder, value: bool) *SocketConfigBuilder {
+        if (self.err == null) {
+            self.socket.setReuseAddr(value) catch |e| {
+                self.err = e;
+            };
+        }
+        return self;
+    }
+
+    /// Set SO_REUSEPORT (Linux/BSD only).
+    pub fn reusePort(self: *SocketConfigBuilder, value: bool) *SocketConfigBuilder {
+        if (self.err == null) {
+            self.socket.setReusePort(value) catch |e| {
+                self.err = e;
+            };
+        }
+        return self;
+    }
+
+    /// Set send buffer size (SO_SNDBUF).
+    pub fn sendBufferSize(self: *SocketConfigBuilder, size: u32) *SocketConfigBuilder {
+        if (self.err == null) {
+            self.socket.setSendBufferSize(size) catch |e| {
+                self.err = e;
+            };
+        }
+        return self;
+    }
+
+    /// Set receive buffer size (SO_RCVBUF).
+    pub fn recvBufferSize(self: *SocketConfigBuilder, size: u32) *SocketConfigBuilder {
+        if (self.err == null) {
+            self.socket.setRecvBufferSize(size) catch |e| {
+                self.err = e;
+            };
+        }
+        return self;
+    }
+
+    /// Set TCP keepalive options.
+    pub fn keepalive(self: *SocketConfigBuilder, ka: ?Keepalive) *SocketConfigBuilder {
+        if (self.err == null) {
+            self.socket.setKeepalive(ka) catch |e| {
+                self.err = e;
+            };
+        }
+        return self;
+    }
+
+    /// Set SO_LINGER.
+    pub fn linger(self: *SocketConfigBuilder, duration: ?Duration) *SocketConfigBuilder {
+        if (self.err == null) {
+            self.socket.setLinger(duration) catch |e| {
+                self.err = e;
+            };
+        }
+        return self;
+    }
+
+    /// Finalize configuration, returning any error that occurred.
+    pub fn apply(self: *SocketConfigBuilder) !void {
+        if (self.err) |e| return e;
     }
 };
 
@@ -521,10 +623,10 @@ pub const AcceptResult = struct {
         return self.stream;
     }
 
-    /// Get the peer address as a formatted string.
+    /// Get the peer address IP as a formatted string (without port).
     /// Useful for logging.
     pub fn peerAddrString(self: AcceptResult, buf: []u8) []u8 {
-        return self.peer_addr.format(buf);
+        return self.peer_addr.ipString(buf);
     }
 };
 
@@ -2018,4 +2120,47 @@ test "TcpStream - tryIo custom operation" {
 
     // Should return null (would block)
     try std.testing.expect(result == null);
+}
+
+test "TcpSocket - getKeepalive" {
+    var socket = try TcpSocket.newV4();
+    defer socket.close();
+
+    // Enable keepalive to exercise the full code path
+    try socket.setKeepalive(.{ .time = Duration.fromSecs(60) });
+
+    // This should now hit the Duration.fromSecs bug
+    const ka = try socket.getKeepalive();
+    try std.testing.expect(ka != null);
+}
+
+test "TcpSocket - builder pattern" {
+    var socket = try TcpSocket.newV4();
+    defer socket.close();
+
+    // Use fluent builder to configure multiple options
+    var builder = socket.configure();
+    _ = builder.reuseAddr(true);
+    _ = builder.recvBufferSize(65536);
+    _ = builder.sendBufferSize(65536);
+    try builder.apply();
+
+    // Verify options were set
+    try std.testing.expect(try socket.getReuseAddr());
+    try std.testing.expect((try socket.getRecvBufferSize()) > 0);
+    try std.testing.expect((try socket.getSendBufferSize()) > 0);
+}
+
+test "TcpSocket - builder pattern with keepalive" {
+    var socket = try TcpSocket.newV4();
+    defer socket.close();
+
+    // Configure with keepalive
+    var builder = socket.configure();
+    _ = builder.reuseAddr(true);
+    _ = builder.keepalive(.{ .time = Duration.fromSecs(30) });
+    try builder.apply();
+
+    const ka = try socket.getKeepalive();
+    try std.testing.expect(ka != null);
 }

@@ -283,6 +283,37 @@ pub const Address = struct {
         }
     }
 
+    /// Parse an IP address (without port), applying a default port.
+    ///
+    /// Unlike `parse()`, this accepts bare IP addresses without port:
+    /// - "127.0.0.1" → 127.0.0.1:default_port
+    /// - "::1" → [::1]:default_port
+    /// - "2001:db8::1" → [2001:db8::1]:default_port
+    ///
+    /// Use this when you have a configuration that specifies host and port separately,
+    /// or when the port comes from a different source (e.g., environment variable).
+    ///
+    /// ## Example
+    ///
+    /// ```zig
+    /// const host = std.process.getEnvVarOwned(allocator, "HOST") orelse "127.0.0.1";
+    /// const port = std.process.getEnvVarOwned(allocator, "PORT") orelse "8080";
+    /// const addr = try Address.parseHost(host, try std.fmt.parseInt(u16, port, 10));
+    /// ```
+    pub fn parseHost(host: []const u8, default_port: u16) !Address {
+        // Try IPv4 first
+        if (parseIpv4(host, default_port)) |addr| {
+            return addr;
+        } else |_| {}
+
+        // Try IPv6
+        if (parseIpv6(host, default_port)) |addr| {
+            return addr;
+        } else |_| {}
+
+        return error.InvalidAddress;
+    }
+
     /// Create from std.net.Address (e.g., from getAddressList).
     ///
     /// This allows interop with the standard library's DNS resolver.
@@ -664,4 +695,34 @@ test "Address - private ranges" {
 
     // Public
     try std.testing.expect(!(try Address.parse("8.8.8.8:80")).isPrivate());
+}
+
+test "Address - parseHost IPv4" {
+    const addr = try Address.parseHost("127.0.0.1", 8080);
+    try std.testing.expectEqual(@as(u16, 8080), addr.port());
+    try std.testing.expect(addr.isIpv4());
+    try std.testing.expect(addr.isLoopback());
+
+    const octets = addr.ipv4Octets().?;
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, octets);
+}
+
+test "Address - parseHost IPv6" {
+    const addr = try Address.parseHost("::1", 443);
+    try std.testing.expectEqual(@as(u16, 443), addr.port());
+    try std.testing.expect(addr.isIpv6());
+    try std.testing.expect(addr.isLoopback());
+}
+
+test "Address - parseHost full IPv6" {
+    const addr = try Address.parseHost("2001:db8:85a3:0:0:8a2e:370:7334", 80);
+    try std.testing.expectEqual(@as(u16, 80), addr.port());
+    try std.testing.expect(addr.isIpv6());
+}
+
+test "Address - parseHost invalid" {
+    // Not a valid IP
+    try std.testing.expectError(error.InvalidAddress, Address.parseHost("localhost", 80));
+    try std.testing.expectError(error.InvalidAddress, Address.parseHost("example.com", 80));
+    try std.testing.expectError(error.InvalidAddress, Address.parseHost("", 80));
 }
