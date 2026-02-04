@@ -494,8 +494,10 @@ pub fn Channel(comptime T: type) type {
         }
 
         /// Check if channel is closed.
-        pub fn isClosed(self: *const Self) bool {
-            return @atomicLoad(bool, &self.closed, .acquire);
+        pub fn isClosed(self: *Self) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.closed;
         }
 
         /// Get number of items in channel (approximate).
