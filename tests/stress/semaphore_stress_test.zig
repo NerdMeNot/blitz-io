@@ -161,7 +161,7 @@ test "Semaphore stress - release batching" {
     }
 
     // Give threads time to start waiting
-    std.time.sleep(std.time.ns_per_ms * 10);
+    std.Thread.sleep(std.time.ns_per_ms * 10);
 
     // Release all permits at once
     sem.release(num_acquirers);

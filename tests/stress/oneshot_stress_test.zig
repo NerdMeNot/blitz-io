@@ -8,6 +8,27 @@ const blitz_io = @import("blitz-io");
 const Scope = blitz_io.Scope;
 const Oneshot = blitz_io.sync.Oneshot;
 
+/// Large value type for stress testing
+const OneshotLargeValue = struct {
+    data: [64]u64,
+
+    fn initWithSeed(seed: u64) @This() {
+        var self: @This() = undefined;
+        for (&self.data, 0..) |*d, i| {
+            d.* = seed + @as(u64, @intCast(i));
+        }
+        return self;
+    }
+
+    fn checksum(self: *const @This()) u64 {
+        var sum: u64 = 0;
+        for (self.data) |d| {
+            sum ^= d;
+        }
+        return sum;
+    }
+};
+
 test "Oneshot stress - many send/recv pairs" {
     const allocator = testing.allocator;
 
@@ -49,7 +70,8 @@ fn oneshotSender(allocator: std.mem.Allocator, value: u64, result: *std.atomic.V
     std.atomic.spinLoopHint();
 
     // Send value
-    Oneshot(u64).Sender.send(&shared, value);
+    var sender = Oneshot(u64).Sender{ .shared = &shared };
+    _ = sender.send(value);
 
     inner_scope.wait() catch {};
 }
@@ -105,10 +127,11 @@ fn waitBeforeSendTest(allocator: std.mem.Allocator, value: u64, result: *std.ato
     inner_scope.spawn(waitingReceiver, .{ &shared, result }) catch return;
 
     // Delay before sending
-    std.time.sleep(std.time.ns_per_ms * 1);
+    std.Thread.sleep(std.time.ns_per_ms * 1);
 
     // Now send
-    Oneshot(u64).Sender.send(&shared, value);
+    var sender = Oneshot(u64).Sender{ .shared = &shared };
+    _ = sender.send(value);
 
     inner_scope.wait() catch {};
 }
@@ -153,7 +176,8 @@ fn sendBeforeRecvTest(allocator: std.mem.Allocator, value: u64, result: *std.ato
     var shared = Oneshot(u64).Shared.init();
 
     // Send first
-    Oneshot(u64).Sender.send(&shared, value);
+    var sender = Oneshot(u64).Sender{ .shared = &shared };
+    _ = sender.send(value);
 
     // Then start receiver
     var inner_scope = Scope.init(allocator);
@@ -188,26 +212,6 @@ test "Oneshot stress - large values" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const LargeValue = struct {
-        data: [64]u64,
-
-        fn init(seed: u64) @This() {
-            var self: @This() = undefined;
-            for (&self.data, 0..) |*d, i| {
-                d.* = seed + @as(u64, @intCast(i));
-            }
-            return self;
-        }
-
-        fn checksum(self: *const @This()) u64 {
-            var sum: u64 = 0;
-            for (self.data) |d| {
-                sum ^= d;
-            }
-            return sum;
-        }
-    };
-
     const num_channels = 30;
     var checksums: [num_channels]std.atomic.Value(u64) = undefined;
     for (&checksums) |*c| {
@@ -215,43 +219,42 @@ test "Oneshot stress - large values" {
     }
 
     for (0..num_channels) |i| {
-        try scope.spawn(largeValueTest, .{ allocator, LargeValue, @as(u64, @intCast(i)), &checksums[i] });
+        try scope.spawn(largeValueTest, .{ allocator, @as(u64, @intCast(i)), &checksums[i] });
     }
 
     try scope.wait();
 
     // Verify checksums
     for (checksums, 0..) |c, i| {
-        const expected = LargeValue.init(@as(u64, @intCast(i))).checksum();
+        const expected = OneshotLargeValue.initWithSeed(@as(u64, @intCast(i))).checksum();
         try testing.expectEqual(expected, c.load(.acquire));
     }
 }
 
 fn largeValueTest(
     allocator: std.mem.Allocator,
-    comptime LargeValue: type,
     seed: u64,
     checksum_result: *std.atomic.Value(u64),
 ) void {
-    var shared = Oneshot(LargeValue).Shared.init();
+    var shared = Oneshot(OneshotLargeValue).Shared.init();
 
     var inner_scope = Scope.init(allocator);
     defer inner_scope.deinit();
 
-    inner_scope.spawn(largeValueReceiver, .{ LargeValue, &shared, checksum_result }) catch return;
+    inner_scope.spawn(largeValueReceiver, .{ &shared, checksum_result }) catch return;
 
-    const value = LargeValue.init(seed);
-    Oneshot(LargeValue).Sender.send(&shared, value);
+    const value = OneshotLargeValue.initWithSeed(seed);
+    var sender = Oneshot(OneshotLargeValue).Sender{ .shared = &shared };
+    _ = sender.send(value);
 
     inner_scope.wait() catch {};
 }
 
 fn largeValueReceiver(
-    comptime LargeValue: type,
-    shared: *Oneshot(LargeValue).Shared,
+    shared: *Oneshot(OneshotLargeValue).Shared,
     checksum_result: *std.atomic.Value(u64),
 ) void {
-    var receiver = Oneshot(LargeValue).Receiver{ .shared = shared };
+    var receiver = Oneshot(OneshotLargeValue).Receiver{ .shared = shared };
 
     while (true) {
         if (receiver.tryRecv()) |value| {
@@ -287,9 +290,10 @@ fn rapidOneshotCycle(allocator: std.mem.Allocator, value: u64, completed: *std.a
     var inner_scope = Scope.init(allocator);
     defer inner_scope.deinit();
 
-    inner_scope.spawn(rapidReceiver, .{ &shared }) catch return;
+    inner_scope.spawn(rapidReceiver, .{&shared}) catch return;
 
-    Oneshot(u64).Sender.send(&shared, value);
+    var sender = Oneshot(u64).Sender{ .shared = &shared };
+    _ = sender.send(value);
 
     inner_scope.wait() catch {};
 

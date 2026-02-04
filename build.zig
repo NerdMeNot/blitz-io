@@ -89,6 +89,16 @@ pub fn build(b: *std.Build) void {
         "tests/stress/scope_stress_test.zig",
         "tests/stress/channel_stress_test.zig",
         "tests/stress/mutex_stress_test.zig",
+        "tests/stress/semaphore_stress_test.zig",
+        "tests/stress/rwlock_stress_test.zig",
+        "tests/stress/barrier_stress_test.zig",
+        "tests/stress/broadcast_stress_test.zig",
+        "tests/stress/notify_stress_test.zig",
+        "tests/stress/oneshot_stress_test.zig",
+        "tests/stress/unbounded_stress_test.zig",
+        "tests/stress/watch_stress_test.zig",
+        "tests/stress/once_cell_stress_test.zig",
+        "tests/stress/io_stress_test.zig",
     }) |test_file| {
         const mod = b.createModule(.{
             .root_source_file = b.path(test_file),

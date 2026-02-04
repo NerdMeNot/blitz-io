@@ -118,6 +118,8 @@ pub const Error = error{
 ///
 /// Enables reading from any source: sockets, files, TLS streams, buffers, etc.
 /// Wrappers can add functionality (decryption, decompression) transparently.
+///
+/// Thread Safety: NOT thread-safe. Use external synchronization if shared between threads.
 pub const Reader = struct {
     /// Opaque pointer to the underlying implementation.
     context: *anyopaque,
@@ -211,6 +213,8 @@ pub const LimitedReader = struct {
 ///
 /// Enables writing to any destination: sockets, files, TLS streams, buffers, etc.
 /// Wrappers can add functionality (encryption, compression) transparently.
+///
+/// Thread Safety: NOT thread-safe. Use external synchronization if shared between threads.
 pub const Writer = struct {
     /// Opaque pointer to the underlying implementation.
     context: *anyopaque,
@@ -264,6 +268,10 @@ pub const Writer = struct {
     }
 
     /// Print formatted output.
+    ///
+    /// Note: Uses a fixed 4096-byte internal buffer. If formatted output exceeds
+    /// this limit, returns `error.InvalidArgument`. For larger formatted output,
+    /// use `std.fmt.bufPrint` with a custom buffer and then `writeAll`.
     pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) Error!void {
         var buf: [4096]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, fmt, args) catch return error.InvalidArgument;
@@ -333,6 +341,8 @@ pub const NullWriter = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// A reader backed by a fixed buffer.
+///
+/// Thread Safety: NOT thread-safe. Use external synchronization if shared between threads.
 pub const FixedBufferReader = struct {
     buffer: []const u8,
     pos: usize = 0,
@@ -363,7 +373,14 @@ pub const FixedBufferReader = struct {
     }
 };
 
+/// Create a FixedBufferReader from a buffer (convenience function).
+pub fn fixedBufferReader(buffer: []const u8) FixedBufferReader {
+    return FixedBufferReader.init(buffer);
+}
+
 /// A writer backed by a fixed buffer.
+///
+/// Thread Safety: NOT thread-safe. Use external synchronization if shared between threads.
 pub const FixedBufferWriter = struct {
     buffer: []u8,
     pos: usize = 0,
@@ -397,6 +414,11 @@ pub const FixedBufferWriter = struct {
         self.pos = 0;
     }
 };
+
+/// Create a FixedBufferWriter from a buffer (convenience function).
+pub fn fixedBufferWriter(buffer: []u8) FixedBufferWriter {
+    return FixedBufferWriter.init(buffer);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Utility: Counting Writer
@@ -495,6 +517,212 @@ test "Writer.print" {
     try w.print("count: {}, name: {s}", .{ 42, "test" });
 
     try std.testing.expectEqualStrings("count: 42, name: test", fbw.getWritten());
+}
+
+test "Writer.print - exceeds buffer limit returns error" {
+    var buf: [100]u8 = undefined;
+    var fbw = FixedBufferWriter.init(&buf);
+    var w = fbw.writer();
+
+    // Create a format that would exceed 4096 bytes
+    // Format "{s}" with 5000-char string will exceed the 4096 internal buffer
+    var large_input: [5000]u8 = undefined;
+    @memset(&large_input, 'x');
+
+    const result = w.print("{s}", .{&large_input});
+    try std.testing.expectError(error.InvalidArgument, result);
+}
+
+test "Reader.readUntilDelimiter" {
+    const data = "hello\nworld";
+    var fbr = FixedBufferReader.init(data);
+    var r = fbr.reader();
+
+    var buf: [20]u8 = undefined;
+    const line = try r.readUntilDelimiter(&buf, '\n');
+    try std.testing.expectEqualStrings("hello\n", line.?);
+}
+
+test "Reader.readUntilDelimiter - delimiter not found" {
+    const data = "hello";
+    var fbr = FixedBufferReader.init(data);
+    var r = fbr.reader();
+
+    var buf: [20]u8 = undefined;
+    const line = try r.readUntilDelimiter(&buf, '\n');
+    try std.testing.expectEqualStrings("hello", line.?);
+}
+
+test "Reader.readUntilDelimiter - empty" {
+    const data = "";
+    var fbr = FixedBufferReader.init(data);
+    var r = fbr.reader();
+
+    var buf: [20]u8 = undefined;
+    const line = try r.readUntilDelimiter(&buf, '\n');
+    try std.testing.expect(line == null);
+}
+
+test "Reader.skipBytes" {
+    const data = "hello world";
+    var fbr = FixedBufferReader.init(data);
+    var r = fbr.reader();
+
+    try r.skipBytes(6); // Skip "hello "
+
+    var buf: [10]u8 = undefined;
+    const n = try r.read(&buf);
+    try std.testing.expectEqualStrings("world", buf[0..n]);
+}
+
+test "Reader.skipBytes - not enough bytes" {
+    const data = "hi";
+    var fbr = FixedBufferReader.init(data);
+    var r = fbr.reader();
+
+    const result = r.skipBytes(10);
+    try std.testing.expectError(error.EndOfStream, result);
+}
+
+test "LimitedReader - limits bytes read" {
+    const data = "hello world";
+    var fbr = FixedBufferReader.init(data);
+    var r = fbr.reader();
+
+    var lr = r.limitedReader(5);
+    var limited = lr.reader();
+
+    var buf: [20]u8 = undefined;
+    const n1 = try limited.read(&buf);
+    try std.testing.expectEqual(@as(usize, 5), n1);
+    try std.testing.expectEqualStrings("hello", buf[0..n1]);
+
+    // Should return 0 now (limit reached)
+    const n2 = try limited.read(&buf);
+    try std.testing.expectEqual(@as(usize, 0), n2);
+}
+
+test "LimitedReader - partial reads" {
+    const data = "hello world";
+    var fbr = FixedBufferReader.init(data);
+    var r = fbr.reader();
+
+    var lr = r.limitedReader(8);
+    var limited = lr.reader();
+
+    // Read in small chunks
+    var buf: [3]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try limited.read(&buf);
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expectEqual(@as(usize, 8), total);
+}
+
+test "NullWriter - discards all data" {
+    var w = NullWriter.writer();
+
+    try w.writeAll("this data is discarded");
+    try w.writeByte('x');
+    try w.writeByteNTimes('y', 100);
+    try w.print("formatted: {d}", .{42});
+
+    // No crash, no error - that's the test
+}
+
+test "fixedBufferReader convenience function" {
+    const data = "test";
+    var fbr = fixedBufferReader(data);
+    var r = fbr.reader();
+
+    var buf: [10]u8 = undefined;
+    const n = try r.read(&buf);
+    try std.testing.expectEqualStrings("test", buf[0..n]);
+}
+
+test "fixedBufferWriter convenience function" {
+    var buf: [20]u8 = undefined;
+    var fbw = fixedBufferWriter(&buf);
+    var w = fbw.writer();
+
+    try w.writeAll("test");
+    try std.testing.expectEqualStrings("test", fbw.getWritten());
+}
+
+test "Writer.writeByte" {
+    var buf: [10]u8 = undefined;
+    var fbw = FixedBufferWriter.init(&buf);
+    var w = fbw.writer();
+
+    try w.writeByte('A');
+    try w.writeByte('B');
+    try w.writeByte('C');
+
+    try std.testing.expectEqualStrings("ABC", fbw.getWritten());
+}
+
+test "Writer.writeByteNTimes" {
+    var buf: [20]u8 = undefined;
+    var fbw = FixedBufferWriter.init(&buf);
+    var w = fbw.writer();
+
+    try w.writeByteNTimes('-', 5);
+    try w.writeByteNTimes('=', 3);
+
+    try std.testing.expectEqualStrings("-----===", fbw.getWritten());
+}
+
+test "Reader.readAll - not enough data" {
+    const data = "hi";
+    var fbr = FixedBufferReader.init(data);
+    var r = fbr.reader();
+
+    var buf: [10]u8 = undefined;
+    const result = r.readAll(&buf);
+    try std.testing.expectError(error.EndOfStream, result);
+}
+
+test "FixedBufferWriter - buffer full" {
+    var buf: [5]u8 = undefined;
+    var fbw = FixedBufferWriter.init(&buf);
+    var w = fbw.writer();
+
+    // Write exactly buffer size
+    const n1 = try w.write("hello");
+    try std.testing.expectEqual(@as(usize, 5), n1);
+
+    // Write when buffer is full - returns 0
+    const n2 = try w.write("more");
+    try std.testing.expectEqual(@as(usize, 0), n2);
+}
+
+test "FixedBufferReader.reset" {
+    const data = "hello";
+    var fbr = FixedBufferReader.init(data);
+
+    var buf: [10]u8 = undefined;
+    _ = try fbr.reader().read(&buf);
+
+    fbr.reset();
+
+    const n = try fbr.reader().read(&buf);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+}
+
+test "FixedBufferWriter.reset" {
+    var buf: [20]u8 = undefined;
+    var fbw = FixedBufferWriter.init(&buf);
+
+    try fbw.writer().writeAll("first");
+    try std.testing.expectEqualStrings("first", fbw.getWritten());
+
+    fbw.reset();
+    try std.testing.expectEqualStrings("", fbw.getWritten());
+
+    try fbw.writer().writeAll("second");
+    try std.testing.expectEqualStrings("second", fbw.getWritten());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

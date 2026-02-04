@@ -33,8 +33,10 @@ fn unboundedProducer(channel: *UnboundedChannel(u64), count: usize) u64 {
     var sum: u64 = 0;
     for (0..count) |i| {
         const value: u64 = @intCast(i + 1);
-        channel.send(value) catch continue;
-        sum += value;
+        const result = channel.send(value) catch continue;
+        if (result == .ok) {
+            sum += value;
+        }
     }
     return sum;
 }
@@ -44,11 +46,13 @@ fn unboundedConsumer(channel: *UnboundedChannel(u64), count: usize) u64 {
     var received: usize = 0;
 
     while (received < count) {
-        if (channel.tryRecv()) |value| {
-            sum += value;
-            received += 1;
-        } else {
-            std.atomic.spinLoopHint();
+        switch (channel.tryRecv()) {
+            .value => |value| {
+                sum += value;
+                received += 1;
+            },
+            .empty => std.atomic.spinLoopHint(),
+            .closed => break,
         }
     }
 
@@ -100,8 +104,10 @@ fn multiUnboundedProducer(channel: *UnboundedChannel(u64), count: usize, produce
     var sum: u64 = 0;
     for (0..count) |i| {
         const value: u64 = producer_id * 1000000 + @as(u64, @intCast(i + 1));
-        channel.send(value) catch continue;
-        sum += value;
+        const result = channel.send(value) catch continue;
+        if (result == .ok) {
+            sum += value;
+        }
     }
     return sum;
 }
@@ -146,8 +152,10 @@ fn burstyProducer(
     for (0..bursts) |_| {
         // Send burst
         for (0..items_per_burst) |i| {
-            channel.send(@intCast(i)) catch continue;
-            _ = sent.fetchAdd(1, .acq_rel);
+            const result = channel.send(@intCast(i)) catch continue;
+            if (result == .ok) {
+                _ = sent.fetchAdd(1, .acq_rel);
+            }
         }
         // Brief pause between bursts
         std.atomic.spinLoopHint();
@@ -161,11 +169,13 @@ fn countingUnboundedConsumer(
 ) void {
     var count: usize = 0;
     while (count < expected) {
-        if (channel.tryRecv()) |_| {
-            count += 1;
-            _ = received.fetchAdd(1, .acq_rel);
-        } else {
-            std.atomic.spinLoopHint();
+        switch (channel.tryRecv()) {
+            .value => {
+                count += 1;
+                _ = received.fetchAdd(1, .acq_rel);
+            },
+            .empty => std.atomic.spinLoopHint(),
+            .closed => break,
         }
     }
 }
@@ -203,14 +213,19 @@ fn sendUntilClosedUnbounded(
 ) void {
     var i: u32 = 0;
     while (true) {
-        if (channel.send(i)) |_| {
-            _ = sends.fetchAdd(1, .acq_rel);
-            i += 1;
-        } else |err| {
-            if (err == error.Closed) {
+        const result = channel.send(i) catch {
+            // Allocation failure
+            continue;
+        };
+        switch (result) {
+            .ok => {
+                _ = sends.fetchAdd(1, .acq_rel);
+                i += 1;
+            },
+            .closed => {
                 detected.store(true, .release);
                 break;
-            }
+            },
         }
     }
 }
@@ -226,8 +241,10 @@ test "UnboundedChannel stress - drain on close" {
     var expected_sum: u64 = 0;
     for (0..num_items) |i| {
         const value: u64 = @intCast(i + 1);
-        try channel.send(value);
-        expected_sum += value;
+        const result = try channel.send(value);
+        if (result == .ok) {
+            expected_sum += value;
+        }
     }
 
     // Close
@@ -235,8 +252,11 @@ test "UnboundedChannel stress - drain on close" {
 
     // Drain remaining items
     var received_sum: u64 = 0;
-    while (channel.tryRecv()) |value| {
-        received_sum += value;
+    while (true) {
+        switch (channel.tryRecv()) {
+            .value => |value| received_sum += value,
+            .empty, .closed => break,
+        }
     }
 
     try testing.expectEqual(expected_sum, received_sum);
@@ -270,8 +290,10 @@ fn checksumUnboundedProducer(channel: *UnboundedChannel(u64), count: usize) u64 
 
     for (0..count) |_| {
         const value = random.int(u64);
-        channel.send(value) catch continue;
-        checksum ^= value;
+        const result = channel.send(value) catch continue;
+        if (result == .ok) {
+            checksum ^= value;
+        }
     }
 
     return checksum;
@@ -282,11 +304,13 @@ fn checksumUnboundedConsumer(channel: *UnboundedChannel(u64), count: usize) u64 
     var received: usize = 0;
 
     while (received < count) {
-        if (channel.tryRecv()) |value| {
-            checksum ^= value;
-            received += 1;
-        } else {
-            std.atomic.spinLoopHint();
+        switch (channel.tryRecv()) {
+            .value => |value| {
+                checksum ^= value;
+                received += 1;
+            },
+            .empty => std.atomic.spinLoopHint(),
+            .closed => break,
         }
     }
 
@@ -302,15 +326,18 @@ test "UnboundedChannel stress - queue growth" {
     // Send many items without consuming (test queue growth)
     const num_items = 10000;
     for (0..num_items) |i| {
-        try channel.send(@intCast(i));
+        _ = try channel.send(@intCast(i));
     }
 
     try testing.expectEqual(@as(usize, num_items), channel.len());
 
     // Now drain
     var count: usize = 0;
-    while (channel.tryRecv()) |_| {
-        count += 1;
+    while (true) {
+        switch (channel.tryRecv()) {
+            .value => count += 1,
+            .empty, .closed => break,
+        }
     }
 
     try testing.expectEqual(num_items, count);

@@ -26,13 +26,13 @@ test "Notify stress - notifyOne wakes single waiter" {
     }
 
     // Give waiters time to register
-    std.time.sleep(std.time.ns_per_ms * 10);
+    std.Thread.sleep(std.time.ns_per_ms * 10);
 
     // Wake them one by one
     for (0..num_waiters) |_| {
         notify.notifyOne();
         // Small delay to let wakeup propagate
-        std.time.sleep(std.time.ns_per_us * 100);
+        std.Thread.sleep(std.time.ns_per_us * 100);
     }
 
     try scope.wait();
@@ -43,7 +43,8 @@ test "Notify stress - notifyOne wakes single waiter" {
 fn notifyWaiter(notify: *Notify, woken: *std.atomic.Value(usize)) void {
     var waiter = NotifyWaiter.init();
 
-    if (notify.wait(&waiter) == .pending) {
+    // wait() returns true if notified immediately, false if we need to wait
+    if (!notify.wait(&waiter)) {
         // Spin until notified
         while (!waiter.isNotified()) {
             std.atomic.spinLoopHint();
@@ -92,7 +93,8 @@ fn notifyAllWaiter(
 
     _ = registered.fetchAdd(1, .acq_rel);
 
-    if (notify.wait(&waiter) == .pending) {
+    // wait() returns true if notified immediately, false if we need to wait
+    if (!notify.wait(&waiter)) {
         while (!waiter.isNotified()) {
             std.atomic.spinLoopHint();
         }
@@ -146,8 +148,8 @@ fn rapidWaiter(notify: *Notify, count: *std.atomic.Value(usize), cycles: usize) 
         var waiter = NotifyWaiter.init();
 
         // Try to wait, but don't block forever
-        const result = notify.wait(&waiter);
-        if (result == .pending) {
+        // wait() returns true if notified immediately, false if added to queue
+        if (!notify.wait(&waiter)) {
             // Spin briefly, then give up (permit may have been consumed)
             var spins: usize = 0;
             while (!waiter.isNotified() and spins < 1000) : (spins += 1) {
@@ -189,9 +191,10 @@ fn permitTest(notify: *Notify, immediate: *std.atomic.Value(usize)) void {
 
     // Wait should consume permit immediately
     var waiter = NotifyWaiter.init();
-    const result = notify.wait(&waiter);
+    // wait() returns true if permit consumed immediately
+    const was_immediate = notify.wait(&waiter);
 
-    if (result == .ready or waiter.isNotified()) {
+    if (was_immediate or waiter.isNotified()) {
         _ = immediate.fetchAdd(1, .acq_rel);
     } else {
         // Permit wasn't available, spin wait
@@ -221,7 +224,7 @@ test "Notify stress - multiple notifyAll bursts" {
         }
 
         // Small delay for waiters to register
-        std.time.sleep(std.time.ns_per_ms * 5);
+        std.Thread.sleep(std.time.ns_per_ms * 5);
 
         // Wake all
         notify.notifyAll();
@@ -235,7 +238,8 @@ test "Notify stress - multiple notifyAll bursts" {
 fn burstWaiter(notify: *Notify, wakes: *std.atomic.Value(usize)) void {
     var waiter = NotifyWaiter.init();
 
-    if (notify.wait(&waiter) == .pending) {
+    // wait() returns true if notified immediately, false if we need to wait
+    if (!notify.wait(&waiter)) {
         while (!waiter.isNotified()) {
             std.atomic.spinLoopHint();
         }

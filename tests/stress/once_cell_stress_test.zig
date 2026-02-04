@@ -7,6 +7,28 @@ const testing = std.testing;
 const blitz_io = @import("blitz-io");
 const Scope = blitz_io.Scope;
 const OnceCell = blitz_io.sync.OnceCell;
+const OnceCellWaiter = blitz_io.sync.OnceCellWaiter;
+
+/// Large value type for stress testing
+const LargeValue = struct {
+    data: [256]u64,
+
+    fn initWithSeed(seed: u64) @This() {
+        var self: @This() = undefined;
+        for (&self.data, 0..) |*d, i| {
+            d.* = seed + @as(u64, @intCast(i));
+        }
+        return self;
+    }
+
+    fn checksum(self: *const @This()) u64 {
+        var sum: u64 = 0;
+        for (self.data) |d| {
+            sum ^= d;
+        }
+        return sum;
+    }
+};
 
 test "OnceCell stress - many threads race to initialize" {
     const allocator = testing.allocator;
@@ -44,14 +66,15 @@ fn raceToInit(
     init_count: *std.atomic.Value(usize),
     value_seen: *std.atomic.Value(u64),
 ) void {
-    const value = cell.getOrInit(struct {
-        fn init(count: *std.atomic.Value(usize)) u64 {
+    const Ctx = *std.atomic.Value(usize);
+    const value_ptr = cell.getOrInitCtx(Ctx, init_count, struct {
+        fn init(count: Ctx) u64 {
             _ = count.fetchAdd(1, .acq_rel);
             return 42;
         }
-    }.init, .{init_count});
+    }.init);
 
-    value_seen.store(value, .release);
+    value_seen.store(value_ptr.*, .release);
 }
 
 test "OnceCell stress - slow initialization with waiters" {
@@ -79,7 +102,7 @@ test "OnceCell stress - slow initialization with waiters" {
     try testing.expectEqual(@as(usize, num_accessors), access_count.load(.acquire));
 
     // Cell should have the value
-    try testing.expectEqual(@as(u64, 999), cell.get().?);
+    try testing.expectEqual(@as(u64, 999), cell.get().?.*);
 }
 
 fn slowInitAccess(
@@ -87,16 +110,17 @@ fn slowInitAccess(
     init_count: *std.atomic.Value(usize),
     access_count: *std.atomic.Value(usize),
 ) void {
-    const value = cell.getOrInit(struct {
-        fn init(count: *std.atomic.Value(usize)) u64 {
+    const Ctx = *std.atomic.Value(usize);
+    const value_ptr = cell.getOrInitCtx(Ctx, init_count, struct {
+        fn init(count: Ctx) u64 {
             _ = count.fetchAdd(1, .acq_rel);
             // Simulate slow initialization
-            std.time.sleep(std.time.ns_per_ms * 10);
+            std.Thread.sleep(std.time.ns_per_ms * 10);
             return 999;
         }
-    }.init, .{init_count});
+    }.init);
 
-    _ = value;
+    _ = value_ptr;
     _ = access_count.fetchAdd(1, .acq_rel);
 }
 
@@ -106,13 +130,13 @@ test "OnceCell stress - get after initialized" {
     var cell = OnceCell(u64).init();
 
     // Initialize first
-    const init_value = cell.getOrInit(struct {
+    const init_value_ptr = cell.getOrInit(struct {
         fn init() u64 {
             return 12345;
         }
-    }.init, .{});
+    }.init);
 
-    try testing.expectEqual(@as(u64, 12345), init_value);
+    try testing.expectEqual(@as(u64, 12345), init_value_ptr.*);
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
@@ -135,7 +159,7 @@ fn fastGet(cell: *OnceCell(u64), count: *std.atomic.Value(usize)) void {
     // Should return immediately since already initialized
     const value = cell.get();
     if (value) |v| {
-        if (v == 12345) {
+        if (v.* == 12345) {
             _ = count.fetchAdd(1, .acq_rel);
         }
     }
@@ -143,26 +167,6 @@ fn fastGet(cell: *OnceCell(u64), count: *std.atomic.Value(usize)) void {
 
 test "OnceCell stress - large value initialization" {
     const allocator = testing.allocator;
-
-    const LargeValue = struct {
-        data: [256]u64,
-
-        fn init(seed: u64) @This() {
-            var self: @This() = undefined;
-            for (&self.data, 0..) |*d, i| {
-                d.* = seed + @as(u64, @intCast(i));
-            }
-            return self;
-        }
-
-        fn checksum(self: *const @This()) u64 {
-            var sum: u64 = 0;
-            for (self.data) |d| {
-                sum ^= d;
-            }
-            return sum;
-        }
-    };
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
@@ -176,30 +180,29 @@ test "OnceCell stress - large value initialization" {
     const num_accessors = 50;
 
     for (0..num_accessors) |i| {
-        try scope.spawn(largeValueAccess, .{ &cell, LargeValue, &checksums[i] });
+        try scope.spawn(largeValueAccess, .{ &cell, &checksums[i] });
     }
 
     try scope.wait();
 
     // All should have same checksum
-    const expected_checksum = LargeValue.init(7777).checksum();
+    const expected_checksum = LargeValue.initWithSeed(7777).checksum();
     for (checksums) |c| {
         try testing.expectEqual(expected_checksum, c.load(.acquire));
     }
 }
 
 fn largeValueAccess(
-    cell: anytype,
-    comptime LargeValue: type,
+    cell: *OnceCell(LargeValue),
     checksum_result: *std.atomic.Value(u64),
 ) void {
-    const value = cell.getOrInit(struct {
+    const value_ptr = cell.getOrInit(struct {
         fn init() LargeValue {
-            return LargeValue.init(7777);
+            return LargeValue.initWithSeed(7777);
         }
-    }.init, .{});
+    }.init);
 
-    checksum_result.store(value.checksum(), .release);
+    checksum_result.store(value_ptr.checksum(), .release);
 }
 
 test "OnceCell stress - repeated getOrInit calls" {
@@ -234,21 +237,22 @@ fn repeatedAccess(
     init_count: *std.atomic.Value(usize),
     count: usize,
 ) void {
+    const Ctx = *std.atomic.Value(usize);
     for (0..count) |_| {
-        const value = cell.getOrInit(struct {
-            fn init(counter: *std.atomic.Value(usize)) u64 {
+        const value_ptr = cell.getOrInitCtx(Ctx, init_count, struct {
+            fn init(counter: Ctx) u64 {
                 _ = counter.fetchAdd(1, .acq_rel);
                 return 42;
             }
-        }.init, .{init_count});
+        }.init);
 
-        if (value == 42) {
+        if (value_ptr.* == 42) {
             _ = total.fetchAdd(1, .acq_rel);
         }
     }
 }
 
-test "OnceCell stress - waiter-based initialization" {
+test "OnceCell stress - async initialization" {
     const allocator = testing.allocator;
 
     var scope = Scope.init(allocator);
@@ -260,19 +264,19 @@ test "OnceCell stress - waiter-based initialization" {
     const num_tasks = 30;
 
     for (0..num_tasks) |_| {
-        try scope.spawn(waiterBasedInit, .{ &cell, &completed });
+        try scope.spawn(asyncInit, .{ &cell, &completed });
     }
 
     try scope.wait();
 
     try testing.expectEqual(@as(usize, num_tasks), completed.load(.acquire));
-    try testing.expectEqual(@as(u64, 555), cell.get().?);
+    try testing.expectEqual(@as(u64, 555), cell.get().?.*);
 }
 
-fn waiterBasedInit(cell: *OnceCell(u64), completed: *std.atomic.Value(usize)) void {
-    var waiter = OnceCell(u64).InitWaiter.init();
+fn asyncInit(cell: *OnceCell(u64), completed: *std.atomic.Value(usize)) void {
+    var waiter = OnceCellWaiter.init();
 
-    const result = cell.getOrInitWaiter(struct {
+    const result = cell.getOrInitAsync(struct {
         fn init() u64 {
             // Simulate slow init
             for (0..100) |_| {
@@ -280,26 +284,24 @@ fn waiterBasedInit(cell: *OnceCell(u64), completed: *std.atomic.Value(usize)) vo
             }
             return 555;
         }
-    }.init, .{}, &waiter);
+    }.init, &waiter);
 
-    switch (result) {
-        .ready => |value| {
-            if (value == 555) {
+    if (result) |value_ptr| {
+        // Got value immediately (either we initialized or it was already done)
+        if (value_ptr.* == 555) {
+            _ = completed.fetchAdd(1, .acq_rel);
+        }
+    } else {
+        // Wait for completion
+        while (!waiter.isComplete()) {
+            std.atomic.spinLoopHint();
+        }
+        // Now get the value
+        if (cell.get()) |value_ptr| {
+            if (value_ptr.* == 555) {
                 _ = completed.fetchAdd(1, .acq_rel);
             }
-        },
-        .pending => {
-            // Wait for completion
-            while (!waiter.isComplete()) {
-                std.atomic.spinLoopHint();
-            }
-            // Now get the value
-            if (cell.get()) |value| {
-                if (value == 555) {
-                    _ = completed.fetchAdd(1, .acq_rel);
-                }
-            }
-        },
+        }
     }
 }
 

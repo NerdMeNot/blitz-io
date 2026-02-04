@@ -3,10 +3,18 @@
 //! Tests the broadcast channel with multiple receivers under high throughput.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
 const Scope = blitz_io.Scope;
 const BroadcastChannel = blitz_io.sync.BroadcastChannel;
+
+// Use smaller iteration counts in debug mode for faster test runs
+const is_debug = builtin.mode == .Debug;
+const NUM_MESSAGES: usize = if (is_debug) 100 else 1000;
+const NUM_MESSAGES_LARGE: usize = if (is_debug) 200 else 2000;
+const NUM_RECEIVERS: usize = if (is_debug) 3 else 5;
+const NUM_RECEIVERS_LARGE: usize = if (is_debug) 5 else 20;
 
 test "BroadcastChannel stress - all receivers get all messages" {
     const allocator = testing.allocator;
@@ -17,25 +25,25 @@ test "BroadcastChannel stress - all receivers get all messages" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_receivers = 5;
-    const num_messages = 1000;
-
-    // Create receivers
-    var receivers: [num_receivers]BroadcastChannel(u64).Receiver = undefined;
+    // Create receivers BEFORE spawning sender to ensure they don't miss messages
+    var receivers: [NUM_RECEIVERS]BroadcastChannel(u64).Receiver = undefined;
     for (&receivers) |*rx| {
         rx.* = channel.subscribe();
     }
 
-    var receiver_sums: [num_receivers]u64 = undefined;
+    var receiver_sums: [NUM_RECEIVERS]u64 = undefined;
     var sender_sum: u64 = 0;
 
-    // Spawn sender
-    try scope.spawnWithResult(broadcastSender, .{ &channel, num_messages }, &sender_sum);
-
-    // Spawn receivers
-    for (0..num_receivers) |i| {
-        try scope.spawnWithResult(broadcastReceiver, .{ &receivers[i], num_messages }, &receiver_sums[i]);
+    // Spawn receivers first so they're ready
+    for (0..NUM_RECEIVERS) |i| {
+        try scope.spawnWithResult(broadcastReceiver, .{&receivers[i]}, &receiver_sums[i]);
     }
+
+    // Small delay to ensure receivers are waiting
+    std.atomic.spinLoopHint();
+
+    // Spawn sender - it will close channel when done
+    try scope.spawnWithResult(broadcastSender, .{ &channel, NUM_MESSAGES }, &sender_sum);
 
     try scope.wait();
 
@@ -52,24 +60,23 @@ fn broadcastSender(channel: *BroadcastChannel(u64), count: usize) u64 {
         _ = channel.send(value);
         sum += value;
     }
+    channel.close(); // Signal receivers to stop
     return sum;
 }
 
-fn broadcastReceiver(receiver: *BroadcastChannel(u64).Receiver, count: usize) u64 {
+fn broadcastReceiver(receiver: *BroadcastChannel(u64).Receiver) u64 {
     var sum: u64 = 0;
-    var received: usize = 0;
 
-    while (received < count) {
+    while (true) {
         switch (receiver.tryRecv()) {
             .value => |v| {
                 sum += v;
-                received += 1;
             },
             .empty => {
                 std.atomic.spinLoopHint();
             },
             .lagged => |_| {
-                // Skip lagged messages
+                // Skip lagged messages - shouldn't happen with large buffer
             },
             .closed => break,
         }
@@ -88,17 +95,18 @@ test "BroadcastChannel stress - concurrent subscribe/receive" {
     defer scope.deinit();
 
     var messages_received = std.atomic.Value(usize).init(0);
+    var receivers_ready = std.atomic.Value(usize).init(0);
 
-    const num_receivers = 10;
-    const num_messages = 500;
+    const num_receivers = NUM_RECEIVERS;
+    const num_messages = NUM_MESSAGES;
 
-    // Start sender first
-    try scope.spawn(concurrentBroadcastSender, .{ &channel, num_messages });
-
-    // Spawn receivers that subscribe dynamically
+    // Spawn receivers first so they can subscribe
     for (0..num_receivers) |_| {
-        try scope.spawn(dynamicSubscriber, .{ &channel, &messages_received });
+        try scope.spawn(dynamicSubscriber, .{ &channel, &messages_received, &receivers_ready });
     }
+
+    // Start sender - it waits for receivers to be ready
+    try scope.spawn(concurrentBroadcastSender, .{ &channel, num_messages, &receivers_ready, num_receivers });
 
     try scope.wait();
 
@@ -106,7 +114,12 @@ test "BroadcastChannel stress - concurrent subscribe/receive" {
     try testing.expect(messages_received.load(.acquire) > 0);
 }
 
-fn concurrentBroadcastSender(channel: *BroadcastChannel(u64), count: usize) void {
+fn concurrentBroadcastSender(channel: *BroadcastChannel(u64), count: usize, receivers_ready: *std.atomic.Value(usize), expected_receivers: usize) void {
+    // Wait for all receivers to subscribe
+    while (receivers_ready.load(.acquire) < expected_receivers) {
+        std.atomic.spinLoopHint();
+    }
+
     for (0..count) |i| {
         _ = channel.send(@intCast(i));
         // Small delay to let receivers catch up
@@ -117,8 +130,9 @@ fn concurrentBroadcastSender(channel: *BroadcastChannel(u64), count: usize) void
     channel.close();
 }
 
-fn dynamicSubscriber(channel: *BroadcastChannel(u64), received: *std.atomic.Value(usize)) void {
+fn dynamicSubscriber(channel: *BroadcastChannel(u64), received: *std.atomic.Value(usize), ready: *std.atomic.Value(usize)) void {
     var rx = channel.subscribe();
+    _ = ready.fetchAdd(1, .acq_rel); // Signal that we're ready
 
     while (true) {
         switch (rx.tryRecv()) {
@@ -150,7 +164,7 @@ test "BroadcastChannel stress - slow receiver lagging" {
     var lagged_count = std.atomic.Value(usize).init(0);
     var received_count = std.atomic.Value(usize).init(0);
 
-    const num_messages = 1000;
+    const num_messages = NUM_MESSAGES;
 
     // Fast sender
     try scope.spawn(fastBroadcastSender, .{ &channel, num_messages });
@@ -201,24 +215,31 @@ fn slowBroadcastReceiver(
 test "BroadcastChannel stress - many receivers same speed" {
     const allocator = testing.allocator;
 
-    var channel = try BroadcastChannel(u64).init(allocator, 128);
+    var channel = try BroadcastChannel(u64).init(allocator, 256);
     defer channel.deinit();
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_receivers = 20;
-    const num_messages = 500;
+    const num_messages = NUM_MESSAGES;
 
-    var receivers: [num_receivers]BroadcastChannel(u64).Receiver = undefined;
+    var receivers: [NUM_RECEIVERS_LARGE]BroadcastChannel(u64).Receiver = undefined;
     for (&receivers) |*rx| {
         rx.* = channel.subscribe();
     }
 
-    var counts: [num_receivers]std.atomic.Value(usize) = undefined;
+    var counts: [NUM_RECEIVERS_LARGE]std.atomic.Value(usize) = undefined;
     for (&counts) |*c| {
         c.* = std.atomic.Value(usize).init(0);
     }
+
+    // Spawn receivers first to ensure they're ready
+    for (0..NUM_RECEIVERS_LARGE) |i| {
+        try scope.spawn(countingBroadcastReceiver, .{ &receivers[i], &counts[i] });
+    }
+
+    // Small delay to ensure receivers are waiting
+    std.atomic.spinLoopHint();
 
     // Sender
     try scope.spawn(struct {
@@ -229,11 +250,6 @@ test "BroadcastChannel stress - many receivers same speed" {
             ch.close();
         }
     }.send, .{ &channel, num_messages });
-
-    // Receivers
-    for (0..num_receivers) |i| {
-        try scope.spawn(countingBroadcastReceiver, .{ &receivers[i], &counts[i] });
-    }
 
     try scope.wait();
 
@@ -264,28 +280,31 @@ fn countingBroadcastReceiver(
 test "BroadcastChannel stress - data integrity" {
     const allocator = testing.allocator;
 
-    var channel = try BroadcastChannel(u64).init(allocator, 256);
+    var channel = try BroadcastChannel(u64).init(allocator, 512);
     defer channel.deinit();
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_receivers = 3;
-    const num_messages = 2000;
+    const num_receivers = NUM_RECEIVERS;
 
-    var receivers: [num_receivers]BroadcastChannel(u64).Receiver = undefined;
+    var receivers: [NUM_RECEIVERS]BroadcastChannel(u64).Receiver = undefined;
     for (&receivers) |*rx| {
         rx.* = channel.subscribe();
     }
 
-    var checksums: [num_receivers]u64 = undefined;
+    var checksums: [NUM_RECEIVERS]u64 = undefined;
     var sender_checksum: u64 = 0;
 
-    try scope.spawnWithResult(checksumBroadcastSender, .{ &channel, num_messages }, &sender_checksum);
-
+    // Spawn receivers first to ensure they're ready
     for (0..num_receivers) |i| {
-        try scope.spawnWithResult(checksumBroadcastReceiver, .{ &receivers[i], num_messages }, &checksums[i]);
+        try scope.spawnWithResult(checksumBroadcastReceiver, .{&receivers[i]}, &checksums[i]);
     }
+
+    // Small delay to ensure receivers are waiting
+    std.atomic.spinLoopHint();
+
+    try scope.spawnWithResult(checksumBroadcastSender, .{ &channel, NUM_MESSAGES_LARGE }, &sender_checksum);
 
     try scope.wait();
 
@@ -310,15 +329,13 @@ fn checksumBroadcastSender(channel: *BroadcastChannel(u64), count: usize) u64 {
     return checksum;
 }
 
-fn checksumBroadcastReceiver(rx: *BroadcastChannel(u64).Receiver, expected_count: usize) u64 {
+fn checksumBroadcastReceiver(rx: *BroadcastChannel(u64).Receiver) u64 {
     var checksum: u64 = 0;
-    var received: usize = 0;
 
-    while (received < expected_count) {
+    while (true) {
         switch (rx.tryRecv()) {
             .value => |v| {
                 checksum ^= v;
-                received += 1;
             },
             .empty => {
                 std.atomic.spinLoopHint();

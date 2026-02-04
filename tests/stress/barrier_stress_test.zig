@@ -154,7 +154,7 @@ test "Barrier stress - staggered arrivals" {
 
 fn staggeredTask(barrier: *Barrier, completed: *std.atomic.Value(usize), delay_factor: u64) void {
     // Stagger arrivals
-    std.time.sleep(delay_factor * std.time.ns_per_ms);
+    std.Thread.sleep(delay_factor * std.time.ns_per_ms);
 
     var waiter = BarrierWaiter.init();
 
