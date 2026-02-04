@@ -1,0 +1,39 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+
+# Reference implementations (not part of this project)
+tokio/
+
+# Test binaries
+test_bounded
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Coverage
+coverage/
+*.gcda
+*.gcno
+
+# Logs
+*.log
+
+# Local development
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.temp
+
+# Benchmark results (keep committed ones in benchmarks/)
+bench-results/
+
+# OS files
+Thumbs.db

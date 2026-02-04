@@ -1,0 +1,224 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Platform Tests - Run on all supported platforms
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  test-linux:
+    name: Linux (io_uring + epoll)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check kernel version
+        run: |
+          echo "Kernel: $(uname -r)"
+          # ubuntu-latest has kernel 5.15+ which supports io_uring
+          # io_uring requires 5.1+, full features need 5.11+
+
+      - name: Check formatting
+        run: zig fmt --check src/*.zig src/**/*.zig tests/**/*.zig build.zig
+
+      - name: Run unit tests (includes io_uring + epoll backend tests)
+        run: zig build test --summary all
+
+      - name: Run integration tests
+        run: zig build test-integration --summary all
+
+      - name: Run stress tests
+        run: zig build test-stress --summary all
+
+      - name: Build library
+        run: zig build
+
+  test-macos:
+    name: macOS (kqueue)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run unit tests (includes kqueue backend tests)
+        run: zig build test --summary all
+        # Note: io_uring tests skip on macOS (Linux-only)
+        # Note: IOCP tests skip on macOS (Windows-only)
+
+      - name: Run integration tests
+        run: zig build test-integration --summary all
+
+      - name: Run stress tests
+        run: zig build test-stress --summary all
+
+      - name: Build library
+        run: zig build
+
+  test-windows:
+    name: Windows (IOCP)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run unit tests (includes IOCP backend tests)
+        run: zig build test --summary all
+        # Note: This is the ONLY platform where IOCP tests actually run
+        # The 8 Windows-specific IOCP tests skip on Linux/macOS
+
+      - name: Run integration tests
+        run: zig build test-integration --summary all
+
+      - name: Build library
+        run: zig build
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Backend-Specific Tests
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Note: io_uring is Linux-only (kernel 5.1+)
+  # The test-linux job already runs io_uring tests on Ubuntu
+  # GitHub's ubuntu-latest has kernel 5.15+ which supports io_uring
+
+  # Note: kqueue is macOS/BSD-only
+  # The test-macos job runs kqueue tests
+
+  # Note: IOCP is Windows-only
+  # The test-windows job runs IOCP tests (the 8 Windows-specific tests)
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Robustness & Edge Cases
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  test-robustness:
+    name: Robustness Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run robustness tests
+        run: zig build test-robustness --summary all
+
+      - name: Run fuzz tests
+        run: zig build test-fuzz --summary all
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Code Coverage (Linux only, best-effort)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-22.04  # kcov works better on 22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install kcov
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y kcov
+
+      - name: Build and run tests with coverage
+        run: |
+          # Build the test executable
+          zig build test 2>&1 || true
+          # Find test binary and run with kcov
+          TEST_BIN=$(find .zig-cache -name "test" -type f -executable 2>/dev/null | head -1)
+          if [ -n "$TEST_BIN" ]; then
+            kcov --include-path=src coverage "$TEST_BIN" || true
+          else
+            echo "Test binary not found, skipping coverage"
+          fi
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          directory: coverage
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Benchmarks (main branch only)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run benchmarks
+        run: |
+          if zig build bench -Doptimize=ReleaseFast 2>/dev/null; then
+            echo "Benchmarks completed"
+          else
+            echo "No benchmark target configured yet"
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Summary Job - Ensures all platform tests pass
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  ci-success:
+    name: CI Success
+    needs: [test-linux, test-macos, test-windows, test-robustness]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.test-linux.result }}" != "success" ]]; then
+            echo "Linux tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-macos.result }}" != "success" ]]; then
+            echo "macOS tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-windows.result }}" != "success" ]]; then
+            echo "Windows tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-robustness.result }}" != "success" ]]; then
+            echo "Robustness tests failed"
+            exit 1
+          fi
+          echo "All CI checks passed!"

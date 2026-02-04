@@ -1,0 +1,18 @@
+.{
+    .fingerprint = 0x9203c3f1c19857e9,
+    .name = .blitz_io,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "README.md",
+        "CLAUDE.md",
+        "LICENSE",
+    },
+}
