@@ -70,6 +70,9 @@ pub const LocalQueue = local_queue.LocalQueue;
 /// Global task queue (MPMC)
 pub const GlobalQueue = global_queue.GlobalQueue;
 
+/// Sharded global task queue (MPMC with reduced contention)
+pub const ShardedGlobalQueue = global_queue.ShardedGlobalQueue;
+
 /// Timer wheel for efficient timeout handling
 pub const TimerWheel = timer.TimerWheel;
 

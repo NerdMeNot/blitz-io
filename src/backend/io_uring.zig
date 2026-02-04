@@ -60,6 +60,47 @@ pub fn getKernelVersion() ?struct { major: u32, minor: u32 } {
     return .{ .major = major, .minor = minor };
 }
 
+/// io_uring feature flags detected from kernel version.
+pub const Features = struct {
+    /// Multishot accept (kernel 5.19+).
+    has_multishot_accept: bool,
+
+    /// Multishot recv (kernel 6.0+).
+    has_multishot_recv: bool,
+
+    /// Buffer rings for provided buffers (kernel 5.19+).
+    has_buffer_ring: bool,
+
+    /// Single issuer optimization (kernel 5.11+).
+    has_single_issuer: bool,
+
+    /// Detect available features based on kernel version.
+    pub fn detect() Features {
+        const ver = getKernelVersion() orelse return .{
+            .has_multishot_accept = false,
+            .has_multishot_recv = false,
+            .has_buffer_ring = false,
+            .has_single_issuer = false,
+        };
+
+        return .{
+            // Multishot accept: kernel 5.19+
+            .has_multishot_accept = ver.major > 5 or (ver.major == 5 and ver.minor >= 19),
+            // Multishot recv: kernel 6.0+
+            .has_multishot_recv = ver.major >= 6,
+            // Buffer rings: kernel 5.19+
+            .has_buffer_ring = ver.major > 5 or (ver.major == 5 and ver.minor >= 19),
+            // Single issuer: kernel 5.11+
+            .has_single_issuer = ver.major > 5 or (ver.major == 5 and ver.minor >= 11),
+        };
+    }
+
+    /// Check if any multishot operations are available.
+    pub fn hasMultishot(self: Features) bool {
+        return self.has_multishot_accept or self.has_multishot_recv;
+    }
+};
+
 /// Operation lifecycle state.
 const Lifecycle = enum {
     /// Operation submitted to SQ, waiting for CQE.
@@ -78,12 +119,23 @@ const TrackedOp = struct {
     submission_id: SubmissionId,
     /// Lifecycle state.
     state: Lifecycle,
+    /// Whether this is a multishot operation (don't remove on first completion).
+    is_multishot: bool,
 
     fn init(op: Operation, submission_id: SubmissionId) TrackedOp {
         return .{
             .op = op,
             .submission_id = submission_id,
             .state = .submitted,
+            .is_multishot = isMultishotOp(op),
+        };
+    }
+
+    /// Check if an operation type is multishot.
+    fn isMultishotOp(op: Operation) bool {
+        return switch (op.op) {
+            .accept_multishot, .recv_multishot => true,
+            else => false,
         };
     }
 };
@@ -285,11 +337,26 @@ pub const IoUringBackend = struct {
             .accept => |a| {
                 sqe.prep_accept(a.fd, a.addr, a.addr_len, 0);
             },
+            .accept_multishot => |a| {
+                sqe.prep_accept(a.fd, a.addr, a.addr_len, 0);
+                // Set multishot flag - kernel will auto-rearm the accept
+                sqe.ioprio |= linux.IORING_ACCEPT_MULTISHOT;
+            },
             .connect => |c| {
                 sqe.prep_connect(c.fd, c.addr, c.addr_len);
             },
             .recv => |r| {
                 sqe.prep_recv(r.fd, r.buffer, r.flags);
+            },
+            .recv_multishot => |r| {
+                // Multishot recv uses provided buffers from a buffer ring
+                sqe.prep_recv(r.fd, &.{}, r.flags);
+                // Set buffer select flag - kernel will pick buffer from group
+                sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+                // Set multishot flag - kernel will auto-rearm
+                sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+                // Set buffer group ID
+                sqe.buf_index = r.buf_group;
             },
             .send => |s| {
                 sqe.prep_send(s.fd, s.buffer, s.flags);
@@ -374,8 +441,15 @@ pub const IoUringBackend = struct {
                 .flags = cqe.flags,
             };
 
-            // O(1) removal using encoded slab key
-            self.markCompletedFast(cqe.user_data);
+            // Handle multishot: check CQE_F_MORE flag
+            // If MORE is set, more completions are coming - DON'T remove from slab
+            // If MORE is not set, this is the final completion
+            const has_more = (cqe.flags & completion.CQEFlags.MORE) != 0;
+            if (!has_more) {
+                // Final completion (or non-multishot) - remove from slab
+                self.markCompletedFast(cqe.user_data);
+            }
+            // If has_more, leave the operation in the slab for subsequent completions
         }
 
         return count;
@@ -412,7 +486,12 @@ pub const IoUringBackend = struct {
                 .result = cqe.res,
                 .flags = cqe.flags,
             };
-            self.markCompletedFast(cqe.user_data);
+
+            // Handle multishot: only remove if this is the final completion
+            const has_more = (cqe.flags & completion.CQEFlags.MORE) != 0;
+            if (!has_more) {
+                self.markCompletedFast(cqe.user_data);
+            }
         }
 
         return count;
@@ -469,6 +548,29 @@ pub const IoUringBackend = struct {
     /// Get the io_uring file descriptor.
     pub fn fd(self: Self) posix.fd_t {
         return self.ring.fd;
+    }
+
+    /// Get detected kernel features.
+    pub fn getFeatures() Features {
+        return Features.detect();
+    }
+
+    /// Check if multishot accept is supported.
+    pub fn supportsMultishotAccept() bool {
+        return Features.detect().has_multishot_accept;
+    }
+
+    /// Check if multishot recv is supported.
+    pub fn supportsMultishotRecv() bool {
+        return Features.detect().has_multishot_recv;
+    }
+
+    /// Cancel a multishot operation.
+    /// For multishot operations, you may want to explicitly cancel them
+    /// when you're done accepting connections or receiving data.
+    pub fn cancelMultishot(self: *Self, id: SubmissionId) !void {
+        // Same as regular cancel
+        try self.cancel(id);
     }
 };
 
@@ -1072,4 +1174,142 @@ test "IoUringBackend - write operation on pipe" {
     var read_buf: [64]u8 = undefined;
     const read_len = try std.posix.read(pipe_fds[0], &read_buf);
     try std.testing.expectEqualStrings(write_data, read_buf[0..read_len]);
+}
+
+test "IoUringBackend - feature detection" {
+    const features = Features.detect();
+
+    // Just verify the detection doesn't crash
+    // The actual values depend on kernel version
+    if (getKernelVersion()) |ver| {
+        // On kernel 5.19+, we should have multishot accept
+        if (ver.major > 5 or (ver.major == 5 and ver.minor >= 19)) {
+            try std.testing.expect(features.has_multishot_accept);
+            try std.testing.expect(features.has_buffer_ring);
+        }
+
+        // On kernel 6.0+, we should have multishot recv
+        if (ver.major >= 6) {
+            try std.testing.expect(features.has_multishot_recv);
+        }
+    }
+}
+
+test "IoUringBackend - multishot accept basic" {
+    if (!isSupported()) return error.SkipZigTest;
+
+    // Skip if multishot accept is not supported
+    const features = Features.detect();
+    if (!features.has_multishot_accept) return error.SkipZigTest;
+
+    const Config = @import("../backend.zig").Config;
+    var backend = try IoUringBackend.init(std.testing.allocator, Config{});
+    defer backend.deinit();
+
+    // Create listening socket
+    const listen_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer std.posix.close(listen_fd);
+
+    // Bind to ephemeral port
+    var addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try std.posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    try std.posix.listen(listen_fd, 10);
+
+    // Get assigned port
+    var name_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    try std.posix.getsockname(listen_fd, @ptrCast(&addr), &name_len);
+
+    // Submit multishot accept
+    var accept_addr: std.posix.sockaddr = undefined;
+    var accept_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    const multishot_id = try backend.submit(.{
+        .op = .{
+            .accept_multishot = .{
+                .fd = listen_fd,
+                .addr = &accept_addr,
+                .addr_len = &accept_addr_len,
+            },
+        },
+        .user_data = 1000,
+    });
+
+    try std.testing.expect(multishot_id.isValid());
+    try std.testing.expectEqual(@as(usize, 1), backend.inFlightCount());
+
+    // Create first client and connect
+    const client1 = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(client1);
+    try std.posix.connect(client1, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+
+    // Wait for first accept completion
+    var completions: [8]Completion = undefined;
+    var count = try backend.wait(&completions, 100_000_000);
+
+    try std.testing.expect(count >= 1);
+    try std.testing.expectEqual(@as(u64, 1000), completions[0].user_data);
+    try std.testing.expect(completions[0].result > 0); // Got a client fd
+
+    // Check if MORE flag is set (multishot is still active)
+    // Note: The kernel may or may not set MORE depending on timing
+    const accepted_fd1: posix.fd_t = @intCast(completions[0].result);
+    defer std.posix.close(accepted_fd1);
+
+    // If MORE is set, operation should still be in-flight
+    if (completions[0].hasMore()) {
+        try std.testing.expectEqual(@as(usize, 1), backend.inFlightCount());
+
+        // Create second client
+        const client2 = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        defer std.posix.close(client2);
+        try std.posix.connect(client2, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+
+        // Wait for second accept
+        count = try backend.wait(&completions, 100_000_000);
+
+        try std.testing.expect(count >= 1);
+        try std.testing.expectEqual(@as(u64, 1000), completions[0].user_data);
+        try std.testing.expect(completions[0].result > 0);
+
+        const accepted_fd2: posix.fd_t = @intCast(completions[0].result);
+        std.posix.close(accepted_fd2);
+
+        // Cancel the multishot
+        try backend.cancelMultishot(multishot_id);
+    }
+
+    // After all completions without MORE, should be removed
+    // (or explicitly cancelled)
+}
+
+test "Completion - hasMore and hasBuffer" {
+    // Test CQE flag helpers
+    const comp_with_more = Completion{
+        .user_data = 1,
+        .result = 0,
+        .flags = completion.CQEFlags.MORE,
+    };
+    try std.testing.expect(comp_with_more.hasMore());
+    try std.testing.expect(!comp_with_more.hasBuffer());
+
+    const comp_with_buffer = Completion{
+        .user_data = 2,
+        .result = 0,
+        .flags = completion.CQEFlags.BUFFER | (42 << 16), // buffer ID 42
+    };
+    try std.testing.expect(!comp_with_buffer.hasMore());
+    try std.testing.expect(comp_with_buffer.hasBuffer());
+    try std.testing.expectEqual(@as(u16, 42), comp_with_buffer.getBufferId());
+
+    const comp_with_both = Completion{
+        .user_data = 3,
+        .result = 100,
+        .flags = completion.CQEFlags.MORE | completion.CQEFlags.BUFFER | (123 << 16),
+    };
+    try std.testing.expect(comp_with_both.hasMore());
+    try std.testing.expect(comp_with_both.hasBuffer());
+    try std.testing.expectEqual(@as(u16, 123), comp_with_both.getBufferId());
 }

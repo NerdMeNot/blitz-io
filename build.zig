@@ -144,6 +144,50 @@ pub fn build(b: *std.Build) void {
     }
 
     // ========================================================================
+    // Concurrency Tests
+    // ========================================================================
+    const concurrency_step = b.step("test-concurrency", "Run concurrency tests");
+
+    inline for (.{
+        "tests/concurrency/task_state_test.zig",
+        "tests/concurrency/work_steal_test.zig",
+    }) |test_file| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(test_file),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("blitz-io", blitz_io_mod);
+
+        const t = b.addTest(.{ .root_module = mod });
+        concurrency_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // Also add concurrency testing framework tests
+    const concurrency_framework_mod = b.createModule(.{
+        .root_source_file = b.path("src/test/concurrency.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const concurrency_framework_tests = b.addTest(.{
+        .root_module = concurrency_framework_mod,
+    });
+    concurrency_step.dependOn(&b.addRunArtifact(concurrency_framework_tests).step);
+
+    // Atomic log tests
+    const atomic_log_mod = b.createModule(.{
+        .root_source_file = b.path("src/test/atomic_log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const atomic_log_tests = b.addTest(.{
+        .root_module = atomic_log_mod,
+    });
+    concurrency_step.dependOn(&b.addRunArtifact(atomic_log_tests).step);
+
+    // ========================================================================
     // Interop Tests
     // ========================================================================
     const interop_step = b.step("test-interop", "Run interoperability tests");
@@ -172,6 +216,7 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(robustness_step);
     test_all_step.dependOn(fuzz_step);
     test_all_step.dependOn(interop_step);
+    test_all_step.dependOn(concurrency_step);
 
     // ========================================================================
     // Stress Test Executable (standalone runner)

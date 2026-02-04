@@ -21,6 +21,23 @@ pub const SubmissionId = struct {
     }
 };
 
+/// io_uring CQE flags
+pub const CQEFlags = struct {
+    /// If set, the application should expect more completions from this request.
+    /// Used by multishot operations (accept_multishot, recv_multishot).
+    pub const MORE: u32 = 1 << 1; // IORING_CQE_F_MORE
+
+    /// If set, the buffer index is valid.
+    /// Used with buffer rings for multishot recv.
+    pub const BUFFER: u32 = 1 << 0; // IORING_CQE_F_BUFFER
+
+    /// If set, more data is available to read (socket has more data).
+    pub const SOCK_NONEMPTY: u32 = 1 << 2; // IORING_CQE_F_SOCK_NONEMPTY
+
+    /// If set, this is a notification CQE (used with send/recv notifications).
+    pub const NOTIF: u32 = 1 << 3; // IORING_CQE_F_NOTIF
+};
+
 /// Result of an I/O completion.
 pub const Completion = struct {
     /// User data associated with the operation (typically task pointer).
@@ -48,6 +65,26 @@ pub const Completion = struct {
             return @enumFromInt(@as(u16, @intCast(-self.result)));
         }
         return null;
+    }
+
+    /// Check if more completions are expected from this multishot operation.
+    /// When true, the operation is still active and will produce more completions.
+    /// When false, this is the final completion and the operation is done.
+    pub fn hasMore(self: Completion) bool {
+        return (self.flags & CQEFlags.MORE) != 0;
+    }
+
+    /// Check if this completion has a buffer index (from buffer ring).
+    /// Used with multishot recv to identify which buffer was used.
+    pub fn hasBuffer(self: Completion) bool {
+        return (self.flags & CQEFlags.BUFFER) != 0;
+    }
+
+    /// Get the buffer ID from a completion that used provided buffers.
+    /// Only valid if hasBuffer() returns true.
+    pub fn getBufferId(self: Completion) u16 {
+        // Buffer ID is stored in upper 16 bits of flags
+        return @truncate(self.flags >> 16);
     }
 };
 
@@ -147,6 +184,18 @@ pub const Operation = struct {
             addr_len: ?*socklen_t,
         },
 
+        /// Multishot accept - one submission handles unlimited connections.
+        /// Available on Linux kernel 5.19+.
+        /// Unlike regular accept, this operation is NOT removed from tracking
+        /// when a completion arrives (unless it's the final completion).
+        accept_multishot: struct {
+            fd: fd_t,
+            /// Note: For multishot accept, addr storage must be persistent
+            /// since multiple completions will write to it.
+            addr: ?*sockaddr,
+            addr_len: ?*socklen_t,
+        },
+
         connect: struct {
             fd: fd_t,
             addr: *const sockaddr,
@@ -156,6 +205,16 @@ pub const Operation = struct {
         recv: struct {
             fd: fd_t,
             buffer: []u8,
+            flags: u32,
+        },
+
+        /// Multishot recv - one submission handles multiple receives.
+        /// Available on Linux kernel 6.0+ with buffer rings (kernel 5.19+).
+        /// Uses provided buffers from a buffer ring for zero-copy receives.
+        recv_multishot: struct {
+            fd: fd_t,
+            /// Buffer group ID (from registered buffer ring).
+            buf_group: u16,
             flags: u32,
         },
 

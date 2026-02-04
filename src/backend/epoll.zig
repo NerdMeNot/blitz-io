@@ -143,6 +143,9 @@ pub const EpollBackend = struct {
             .timeout => |t| try self.setupTimer(t.ns, token),
             // These don't need epoll registration
             .open, .close, .fsync, .nop, .cancel, .readv, .writev => {},
+            // Linux-only multishot operations - epoll fallback doesn't support these
+            // Use io_uring backend for multishot support
+            .accept_multishot, .recv_multishot => {},
         }
     }
 

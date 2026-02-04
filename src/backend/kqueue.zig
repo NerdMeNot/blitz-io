@@ -262,6 +262,8 @@ pub const KqueueBackend = struct {
             .open, .close, .fsync, .nop => null,
             // Not directly supported
             .readv, .writev, .cancel => null,
+            // Linux-only multishot operations - not supported on macOS/BSD
+            .accept_multishot, .recv_multishot => null,
         };
     }
 

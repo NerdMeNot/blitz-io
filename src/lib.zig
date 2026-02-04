@@ -863,6 +863,12 @@ pub const util = struct {
     pub const Pointers = @import("util/linked_list.zig").Pointers;
 };
 
+/// Testing utilities (concurrency framework, atomic logging)
+pub const testing = struct {
+    pub const concurrency = @import("test/concurrency.zig");
+    pub const atomic_log = @import("test/atomic_log.zig");
+};
+
 /// Blocking thread pool
 pub const BlockingPool = @import("blocking.zig").BlockingPool;
 
