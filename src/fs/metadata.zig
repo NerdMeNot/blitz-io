@@ -2,10 +2,29 @@
 //!
 //! Provides types for querying file metadata including size, timestamps,
 //! permissions, and file type.
+//!
+//! ## SystemTime
+//!
+//! Timestamps are returned as `SystemTime` which provides ergonomic methods:
+//!
+//! ```zig
+//! const meta = try fs.metadata("file.txt");
+//! const mtime = meta.modifiedTime();
+//!
+//! // Check if modified within last hour
+//! if (mtime.elapsed().asHours() < 1) {
+//!     // Recently modified
+//! }
+//!
+//! // Compare timestamps
+//! const atime = meta.accessedTime();
+//! const diff = mtime.durationSince(atime);
+//! ```
 
 const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
+const Duration = @import("../time.zig").Duration;
 
 /// Metadata about a file or directory.
 pub const Metadata = struct {
@@ -47,23 +66,51 @@ pub const Metadata = struct {
     }
 
     /// Get the last modification time as seconds since Unix epoch.
+    /// For a more ergonomic API, use `modifiedTime()` which returns `SystemTime`.
     pub fn modified(self: Metadata) i64 {
         return self.inner.mtime().tv_sec;
     }
 
     /// Get the last access time as seconds since Unix epoch.
+    /// For a more ergonomic API, use `accessedTime()` which returns `SystemTime`.
     pub fn accessed(self: Metadata) i64 {
         return self.inner.atime().tv_sec;
     }
 
     /// Get the creation time as seconds since Unix epoch (if available).
     /// Returns null on platforms that don't support creation time.
+    /// For a more ergonomic API, use `createdTime()` which returns `?SystemTime`.
     pub fn created(self: Metadata) ?i64 {
         if (comptime builtin.os.tag == .linux) {
             // Linux doesn't have creation time in stat
             return null;
         } else if (comptime builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
             return self.inner.birthtime().tv_sec;
+        } else {
+            return null;
+        }
+    }
+
+    /// Get the last modification time as SystemTime.
+    pub fn modifiedTime(self: Metadata) SystemTime {
+        const ts = self.inner.mtime();
+        return SystemTime.fromTimespec(ts);
+    }
+
+    /// Get the last access time as SystemTime.
+    pub fn accessedTime(self: Metadata) SystemTime {
+        const ts = self.inner.atime();
+        return SystemTime.fromTimespec(ts);
+    }
+
+    /// Get the creation time as SystemTime (if available).
+    /// Returns null on platforms that don't support creation time (Linux).
+    pub fn createdTime(self: Metadata) ?SystemTime {
+        if (comptime builtin.os.tag == .linux) {
+            return null;
+        } else if (comptime builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
+            const ts = self.inner.birthtime();
+            return SystemTime.fromTimespec(ts);
         } else {
             return null;
         }
@@ -228,6 +275,129 @@ pub const Permissions = struct {
     }
 };
 
+/// A point in time from the filesystem.
+///
+/// Provides ergonomic methods for comparing and measuring file timestamps.
+///
+/// ## Example
+///
+/// ```zig
+/// const meta = try fs.metadata("file.txt");
+/// const mtime = meta.modifiedTime();
+///
+/// // Check how long ago the file was modified
+/// const age = mtime.elapsed();
+/// if (age.asHours() < 1) {
+///     // Modified within the last hour
+/// }
+///
+/// // Compare two timestamps
+/// const atime = meta.accessedTime();
+/// if (mtime.isAfter(atime)) {
+///     // File was modified after it was last accessed (unusual)
+/// }
+/// ```
+pub const SystemTime = struct {
+    /// Seconds since Unix epoch (1970-01-01 00:00:00 UTC).
+    secs: i64,
+    /// Nanoseconds within the second (0 to 999,999,999).
+    nsecs: u32,
+
+    /// Unix epoch (1970-01-01 00:00:00 UTC).
+    pub const UNIX_EPOCH = SystemTime{ .secs = 0, .nsecs = 0 };
+
+    /// Create from seconds since Unix epoch.
+    pub fn fromSecs(secs: i64) SystemTime {
+        return .{ .secs = secs, .nsecs = 0 };
+    }
+
+    /// Create from a timespec.
+    pub fn fromTimespec(ts: posix.timespec) SystemTime {
+        return .{
+            .secs = ts.tv_sec,
+            .nsecs = if (ts.tv_nsec >= 0) @intCast(ts.tv_nsec) else 0,
+        };
+    }
+
+    /// Get the current system time.
+    pub fn now() SystemTime {
+        const ts = std.time.nanoTimestamp();
+        const secs = @divFloor(ts, std.time.ns_per_s);
+        const nsecs = @mod(ts, std.time.ns_per_s);
+        return .{
+            .secs = @intCast(secs),
+            .nsecs = @intCast(if (nsecs < 0) 0 else nsecs),
+        };
+    }
+
+    /// Duration elapsed since this time (from now).
+    /// Returns Duration.ZERO if this time is in the future.
+    pub fn elapsed(self: SystemTime) Duration {
+        const current = now();
+        return current.durationSince(self);
+    }
+
+    /// Duration between this time and an earlier time.
+    /// Returns Duration.ZERO if `earlier` is actually later than self.
+    pub fn durationSince(self: SystemTime, earlier: SystemTime) Duration {
+        const self_nanos = self.toNanos();
+        const earlier_nanos = earlier.toNanos();
+
+        if (self_nanos <= earlier_nanos) {
+            return Duration.ZERO;
+        }
+
+        return Duration.fromNanos(@intCast(self_nanos - earlier_nanos));
+    }
+
+    /// Check if this time is before another.
+    pub fn isBefore(self: SystemTime, other: SystemTime) bool {
+        if (self.secs != other.secs) {
+            return self.secs < other.secs;
+        }
+        return self.nsecs < other.nsecs;
+    }
+
+    /// Check if this time is after another.
+    pub fn isAfter(self: SystemTime, other: SystemTime) bool {
+        if (self.secs != other.secs) {
+            return self.secs > other.secs;
+        }
+        return self.nsecs > other.nsecs;
+    }
+
+    /// Add a duration to this time.
+    pub fn add(self: SystemTime, duration: Duration) SystemTime {
+        const total_nanos = self.toNanos() + @as(i128, duration.asNanos());
+        return fromNanosI128(total_nanos);
+    }
+
+    /// Subtract a duration from this time.
+    pub fn sub(self: SystemTime, duration: Duration) SystemTime {
+        const total_nanos = self.toNanos() - @as(i128, duration.asNanos());
+        return fromNanosI128(total_nanos);
+    }
+
+    /// Get seconds since Unix epoch.
+    pub fn asSecs(self: SystemTime) i64 {
+        return self.secs;
+    }
+
+    /// Get total nanoseconds since Unix epoch.
+    fn toNanos(self: SystemTime) i128 {
+        return @as(i128, self.secs) * std.time.ns_per_s + self.nsecs;
+    }
+
+    fn fromNanosI128(nanos: i128) SystemTime {
+        const secs = @divFloor(nanos, std.time.ns_per_s);
+        const nsecs = @mod(nanos, std.time.ns_per_s);
+        return .{
+            .secs = @intCast(secs),
+            .nsecs = @intCast(if (nsecs < 0) 0 else nsecs),
+        };
+    }
+};
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -251,4 +421,48 @@ test "FileType - from mode" {
     try std.testing.expectEqual(FileType.file, FileType.fromMode(posix.S.IFREG));
     try std.testing.expectEqual(FileType.directory, FileType.fromMode(posix.S.IFDIR));
     try std.testing.expectEqual(FileType.sym_link, FileType.fromMode(posix.S.IFLNK));
+}
+
+test "SystemTime - from seconds" {
+    const t = SystemTime.fromSecs(1000);
+    try std.testing.expectEqual(@as(i64, 1000), t.secs);
+    try std.testing.expectEqual(@as(u32, 0), t.nsecs);
+}
+
+test "SystemTime - comparisons" {
+    const t1 = SystemTime.fromSecs(100);
+    const t2 = SystemTime.fromSecs(200);
+
+    try std.testing.expect(t1.isBefore(t2));
+    try std.testing.expect(t2.isAfter(t1));
+    try std.testing.expect(!t1.isAfter(t2));
+    try std.testing.expect(!t2.isBefore(t1));
+}
+
+test "SystemTime - duration arithmetic" {
+    const t1 = SystemTime.fromSecs(100);
+    const t2 = SystemTime.fromSecs(150);
+
+    const diff = t2.durationSince(t1);
+    try std.testing.expectEqual(@as(u64, 50), diff.asSecs());
+
+    // Duration since later time should be zero
+    const zero_diff = t1.durationSince(t2);
+    try std.testing.expectEqual(@as(u64, 0), zero_diff.asSecs());
+}
+
+test "SystemTime - add and sub" {
+    const t = SystemTime.fromSecs(100);
+    const d = Duration.fromSecs(50);
+
+    const t_plus = t.add(d);
+    try std.testing.expectEqual(@as(i64, 150), t_plus.secs);
+
+    const t_minus = t.sub(d);
+    try std.testing.expectEqual(@as(i64, 50), t_minus.secs);
+}
+
+test "SystemTime - UNIX_EPOCH" {
+    try std.testing.expectEqual(@as(i64, 0), SystemTime.UNIX_EPOCH.secs);
+    try std.testing.expectEqual(@as(u32, 0), SystemTime.UNIX_EPOCH.nsecs);
 }

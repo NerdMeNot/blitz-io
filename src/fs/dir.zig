@@ -37,7 +37,7 @@ pub fn createDir(path: []const u8) !void {
 /// Create a new directory with specific permissions.
 pub fn createDirMode(path: []const u8, mode: u32) !void {
     const path_z = try posix.toPosixPath(path);
-    try posix.mkdiratZ(posix.AT.FDCWD, &path_z, mode);
+    try posix.mkdiratZ(posix.AT.FDCWD, &path_z, @intCast(mode));
 }
 
 /// Create a directory and all parent directories as needed.
@@ -175,9 +175,27 @@ pub fn readDir(path: []const u8) !ReadDir {
 }
 
 /// Directory builder with configurable options.
+///
+/// ## Example
+///
+/// ```zig
+/// // Create nested directories with custom mode
+/// try DirBuilder.new()
+///     .setRecursive(true)
+///     .setMode(0o700)
+///     .create("path/to/private/dir");
+///
+/// // Set mode on all created directories (not just the final one)
+/// try DirBuilder.new()
+///     .setRecursive(true)
+///     .setMode(0o700)
+///     .setModeForAll(true)
+///     .create("a/b/c");  // All three get 0o700
+/// ```
 pub const DirBuilder = struct {
     recursive: bool = false,
     mode: u32 = 0o755,
+    mode_for_all: bool = false,
 
     pub fn new() DirBuilder {
         return .{};
@@ -191,21 +209,61 @@ pub const DirBuilder = struct {
     }
 
     /// Set the directory permissions.
-    pub fn setMode(self: DirBuilder, mode: u32) DirBuilder {
+    pub fn setMode(self: DirBuilder, mode_val: u32) DirBuilder {
         var builder = self;
-        builder.mode = mode;
+        builder.mode = mode_val;
+        return builder;
+    }
+
+    /// When true, apply mode to all created directories (including parents).
+    /// When false (default), only the final directory gets the custom mode.
+    /// This matches the difference between `mkdir -p` (false) and a custom
+    /// implementation that sets mode on each created directory (true).
+    pub fn setModeForAll(self: DirBuilder, value: bool) DirBuilder {
+        var builder = self;
+        builder.mode_for_all = value;
         return builder;
     }
 
     /// Create the directory.
     pub fn create(self: DirBuilder, path: []const u8) !void {
         if (self.recursive) {
-            try createDirAll(path);
-            // Set final mode
-            const path_z = try posix.toPosixPath(path);
-            try posix.chmodZ(&path_z, self.mode);
+            if (self.mode_for_all) {
+                try self.createDirAllWithMode(path);
+            } else {
+                try createDirAll(path);
+                // Set final mode only
+                try posix.fchmodat(posix.AT.FDCWD, path, @intCast(self.mode), 0);
+            }
         } else {
             try createDirMode(path, self.mode);
+        }
+    }
+
+    /// Create all directories with the configured mode.
+    fn createDirAllWithMode(self: DirBuilder, path: []const u8) !void {
+        var end: usize = 0;
+
+        while (end < path.len) {
+            while (end < path.len and path[end] != '/') : (end += 1) {}
+
+            if (end > 0) {
+                const subpath = path[0..end];
+                createDirMode(subpath, self.mode) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                };
+            }
+
+            end += 1;
+        }
+
+        // Create the final directory
+        if (path.len > 0) {
+            createDirMode(path, self.mode) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
         }
     }
 };
@@ -274,4 +332,29 @@ test "DirBuilder" {
 
     try std.testing.expect(builder.recursive);
     try std.testing.expectEqual(@as(u32, 0o700), builder.mode);
+}
+
+test "DirBuilder - modeForAll" {
+    const path = "/tmp/blitz_io_dirbuilder_all/a/b/c";
+    const base = "/tmp/blitz_io_dirbuilder_all";
+
+    // Create with mode for all directories
+    try DirBuilder.new()
+        .setRecursive(true)
+        .setMode(0o700)
+        .setModeForAll(true)
+        .create(path);
+
+    defer removeDirAll(std.testing.allocator, base) catch {};
+
+    // Check that intermediate directories also have the mode
+    const stat_a = try posix.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath("/tmp/blitz_io_dirbuilder_all/a")), 0);
+    const stat_b = try posix.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath("/tmp/blitz_io_dirbuilder_all/a/b")), 0);
+    const stat_c = try posix.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath(path)), 0);
+
+    // Mode should be 0o700 for all (with directory bit)
+    const expected_mode = 0o700;
+    try std.testing.expectEqual(expected_mode, stat_a.mode & 0o777);
+    try std.testing.expectEqual(expected_mode, stat_b.mode & 0o777);
+    try std.testing.expectEqual(expected_mode, stat_c.mode & 0o777);
 }

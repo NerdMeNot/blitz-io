@@ -43,9 +43,17 @@ pub fn readFile(allocator: mem.Allocator, path: []const u8) ![]u8 {
     return file.readToEnd(allocator);
 }
 
-/// Read the entire contents of a file as a string.
+/// Read the entire contents of a file as a validated UTF-8 string.
+/// Returns error.InvalidUtf8 if the file contains invalid UTF-8 sequences.
 pub fn readFileString(allocator: mem.Allocator, path: []const u8) ![]u8 {
-    return readFile(allocator, path);
+    const data = try readFile(allocator, path);
+    errdefer allocator.free(data);
+
+    if (!std.unicode.utf8ValidateSlice(data)) {
+        return error.InvalidUtf8;
+    }
+
+    return data;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -207,6 +215,36 @@ test "readFile and writeFile" {
     defer std.testing.allocator.free(data);
 
     try std.testing.expectEqualStrings(content, data);
+}
+
+test "readFileString - valid UTF-8" {
+    const path = "/tmp/blitz_io_utf8_valid.txt";
+    const content = "Hello, 世界! 🎉";
+
+    try writeFile(path, content);
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    const data = try readFileString(std.testing.allocator, path);
+    defer std.testing.allocator.free(data);
+
+    try std.testing.expectEqualStrings(content, data);
+}
+
+test "readFileString - invalid UTF-8" {
+    const path = "/tmp/blitz_io_utf8_invalid.bin";
+
+    // Write invalid UTF-8 sequence
+    {
+        var file = try File.create(path);
+        defer file.close();
+        // 0xFF 0xFE is invalid UTF-8
+        try file.writeAll(&[_]u8{ 0xFF, 0xFE, 0x00 });
+    }
+
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    const result = readFileString(std.testing.allocator, path);
+    try std.testing.expectError(error.InvalidUtf8, result);
 }
 
 test "appendFile" {

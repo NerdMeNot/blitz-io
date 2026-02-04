@@ -89,6 +89,9 @@ pub const Permissions = @import("fs/metadata.zig").Permissions;
 /// File type (file, directory, symlink, etc.).
 pub const FileType = @import("fs/metadata.zig").FileType;
 
+/// A point in time from the filesystem (for timestamps).
+pub const SystemTime = @import("fs/metadata.zig").SystemTime;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Async File I/O (requires Runtime)
 // ═══════════════════════════════════════════════════════════════════════════════
