@@ -426,6 +426,11 @@ pub const AsyncFile = struct {
         }
     }
 
+    /// Alias for syncAll (consistency with File).
+    pub fn sync(self: *Self) !void {
+        try self.syncAll();
+    }
+
     fn fsyncIoUring(self: *Self, datasync: bool) !void {
         const backend = self.runtime.scheduler.getBackend();
 
@@ -625,6 +630,27 @@ pub fn writeFileAsync(rt: *Runtime, path: []const u8, data: []const u8) !void {
 
     try file.writeAll(data);
     try file.syncAll();
+}
+
+/// Append data to a file using async I/O.
+pub fn appendFileAsync(rt: *Runtime, path: []const u8, data: []const u8) !void {
+    const handle = try openSyncAppend(path);
+    var file = AsyncFile{ .handle = handle, .runtime = rt };
+    defer file.close();
+
+    try file.writeAll(data);
+    try file.syncAll();
+}
+
+fn openSyncAppend(path: []const u8) !posix.fd_t {
+    var flags: posix.O = .{};
+    flags.ACCMODE = .WRONLY;
+    flags.CREAT = true;
+    flags.APPEND = true;
+    flags.CLOEXEC = true;
+
+    const path_z = try posix.toPosixPath(path);
+    return posix.openZ(&path_z, flags, 0o666);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

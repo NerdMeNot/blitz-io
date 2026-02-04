@@ -236,6 +236,18 @@ pub const File = struct {
         return std_file.getPos();
     }
 
+    /// Seek to a specific position from the start.
+    /// Convenience wrapper around seek(pos, .start).
+    pub fn seekTo(self: *File, pos: u64) !void {
+        _ = try self.seek(@intCast(pos), .start);
+    }
+
+    /// Seek by a relative offset from current position.
+    /// Returns the new position.
+    pub fn seekBy(self: *File, offset: i64) !u64 {
+        return self.seek(offset, .current);
+    }
+
     /// Get the length of the file.
     pub fn getLen(self: *File) !u64 {
         const meta = try self.metadata();
@@ -666,6 +678,37 @@ test "File - position tracking" {
         // Rewind
         try file.rewind();
         try std.testing.expectEqual(@as(u64, 0), try file.getPos());
+    }
+
+    try std.fs.deleteFileAbsolute(path);
+}
+
+test "File - seekTo and seekBy" {
+    const path = "/tmp/blitz_io_test_seekto.txt";
+
+    {
+        var file = try File.create(path);
+        defer file.close();
+        try file.writeAll("0123456789");
+    }
+
+    {
+        var file = try File.open(path);
+        defer file.close();
+
+        // seekTo absolute position
+        try file.seekTo(5);
+        try std.testing.expectEqual(@as(u64, 5), try file.getPos());
+
+        // seekBy relative offset (forward)
+        const pos1 = try file.seekBy(2);
+        try std.testing.expectEqual(@as(u64, 7), pos1);
+        try std.testing.expectEqual(@as(u64, 7), try file.getPos());
+
+        // seekBy relative offset (backward)
+        const pos2 = try file.seekBy(-3);
+        try std.testing.expectEqual(@as(u64, 4), pos2);
+        try std.testing.expectEqual(@as(u64, 4), try file.getPos());
     }
 
     try std.fs.deleteFileAbsolute(path);

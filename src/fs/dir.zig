@@ -202,7 +202,8 @@ pub const DirBuilder = struct {
         if (self.recursive) {
             try createDirAll(path);
             // Set final mode
-            try posix.chmodZ(try posix.toPosixPath(path), self.mode);
+            const path_z = try posix.toPosixPath(path);
+            try posix.chmodZ(&path_z, self.mode);
         } else {
             try createDirMode(path, self.mode);
         }

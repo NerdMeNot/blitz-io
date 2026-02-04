@@ -106,6 +106,9 @@ pub const readFileAsync = async_file_mod.readFileAsync;
 /// Write entire file using async I/O.
 pub const writeFileAsync = async_file_mod.writeFileAsync;
 
+/// Append to file using async I/O.
+pub const appendFileAsync = async_file_mod.appendFileAsync;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Directory Types
 // ═══════════════════════════════════════════════════════════════════════════════
