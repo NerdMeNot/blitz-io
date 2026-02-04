@@ -162,18 +162,34 @@ pub const Mutex = struct {
     /// Release the lock.
     /// If there are waiters, grants the lock to the first one.
     pub fn unlock(self: *Self) void {
+        // Copy waker info before setting acquired, because once acquired is set,
+        // the waiting thread may destroy the waiter (use-after-free race).
+        var waker_fn: ?WakerFn = null;
+        var waker_ctx: ?*anyopaque = null;
+
         self.wait_lock.lock();
 
         // Check for waiters
         if (self.waiters.popFront()) |waiter| {
+            // Copy waker BEFORE setting acquired
+            waker_fn = waiter.waker;
+            waker_ctx = waiter.waker_ctx;
+
             // Grant lock to waiter (don't change locked state)
+            // WARNING: After this line, waiter may be freed by the waiting thread!
             waiter.acquired = true;
-            self.wait_lock.unlock();
-            waiter.wake();
         } else {
             // No waiters - unlock
             self.locked.store(false, .release);
-            self.wait_lock.unlock();
+        }
+
+        self.wait_lock.unlock();
+
+        // Wake outside lock using copied function pointers (safe even if waiter is freed)
+        if (waker_fn) |wf| {
+            if (waker_ctx) |ctx| {
+                wf(ctx);
+            }
         }
     }
 

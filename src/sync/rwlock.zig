@@ -198,7 +198,9 @@ pub const RwLock = struct {
 
     /// Release read lock.
     pub fn readUnlock(self: *Self) void {
-        var writer_to_wake: ?*WriteWaiter = null;
+        // Copy waker info before setting acquired to avoid use-after-free race
+        var waker_fn: ?WakerFn = null;
+        var waker_ctx: ?*anyopaque = null;
 
         self.mutex.lock();
 
@@ -207,8 +209,11 @@ pub const RwLock = struct {
 
         // If no more readers and writers waiting, wake one writer
         if (self.readers == 0 and self.write_waiters.count() > 0) {
-            writer_to_wake = self.write_waiters.popFront();
-            if (writer_to_wake) |w| {
+            if (self.write_waiters.popFront()) |w| {
+                // Copy waker BEFORE setting acquired
+                waker_fn = w.waker;
+                waker_ctx = w.waker_ctx;
+                // After this, waiter may be freed by waiting thread
                 w.acquired = true;
                 self.writer_active = true;
             }
@@ -216,9 +221,11 @@ pub const RwLock = struct {
 
         self.mutex.unlock();
 
-        // Wake outside lock
-        if (writer_to_wake) |w| {
-            w.wake();
+        // Wake outside lock using copied function pointers
+        if (waker_fn) |wf| {
+            if (waker_ctx) |ctx| {
+                wf(ctx);
+            }
         }
     }
 
@@ -283,7 +290,9 @@ pub const RwLock = struct {
     /// Release write lock.
     pub fn writeUnlock(self: *Self) void {
         var wake_list: WakeList(32) = .{};
-        var writer_to_wake: ?*WriteWaiter = null;
+        // Copy waker info to avoid use-after-free race
+        var writer_waker_fn: ?WakerFn = null;
+        var writer_waker_ctx: ?*anyopaque = null;
 
         self.mutex.lock();
 
@@ -293,29 +302,36 @@ pub const RwLock = struct {
         // Prefer waking writers (writer priority) OR wake all waiting readers
         if (self.write_waiters.count() > 0) {
             // Wake one writer
-            writer_to_wake = self.write_waiters.popFront();
-            if (writer_to_wake) |w| {
+            if (self.write_waiters.popFront()) |w| {
+                // Copy waker BEFORE setting acquired
+                writer_waker_fn = w.waker;
+                writer_waker_ctx = w.waker_ctx;
+                // After this, waiter may be freed by waiting thread
                 w.acquired = true;
                 self.writer_active = true;
             }
         } else {
-            // Wake all waiting readers
+            // Wake all waiting readers - copy waker info before setting acquired
             while (self.read_waiters.popFront()) |r| {
-                r.acquired = true;
-                self.readers += 1;
+                // Copy waker BEFORE setting acquired
                 if (r.waker) |wf| {
                     if (r.waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }
+                // After this, waiter may be freed by waiting thread
+                r.acquired = true;
+                self.readers += 1;
             }
         }
 
         self.mutex.unlock();
 
-        // Wake outside lock
-        if (writer_to_wake) |w| {
-            w.wake();
+        // Wake outside lock using copied function pointers
+        if (writer_waker_fn) |wf| {
+            if (writer_waker_ctx) |ctx| {
+                wf(ctx);
+            }
         }
         wake_list.wakeAll();
     }
