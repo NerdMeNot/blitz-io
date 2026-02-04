@@ -217,12 +217,16 @@ pub const Semaphore = struct {
                 available -= needed;
                 _ = self.permits.fetchSub(needed, .release);
                 waiter.acquired = waiter.permits;
+
+                // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
+                const waker_fn = waiter.waker;
+                const waker_ctx = waiter.waker_ctx;
                 waiter.complete = true;
 
                 _ = self.waiters.popFront();
 
-                if (waiter.waker) |wf| {
-                    if (waiter.waker_ctx) |ctx| {
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }

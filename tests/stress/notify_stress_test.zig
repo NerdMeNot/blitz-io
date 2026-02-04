@@ -17,22 +17,23 @@ test "Notify stress - notifyOne wakes single waiter" {
 
     var notify = Notify.init();
     var woken_count = std.atomic.Value(usize).init(0);
+    var registered_count = std.atomic.Value(usize).init(0);
 
     const num_waiters = 50;
 
-    // Spawn waiters
+    // Spawn waiters - they signal when registered
     for (0..num_waiters) |_| {
-        try scope.spawn(notifyWaiter, .{ &notify, &woken_count });
+        try scope.spawn(notifyWaiter, .{ &notify, &woken_count, &registered_count });
     }
 
-    // Give waiters time to register
-    std.Thread.sleep(std.time.ns_per_ms * 10);
+    // Wait for ALL waiters to actually register (not just sleep and hope)
+    while (registered_count.load(.acquire) < num_waiters) {
+        std.atomic.spinLoopHint();
+    }
 
-    // Wake them one by one
+    // Now all waiters are in the queue - wake them one by one
     for (0..num_waiters) |_| {
         notify.notifyOne();
-        // Small delay to let wakeup propagate
-        std.Thread.sleep(std.time.ns_per_us * 100);
     }
 
     try scope.wait();
@@ -40,11 +41,16 @@ test "Notify stress - notifyOne wakes single waiter" {
     try testing.expectEqual(@as(usize, num_waiters), woken_count.load(.acquire));
 }
 
-fn notifyWaiter(notify: *Notify, woken: *std.atomic.Value(usize)) void {
+fn notifyWaiter(notify: *Notify, woken: *std.atomic.Value(usize), registered: *std.atomic.Value(usize)) void {
     var waiter = NotifyWaiter.init();
 
-    // wait() returns true if notified immediately, false if we need to wait
-    if (!notify.wait(&waiter)) {
+    // wait() returns true if notified immediately (permit consumed), false if we need to wait
+    const immediate = notify.wait(&waiter);
+
+    // Signal AFTER wait() so main thread knows we're actually in the queue
+    _ = registered.fetchAdd(1, .acq_rel);
+
+    if (!immediate) {
         // Spin until notified
         while (!waiter.isNotified()) {
             std.atomic.spinLoopHint();
@@ -213,18 +219,22 @@ test "Notify stress - multiple notifyAll bursts" {
 
     var notify = Notify.init();
     var total_wakes = std.atomic.Value(usize).init(0);
+    var registered = std.atomic.Value(usize).init(0);
 
     const num_waiters = 20;
     const bursts = 5;
 
-    for (0..bursts) |_| {
+    for (0..bursts) |burst| {
         // Spawn batch of waiters
         for (0..num_waiters) |_| {
-            try scope.spawn(burstWaiter, .{ &notify, &total_wakes });
+            try scope.spawn(burstWaiter, .{ &notify, &total_wakes, &registered });
         }
 
-        // Small delay for waiters to register
-        std.Thread.sleep(std.time.ns_per_ms * 5);
+        // Wait for this batch to actually register
+        const expected = (burst + 1) * num_waiters;
+        while (registered.load(.acquire) < expected) {
+            std.atomic.spinLoopHint();
+        }
 
         // Wake all
         notify.notifyAll();
@@ -235,11 +245,16 @@ test "Notify stress - multiple notifyAll bursts" {
     try testing.expectEqual(@as(usize, num_waiters * bursts), total_wakes.load(.acquire));
 }
 
-fn burstWaiter(notify: *Notify, wakes: *std.atomic.Value(usize)) void {
+fn burstWaiter(notify: *Notify, wakes: *std.atomic.Value(usize), registered: *std.atomic.Value(usize)) void {
     var waiter = NotifyWaiter.init();
 
     // wait() returns true if notified immediately, false if we need to wait
-    if (!notify.wait(&waiter)) {
+    const immediate = notify.wait(&waiter);
+
+    // Signal AFTER wait() so main knows we're in the queue
+    _ = registered.fetchAdd(1, .acq_rel);
+
+    if (!immediate) {
         while (!waiter.isNotified()) {
             std.atomic.spinLoopHint();
         }

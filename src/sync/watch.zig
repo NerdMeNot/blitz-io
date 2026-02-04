@@ -260,10 +260,13 @@ pub fn Watch(comptime T: type) type {
             self.version +%= 1;
 
             // Wake all waiters
+            // CRITICAL: Copy waker info BEFORE setting notified flag to avoid use-after-free
             while (self.waiters.popFront()) |w| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
                 w.notified = true;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }
@@ -283,10 +286,13 @@ pub fn Watch(comptime T: type) type {
             modify_fn(&self.value);
             self.version +%= 1;
 
+            // CRITICAL: Copy waker info BEFORE setting notified flag to avoid use-after-free
             while (self.waiters.popFront()) |w| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
                 w.notified = true;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }
@@ -315,10 +321,13 @@ pub fn Watch(comptime T: type) type {
 
             self.closed = true;
 
+            // CRITICAL: Copy waker info BEFORE setting closed flag to avoid use-after-free
             while (self.waiters.popFront()) |w| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
                 w.closed = true;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }

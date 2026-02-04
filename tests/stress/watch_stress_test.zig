@@ -68,32 +68,20 @@ fn watchSender(watch: *Watch(u64), count: usize, receivers_ready: *std.atomic.Va
 }
 
 fn watchReceiver(rx: *Watch(u64).Receiver, final_value: *std.atomic.Value(u64), ready: *std.atomic.Value(usize)) void {
-    var last_seen: u64 = 0;
-
     // Signal that we're ready
     _ = ready.fetchAdd(1, .acq_rel);
 
-    while (true) {
+    while (!rx.isClosed()) {
         if (rx.hasChanged()) {
-            // Use get() which properly locks
-            const value = rx.get();
-            last_seen = value;
+            _ = rx.get();
             rx.markSeen();
         }
-
-        if (rx.isClosed()) {
-            // Check one more time after close to catch final value
-            if (rx.hasChanged()) {
-                last_seen = rx.get();
-            }
-            break;
-        }
-
         std.atomic.spinLoopHint();
     }
 
-    // Store final value
-    final_value.store(last_seen, .release);
+    // After close, always read the final value directly
+    // This ensures we don't miss the last update due to race between close and hasChanged
+    final_value.store(rx.get(), .release);
 }
 
 test "Watch stress - rapid updates" {

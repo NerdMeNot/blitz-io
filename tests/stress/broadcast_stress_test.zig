@@ -19,7 +19,8 @@ const NUM_RECEIVERS_LARGE: usize = if (is_debug) 5 else 20;
 test "BroadcastChannel stress - all receivers get all messages" {
     const allocator = testing.allocator;
 
-    var channel = try BroadcastChannel(u64).init(allocator, 256);
+    // Buffer must hold all messages to guarantee no lag
+    var channel = try BroadcastChannel(u64).init(allocator, NUM_MESSAGES + 64);
     defer channel.deinit();
 
     var scope = Scope.init(allocator);
@@ -33,17 +34,15 @@ test "BroadcastChannel stress - all receivers get all messages" {
 
     var receiver_sums: [NUM_RECEIVERS]u64 = undefined;
     var sender_sum: u64 = 0;
+    var receivers_ready = std.atomic.Value(usize).init(0);
 
-    // Spawn receivers first so they're ready
+    // Spawn receivers first - they signal when in their loop
     for (0..NUM_RECEIVERS) |i| {
-        try scope.spawnWithResult(broadcastReceiver, .{&receivers[i]}, &receiver_sums[i]);
+        try scope.spawnWithResult(broadcastReceiverWithReady, .{ &receivers[i], &receivers_ready }, &receiver_sums[i]);
     }
 
-    // Small delay to ensure receivers are waiting
-    std.atomic.spinLoopHint();
-
-    // Spawn sender - it will close channel when done
-    try scope.spawnWithResult(broadcastSender, .{ &channel, NUM_MESSAGES }, &sender_sum);
+    // Spawn sender - it waits for all receivers to be ready
+    try scope.spawnWithResult(broadcastSenderWithReady, .{ &channel, NUM_MESSAGES, &receivers_ready, NUM_RECEIVERS }, &sender_sum);
 
     try scope.wait();
 
@@ -53,20 +52,27 @@ test "BroadcastChannel stress - all receivers get all messages" {
     }
 }
 
-fn broadcastSender(channel: *BroadcastChannel(u64), count: usize) u64 {
+fn broadcastSenderWithReady(channel: *BroadcastChannel(u64), count: usize, ready: *std.atomic.Value(usize), expected: usize) u64 {
+    // Wait for all receivers to be in their polling loop
+    while (ready.load(.acquire) < expected) {
+        std.atomic.spinLoopHint();
+    }
+
     var sum: u64 = 0;
     for (0..count) |i| {
         const value: u64 = @intCast(i + 1);
         _ = channel.send(value);
         sum += value;
     }
-    channel.close(); // Signal receivers to stop
+    channel.close();
     return sum;
 }
 
-fn broadcastReceiver(receiver: *BroadcastChannel(u64).Receiver) u64 {
-    var sum: u64 = 0;
+fn broadcastReceiverWithReady(receiver: *BroadcastChannel(u64).Receiver, ready: *std.atomic.Value(usize)) u64 {
+    // Signal that we're about to start polling
+    _ = ready.fetchAdd(1, .acq_rel);
 
+    var sum: u64 = 0;
     while (true) {
         switch (receiver.tryRecv()) {
             .value => |v| {
@@ -76,7 +82,7 @@ fn broadcastReceiver(receiver: *BroadcastChannel(u64).Receiver) u64 {
                 std.atomic.spinLoopHint();
             },
             .lagged => |_| {
-                // Skip lagged messages - shouldn't happen with large buffer
+                // Shouldn't happen with large buffer
             },
             .closed => break,
         }

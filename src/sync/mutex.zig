@@ -49,8 +49,8 @@ pub const Waiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
 
-    /// Whether lock has been acquired
-    acquired: bool = false,
+    /// Whether lock has been acquired (atomic for cross-thread visibility)
+    acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Intrusive list pointers
     pointers: Pointers(Waiter) = .{},
@@ -76,14 +76,14 @@ pub const Waiter = struct {
         }
     }
 
-    /// Check if lock was acquired
+    /// Check if lock was acquired (uses acquire ordering for cross-thread visibility)
     pub fn isAcquired(self: *const Self) bool {
-        return self.acquired;
+        return self.acquired.load(.acquire);
     }
 
     /// Reset for reuse
     pub fn reset(self: *Self) void {
-        self.acquired = false;
+        self.acquired.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -136,7 +136,7 @@ pub const Mutex = struct {
     pub fn lock(self: *Self, waiter: *Waiter) bool {
         // Fast path: try to acquire without lock
         if (self.tryLock()) {
-            waiter.acquired = true;
+            waiter.acquired.store(true, .release);
             return true;
         }
 
@@ -146,12 +146,12 @@ pub const Mutex = struct {
         // Re-check under lock
         if (self.locked.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
             self.wait_lock.unlock();
-            waiter.acquired = true;
+            waiter.acquired.store(true, .release);
             return true;
         }
 
         // Add to waiters list
-        waiter.acquired = false;
+        waiter.acquired.store(false, .release);
         self.waiters.pushBack(waiter);
 
         self.wait_lock.unlock();
@@ -177,7 +177,7 @@ pub const Mutex = struct {
 
             // Grant lock to waiter (don't change locked state)
             // WARNING: After this line, waiter may be freed by the waiting thread!
-            waiter.acquired = true;
+            waiter.acquired.store(true, .release);
         } else {
             // No waiters - unlock
             self.locked.store(false, .release);

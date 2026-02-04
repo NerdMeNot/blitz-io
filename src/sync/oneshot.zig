@@ -68,9 +68,9 @@ pub fn Oneshot(comptime T: type) type {
             /// The value (valid when state == .value_sent)
             value: ?T,
 
-            /// Receiver waker (valid when state == .receiver_waiting)
-            waker: ?WakerFn,
-            waker_ctx: ?*anyopaque,
+            /// Waiting receiver (valid when state == .receiver_waiting)
+            /// We store the waiter pointer so sender can set waiter.value directly
+            waiter: ?*RecvWaiter,
 
             /// Mutex for state transitions
             mutex: std.Thread.Mutex,
@@ -79,8 +79,7 @@ pub fn Oneshot(comptime T: type) type {
                 return .{
                     .state = std.atomic.Value(u8).init(@intFromEnum(State.empty)),
                     .value = null,
-                    .waker = null,
-                    .waker_ctx = null,
+                    .waiter = null,
                     .mutex = .{},
                 };
             }
@@ -146,18 +145,24 @@ pub fn Oneshot(comptime T: type) type {
                         return true;
                     },
                     .receiver_waiting => {
-                        // Receiver is waiting, deliver directly
-                        self.shared.value = value;
-                        self.shared.state.store(@intFromEnum(State.value_sent), .release);
+                        // Receiver is waiting, deliver directly to waiter
+                        // Copy waiter pointer and waker info BEFORE setting value
+                        // (to avoid use-after-free if waiter checks value and destroys itself)
+                        const waiter = self.shared.waiter.?;
+                        const waker = waiter.waker;
+                        const ctx = waiter.waker_ctx;
 
-                        const waker = self.shared.waker;
-                        const ctx = self.shared.waker_ctx;
-                        self.shared.waker = null;
-                        self.shared.waker_ctx = null;
+                        // Store value in both places
+                        self.shared.value = value;
+                        waiter.value = value;
+
+                        // Clear waiter pointer and update state
+                        self.shared.waiter = null;
+                        self.shared.state.store(@intFromEnum(State.value_sent), .release);
 
                         self.shared.mutex.unlock();
 
-                        // Wake receiver outside lock
+                        // Wake receiver outside lock using copied waker
                         if (waker) |wf| {
                             if (ctx) |c| {
                                 wf(c);
@@ -189,16 +194,21 @@ pub fn Oneshot(comptime T: type) type {
                 const state: State = @enumFromInt(self.shared.state.load(.acquire));
 
                 if (state == .receiver_waiting) {
-                    // Wake receiver with error
-                    self.shared.state.store(@intFromEnum(State.closed), .release);
+                    // Copy waiter pointer and waker info BEFORE setting closed flag
+                    const waiter = self.shared.waiter.?;
+                    const waker = waiter.waker;
+                    const ctx = waiter.waker_ctx;
 
-                    const waker = self.shared.waker;
-                    const ctx = self.shared.waker_ctx;
-                    self.shared.waker = null;
-                    self.shared.waker_ctx = null;
+                    // Set closed flag on waiter
+                    waiter.closed = true;
+
+                    // Clear waiter pointer and update state
+                    self.shared.waiter = null;
+                    self.shared.state.store(@intFromEnum(State.closed), .release);
 
                     self.shared.mutex.unlock();
 
+                    // Wake receiver outside lock using copied waker
                     if (waker) |wf| {
                         if (ctx) |c| {
                             wf(c);
@@ -285,9 +295,8 @@ pub fn Oneshot(comptime T: type) type {
                         return true;
                     },
                     .empty => {
-                        // Register waiter
-                        self.shared.waker = waiter.waker;
-                        self.shared.waker_ctx = waiter.waker_ctx;
+                        // Register waiter (store pointer so sender can set waiter.value)
+                        self.shared.waiter = waiter;
                         self.shared.state.store(@intFromEnum(State.receiver_waiting), .release);
                         self.shared.mutex.unlock();
                         return false;
@@ -307,8 +316,7 @@ pub fn Oneshot(comptime T: type) type {
                 const state: State = @enumFromInt(self.shared.state.load(.acquire));
 
                 if (state == .receiver_waiting) {
-                    self.shared.waker = null;
-                    self.shared.waker_ctx = null;
+                    self.shared.waiter = null;
                     self.shared.state.store(@intFromEnum(State.empty), .release);
                 }
 

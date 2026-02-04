@@ -43,8 +43,8 @@ pub const Waiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
 
-    /// Whether this waiter has been notified
-    notified: bool = false,
+    /// Whether this waiter has been notified (atomic for cross-thread visibility)
+    notified: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Intrusive list pointers
     pointers: Pointers(Waiter) = .{},
@@ -61,24 +61,33 @@ pub const Waiter = struct {
         self.waker = wake_fn;
     }
 
-    /// Wake this waiter
+    /// Wake this waiter (SAFE: copies waker info before setting flag)
     pub fn wake(self: *Self) void {
-        self.notified = true;
-        if (self.waker) |wf| {
-            if (self.waker_ctx) |ctx| {
+        // CRITICAL: Copy waker info BEFORE setting notified flag.
+        // Once notified is true, the waiting thread may destroy this waiter.
+        const waker_fn = self.waker;
+        const waker_ctx = self.waker_ctx;
+
+        // Now safe to set the flag - we have our own copies
+        // Use release ordering so the waiting thread sees all prior writes
+        self.notified.store(true, .release);
+
+        // Wake using copied function pointers
+        if (waker_fn) |wf| {
+            if (waker_ctx) |ctx| {
                 wf(ctx);
             }
         }
     }
 
-    /// Check if notified
+    /// Check if notified (uses acquire ordering for cross-thread visibility)
     pub fn isNotified(self: *const Self) bool {
-        return self.notified;
+        return self.notified.load(.acquire);
     }
 
     /// Reset for reuse
     pub fn reset(self: *Self) void {
-        self.notified = false;
+        self.notified.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -177,10 +186,16 @@ pub const Notify = struct {
         self.mutex.lock();
 
         // Drain all waiters
+        // CRITICAL: Copy waker info BEFORE setting notified flag to avoid use-after-free
         while (self.waiters.popFront()) |waiter| {
-            waiter.notified = true;
-            if (waiter.waker) |wf| {
-                if (waiter.waker_ctx) |ctx| {
+            const waker_fn = waiter.waker;
+            const waker_ctx = waiter.waker_ctx;
+
+            // Now safe to set the flag (atomic for cross-thread visibility)
+            waiter.notified.store(true, .release);
+
+            if (waker_fn) |wf| {
+                if (waker_ctx) |ctx| {
                     wake_list.push(.{ .context = ctx, .wake_fn = wf });
                 }
             }
@@ -213,7 +228,7 @@ pub const Notify = struct {
             );
             if (result == null) {
                 // Consumed permit
-                waiter.notified = true;
+                waiter.notified.store(true, .release);
                 return true;
             }
             // CAS failed, fall through to slow path
@@ -227,12 +242,12 @@ pub const Notify = struct {
         if (state & State.PERMIT != 0) {
             _ = self.state.fetchAnd(~State.PERMIT, .release);
             self.mutex.unlock();
-            waiter.notified = true;
+            waiter.notified.store(true, .release);
             return true;
         }
 
         // Add to waiters list
-        waiter.notified = false;
+        waiter.notified.store(false, .release);
         self.waiters.pushBack(waiter);
 
         // Set WAITING flag

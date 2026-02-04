@@ -257,9 +257,16 @@ pub fn Channel(comptime T: type) type {
 
             self.mutex.unlock();
 
+            // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
             if (recv_waiter) |w| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
                 w.complete = true;
-                w.wake();
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
+                        wf(ctx);
+                    }
+                }
             }
 
             return .ok;
@@ -299,9 +306,16 @@ pub fn Channel(comptime T: type) type {
                 const recv_waiter = self.recv_waiters.popFront();
                 self.mutex.unlock();
 
+                // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
                 if (recv_waiter) |w| {
+                    const waker_fn = w.waker;
+                    const waker_ctx = w.waker_ctx;
                     w.complete = true;
-                    w.wake();
+                    if (waker_fn) |wf| {
+                        if (waker_ctx) |ctx| {
+                            wf(ctx);
+                        }
+                    }
                 }
 
                 waiter.complete = true;
@@ -364,9 +378,16 @@ pub fn Channel(comptime T: type) type {
 
             self.mutex.unlock();
 
+            // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
             if (send_waiter) |w| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
                 w.complete = true;
-                w.wake();
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
+                        wf(ctx);
+                    }
+                }
             }
 
             return .{ .value = value };
@@ -402,9 +423,16 @@ pub fn Channel(comptime T: type) type {
                 const send_waiter = self.send_waiters.popFront();
                 self.mutex.unlock();
 
+                // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
                 if (send_waiter) |w| {
+                    const waker_fn = w.waker;
+                    const waker_ctx = w.waker_ctx;
                     w.complete = true;
-                    w.wake();
+                    if (waker_fn) |wf| {
+                        if (waker_ctx) |ctx| {
+                            wf(ctx);
+                        }
+                    }
                 }
 
                 waiter.complete = true;
@@ -467,20 +495,26 @@ pub fn Channel(comptime T: type) type {
             self.closed = true;
 
             // Wake all send waiters
+            // CRITICAL: Copy waker info BEFORE setting closed flag to avoid use-after-free
             while (self.send_waiters.popFront()) |w| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
                 w.closed = true;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         send_wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }
             }
 
             // Wake all recv waiters
+            // CRITICAL: Copy waker info BEFORE setting closed flag to avoid use-after-free
             while (self.recv_waiters.popFront()) |w| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
                 w.closed = true;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         recv_wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }

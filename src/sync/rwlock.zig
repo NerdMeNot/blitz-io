@@ -47,7 +47,7 @@ pub const WakerFn = *const fn (*anyopaque) void;
 pub const ReadWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
-    acquired: bool = false,
+    acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(ReadWaiter) = .{},
 
     const Self = @This();
@@ -70,11 +70,11 @@ pub const ReadWaiter = struct {
     }
 
     pub fn isAcquired(self: *const Self) bool {
-        return self.acquired;
+        return self.acquired.load(.acquire);
     }
 
     pub fn reset(self: *Self) void {
-        self.acquired = false;
+        self.acquired.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -85,7 +85,7 @@ pub const ReadWaiter = struct {
 pub const WriteWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
-    acquired: bool = false,
+    acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(WriteWaiter) = .{},
 
     const Self = @This();
@@ -108,11 +108,11 @@ pub const WriteWaiter = struct {
     }
 
     pub fn isAcquired(self: *const Self) bool {
-        return self.acquired;
+        return self.acquired.load(.acquire);
     }
 
     pub fn reset(self: *Self) void {
-        self.acquired = false;
+        self.acquired.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -184,12 +184,12 @@ pub const RwLock = struct {
         if (!self.writer_active and self.write_waiters.count() == 0) {
             self.readers += 1;
             self.mutex.unlock();
-            waiter.acquired = true;
+            waiter.acquired.store(true, .release);
             return true;
         }
 
         // Must wait
-        waiter.acquired = false;
+        waiter.acquired.store(false, .release);
         self.read_waiters.pushBack(waiter);
         self.mutex.unlock();
 
@@ -214,7 +214,7 @@ pub const RwLock = struct {
                 waker_fn = w.waker;
                 waker_ctx = w.waker_ctx;
                 // After this, waiter may be freed by waiting thread
-                w.acquired = true;
+                w.acquired.store(true, .release);
                 self.writer_active = true;
             }
         }
@@ -275,12 +275,12 @@ pub const RwLock = struct {
         if (!self.writer_active and self.readers == 0) {
             self.writer_active = true;
             self.mutex.unlock();
-            waiter.acquired = true;
+            waiter.acquired.store(true, .release);
             return true;
         }
 
         // Must wait
-        waiter.acquired = false;
+        waiter.acquired.store(false, .release);
         self.write_waiters.pushBack(waiter);
         self.mutex.unlock();
 
@@ -307,7 +307,7 @@ pub const RwLock = struct {
                 writer_waker_fn = w.waker;
                 writer_waker_ctx = w.waker_ctx;
                 // After this, waiter may be freed by waiting thread
-                w.acquired = true;
+                w.acquired.store(true, .release);
                 self.writer_active = true;
             }
         } else {
@@ -320,7 +320,7 @@ pub const RwLock = struct {
                     }
                 }
                 // After this, waiter may be freed by waiting thread
-                r.acquired = true;
+                r.acquired.store(true, .release);
                 self.readers += 1;
             }
         }
