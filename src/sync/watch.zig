@@ -31,11 +31,15 @@
 //! Reference: tokio/src/sync/watch.rs
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const LinkedList = @import("../util/linked_list.zig").LinkedList;
 const Pointers = @import("../util/linked_list.zig").Pointers;
 const WakeList = @import("../util/wake_list.zig").WakeList;
+const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+
+// Unified waiter for the simple blocking API
+const unified_waiter = @import("waiter.zig");
+const UnifiedWaiter = unified_waiter.Waiter;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
@@ -48,9 +52,13 @@ pub const WakerFn = *const fn (*anyopaque) void;
 pub const ChangeWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
-    notified: bool = false,
-    closed: bool = false,
+    /// Whether notification was received (atomic for cross-thread visibility)
+    notified: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Whether channel was closed (atomic for cross-thread visibility)
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(ChangeWaiter) = .{},
+    /// Debug-mode invocation tracking (detects use-after-free)
+    invocation: InvocationId = .{},
 
     const Self = @This();
 
@@ -72,15 +80,27 @@ pub const ChangeWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.notified or self.closed;
+        return self.notified.load(.seq_cst) or self.closed.load(.seq_cst);
     }
 
+    /// Get invocation token (for debug tracking)
+    pub fn token(self: *const Self) InvocationId.Id {
+        return self.invocation.get();
+    }
+
+    /// Verify invocation token matches (debug mode)
+    pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
+        self.invocation.verify(tok);
+    }
+
+    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.notified = false;
-        self.closed = false;
+        self.notified.store(false, .seq_cst);
+        self.closed.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
+        self.invocation.bump();
     }
 };
 
@@ -162,20 +182,20 @@ pub fn Watch(comptime T: type) type {
                 // Check if already changed
                 if (self.seen_version < self.watch.version) {
                     self.watch.mutex.unlock();
-                    waiter.notified = true;
+                    waiter.notified.store(true, .seq_cst);
                     return true;
                 }
 
                 // Check if closed
                 if (self.watch.closed) {
                     self.watch.mutex.unlock();
-                    waiter.closed = true;
+                    waiter.closed.store(true, .seq_cst);
                     return true;
                 }
 
                 // Wait for change
-                waiter.notified = false;
-                waiter.closed = false;
+                waiter.notified.store(false, .seq_cst);
+                waiter.closed.store(false, .seq_cst);
                 self.watch.waiters.pushBack(waiter);
 
                 self.watch.mutex.unlock();
@@ -206,6 +226,79 @@ pub fn Watch(comptime T: type) type {
                 self.watch.mutex.lock();
                 defer self.watch.mutex.unlock();
                 return self.watch.closed;
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // Blocking API (using unified Waiter)
+            // ═══════════════════════════════════════════════════════════════
+
+            /// Result of changedBlocking
+            pub const ChangedResult = enum {
+                /// Value changed - caller should read new value
+                changed,
+                /// Sender closed - no more changes
+                closed,
+            };
+
+            /// Blocking wait for a change.
+            /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
+            ///
+            /// Returns .changed if value changed, .closed if sender closed.
+            ///
+            /// Example:
+            /// ```zig
+            /// switch (rx.changedBlocking()) {
+            ///     .changed => {
+            ///         const new_value = rx.getAndUpdate();
+            ///         // Use new_value
+            ///     },
+            ///     .closed => {
+            ///         // No more changes
+            ///     },
+            /// }
+            /// ```
+            pub fn changedBlocking(self: *Receiver) ChangedResult {
+                var waiter = ChangeWaiter.init();
+
+                // Set up waker bridge to unified waiter
+                var unified = UnifiedWaiter.init();
+                const WakerBridge = struct {
+                    fn wake(ctx: *anyopaque) void {
+                        const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
+                        uw.notify();
+                    }
+                };
+                waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+
+                self.watch.mutex.lock();
+
+                // Check if already changed
+                if (self.seen_version < self.watch.version) {
+                    self.watch.mutex.unlock();
+                    return .changed;
+                }
+
+                // Check if closed
+                if (self.watch.closed) {
+                    self.watch.mutex.unlock();
+                    return .closed;
+                }
+
+                // Wait for change
+                waiter.notified.store(false, .seq_cst);
+                waiter.closed.store(false, .seq_cst);
+                self.watch.waiters.pushBack(&waiter);
+
+                self.watch.mutex.unlock();
+
+                // Wait until notified
+                unified.wait();
+
+                // Check what happened
+                if (waiter.closed.load(.seq_cst)) {
+                    return .closed;
+                }
+                return .changed;
             }
         };
 
@@ -264,7 +357,7 @@ pub fn Watch(comptime T: type) type {
             while (self.waiters.popFront()) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.notified = true;
+                w.notified.store(true, .seq_cst);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
@@ -290,7 +383,7 @@ pub fn Watch(comptime T: type) type {
             while (self.waiters.popFront()) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.notified = true;
+                w.notified.store(true, .seq_cst);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
@@ -325,7 +418,7 @@ pub fn Watch(comptime T: type) type {
             while (self.waiters.popFront()) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.closed = true;
+                w.closed.store(true, .seq_cst);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
@@ -431,7 +524,7 @@ test "Watch - wait for change" {
     // Send wakes waiter
     watch.send(42);
     try std.testing.expect(woken);
-    try std.testing.expect(waiter.notified);
+    try std.testing.expect(waiter.notified.load(.acquire));
 }
 
 test "Watch - close wakes waiters" {
@@ -456,7 +549,7 @@ test "Watch - close wakes waiters" {
     watch.close();
 
     try std.testing.expect(woken);
-    try std.testing.expect(waiter.closed);
+    try std.testing.expect(waiter.closed.load(.acquire));
     try std.testing.expect(rx.isClosed());
 }
 
@@ -490,4 +583,84 @@ test "Watch - sendModify" {
 
     try std.testing.expect(rx.hasChanged());
     try std.testing.expectEqual(@as(u32, 20), rx.get());
+}
+
+test "Watch - changedBlocking simple" {
+    var watch = Watch(u32).init(42);
+    defer watch.deinit();
+
+    var rx = watch.subscribe();
+    // Initial value should show as changed
+    const result = rx.changedBlocking();
+    try std.testing.expectEqual(Watch(u32).Receiver.ChangedResult.changed, result);
+}
+
+test "Watch - changedBlocking with contention" {
+    var watch = Watch(u32).init(0);
+    defer watch.deinit();
+
+    var rx = watch.subscribe();
+    rx.markSeen();
+
+    var got_change = std.atomic.Value(bool).init(false);
+    var got_value = std.atomic.Value(u32).init(0);
+
+    // Start a thread that will wait for change
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(r: *Watch(u32).Receiver, gc: *std.atomic.Value(bool), gv: *std.atomic.Value(u32)) void {
+            const res = r.changedBlocking();
+            if (res == .changed) {
+                gc.store(true, .release);
+                gv.store(r.getAndUpdate(), .release);
+            }
+        }
+    }.run, .{ &rx, &got_change, &got_value });
+
+    // Give thread time to start waiting
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Should not have received change yet
+    try std.testing.expect(!got_change.load(.acquire));
+
+    // Send value - should wake the thread
+    watch.send(123);
+
+    // Wait for thread
+    thread.join();
+
+    // Should have received the change
+    try std.testing.expect(got_change.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 123), got_value.load(.acquire));
+}
+
+test "Watch - changedBlocking returns closed" {
+    var watch = Watch(u32).init(0);
+    defer watch.deinit();
+
+    var rx = watch.subscribe();
+    rx.markSeen();
+
+    var got_closed = std.atomic.Value(bool).init(false);
+
+    // Start a thread that will wait for change
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(r: *Watch(u32).Receiver, gc: *std.atomic.Value(bool)) void {
+            const res = r.changedBlocking();
+            if (res == .closed) {
+                gc.store(true, .release);
+            }
+        }
+    }.run, .{ &rx, &got_closed });
+
+    // Give thread time to start waiting
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Close the watch - should wake the thread
+    watch.close();
+
+    // Wait for thread
+    thread.join();
+
+    // Should have received closed
+    try std.testing.expect(got_closed.load(.acquire));
 }

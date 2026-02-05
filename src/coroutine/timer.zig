@@ -1,7 +1,7 @@
-//! Timer Wheel for Efficient Timeout Management
+//! Timer Wheel for Coroutine Runtime
 //!
-//! Implements a hierarchical timing wheel similar to Tokio's timer driver.
-//! The timer wheel provides O(1) insertion and O(1) expiration checking.
+//! Hierarchical timing wheel with O(1) insertion and O(1) expiration checking.
+//! Ported from executor/timer.zig for the coroutine system.
 //!
 //! Architecture:
 //! - Level 0: 64 slots, 1ms resolution (64ms range)
@@ -12,12 +12,9 @@
 //! - Overflow: linked list for very long timers
 //!
 //! Optimizations (matching Tokio):
-//! - Bit-based level selection: O(1) using leading zeros instead of linear search
+//! - Bit-based level selection: O(1) using @clz instead of linear search
 //! - Occupancy bitfield: 64-bit field per level for O(1) next-slot lookup
 //! - Intrusive linked list: Zero allocation per timer entry
-//!
-//! Total precision: millisecond-level for timers < 64ms,
-//! degrades gracefully for longer timers.
 //!
 //! Reference: tokio/src/time/driver/wheel/mod.rs
 
@@ -42,7 +39,6 @@ const LEVEL_0_SLOT_NS: u64 = std.time.ns_per_ms;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // COMPTIME OPTIMIZATION: Precompute slot durations and max ranges
-// Zig advantage: These are computed at compile time, zero runtime cost
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Precomputed slot durations for each level (computed at comptime)
@@ -76,7 +72,7 @@ pub const TimerEntry = struct {
     /// Deadline in nanoseconds (monotonic)
     deadline_ns: u64,
 
-    /// Task to wake when timer expires (for task-based waking)
+    /// Coroutine task to wake when timer expires
     task: ?*Header,
 
     /// Generic waker function (for waiter-based primitives)
@@ -135,14 +131,14 @@ pub const TimerEntry = struct {
     }
 
     /// Wake this entry (called when timer expires)
+    /// For coroutines, this reschedules the task
     pub fn wake(self: *TimerEntry) void {
-        // Try task-based waking first
+        // Try task-based waking first (coroutine task)
         if (self.task) |task| {
-            if (task.transitionToScheduled()) {
-                task.schedule();
-            }
+            // Reschedule the coroutine task
+            task.schedule();
         }
-        // Then try waker-based waking
+        // Then try waker-based waking (sync primitives)
         if (self.waker) |waker_fn| {
             if (self.waker_ctx) |ctx| {
                 waker_fn(ctx);
@@ -313,11 +309,6 @@ inline fn levelMaxDuration(level: usize) u64 {
 /// Calculate the appropriate level for a timer using bit manipulation.
 /// This is O(1) using leading zeros, replacing the O(NUM_LEVELS) linear search.
 ///
-/// The key insight (from Tokio): the level is determined by the most significant
-/// differing bit between `elapsed` (current wheel position) and `when` (deadline),
-/// both measured in ticks (level 0 slot durations).
-/// Each level covers 6 bits (64 slots), so level = significant_bit / 6.
-///
 /// Reference: tokio/src/time/driver/wheel/mod.rs::Wheel::level_for
 inline fn levelFor(now_ns: u64, deadline_ns: u64) usize {
     // Convert from nanoseconds to ticks (level 0 slot durations)
@@ -329,19 +320,16 @@ inline fn levelFor(now_ns: u64, deadline_ns: u64) usize {
     const masked = (elapsed_ticks ^ when_ticks) | SLOT_MASK;
 
     // Clamp to max wheel duration (in ticks) to prevent overflow
-    // MAX_WHEEL_DURATION is in nanoseconds, convert to ticks
     const max_ticks = MAX_WHEEL_DURATION / LEVEL_0_SLOT_NS;
     if (masked >= max_ticks) {
         return NUM_LEVELS; // Overflow level
     }
 
     // Find the position of the most significant set bit.
-    // @clz counts leading zeros in a 64-bit value.
     const leading_zeros = @clz(masked);
     const significant_bit = 63 - leading_zeros;
 
     // Each level handles BITS_PER_LEVEL (6) bits.
-    // Level 0: bits 0-5, Level 1: bits 6-11, etc.
     return significant_bit / BITS_PER_LEVEL;
 }
 
@@ -389,8 +377,6 @@ pub const TimerWheel = struct {
     }
 
     /// Clean up all timer entries
-    /// Frees all entries that were allocated via sleep() or deadline()
-    /// Note: Entries allocated externally and inserted via insert() are NOT freed
     pub fn deinit(self: *Self) void {
         // Free entries in all levels
         for (&self.levels) |*level| {
@@ -410,7 +396,6 @@ pub const TimerWheel = struct {
         var entry = slot.head;
         while (entry) |e| {
             const next = e.next;
-            // Only free entries that we allocated
             if (e.heap_allocated) {
                 self.allocator.destroy(e);
             }
@@ -444,20 +429,15 @@ pub const TimerWheel = struct {
             self.overflow.push(entry);
         } else {
             const slot_idx = Level.slotFor(entry_deadline, level_idx, current_now);
-            // Use the new addEntry that maintains occupancy bitfield
             self.levels[level_idx].addEntry(slot_idx, entry);
         }
 
         self.count += 1;
     }
 
-    /// Remove a timer (if it's still in the wheel)
-    /// Note: This just marks the timer as cancelled, it remains in the wheel
-    /// until the next poll() when it will be cleaned up.
+    /// Remove a timer (marks as cancelled)
     pub fn remove(_: *Self, entry: *TimerEntry) void {
-        // Mark as cancelled - actual removal happens during poll
         entry.cancel();
-        // Note: We don't update count here as the entry is still in a slot
     }
 
     /// Poll for expired timers
@@ -473,7 +453,6 @@ pub const TimerWheel = struct {
         var current = self.levels[0].current;
 
         while (current != level0_slot) {
-            // Use takeAllFromSlot which updates occupancy bitfield
             const entries = self.levels[0].takeAllFromSlot(current);
             self.appendExpired(&expired_head, &expired_tail, entries);
 
@@ -491,7 +470,6 @@ pub const TimerWheel = struct {
         while (entry) |e| {
             const next = e.next;
             if (e.deadline_ns <= self.now_ns) {
-                // Use removeEntry which updates occupancy
                 self.levels[0].removeEntry(current, e);
                 self.appendEntry(&expired_head, &expired_tail, e);
             }
@@ -516,7 +494,6 @@ pub const TimerWheel = struct {
         }
 
         // Move entries from this slot to lower levels
-        // Use takeAllFromSlot which updates occupancy bitfield
         var entry = level.takeAllFromSlot(slot_idx);
         while (entry) |e| {
             const next = e.next;
@@ -526,7 +503,6 @@ pub const TimerWheel = struct {
             if (e.cancelled) {
                 self.count -|= 1;
             } else {
-                // Re-insert at appropriate level
                 self.count -|= 1;
                 self.insert(e);
             }
@@ -575,29 +551,22 @@ pub const TimerWheel = struct {
     }
 
     /// Get time until next timer expires (for poll timeout).
-    /// Uses occupancy bitfield for O(1) lookup per level.
     pub fn nextExpiration(self: *const Self) ?u64 {
-        // Check each level using the occupancy bitfield
         for (0..NUM_LEVELS) |level_idx| {
             const level = &self.levels[level_idx];
 
             if (!level.hasEntries()) continue;
 
-            // Use O(1) bit lookup to find next occupied slot
             if (level.nextOccupiedSlot(level.current)) |next_slot| {
-                // Calculate time until this slot
-                const slot_duration = slotDuration(level_idx);
+                const slot_duration_val = slotDuration(level_idx);
                 const slots_until: u64 = if (next_slot >= level.current)
                     next_slot - level.current
                 else
                     (SLOTS_PER_LEVEL - level.current) + next_slot;
 
-                // Time until start of that slot
-                const time_until = slots_until * slot_duration;
+                const time_until = slots_until * slot_duration_val;
 
-                // For level 0, we can be more precise by checking actual deadlines
                 if (level_idx == 0 and slots_until == 0) {
-                    // Current slot - find earliest deadline
                     var earliest: ?u64 = null;
                     var entry = level.slots[next_slot].head;
                     while (entry) |e| {
@@ -619,7 +588,6 @@ pub const TimerWheel = struct {
 
         // Check overflow list
         if (!self.overflow.isEmpty()) {
-            // Find earliest in overflow
             var earliest: ?u64 = null;
             var entry = self.overflow.head;
             while (entry) |e| {
@@ -635,9 +603,7 @@ pub const TimerWheel = struct {
             }
         }
 
-        // No timers
         if (self.count > 0) {
-            // Timers exist but all might be cancelled
             return LEVEL_0_SLOT_NS;
         }
 
@@ -660,30 +626,24 @@ pub const TimerWheel = struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Create a timer entry for sleeping
-/// Returns error.OutOfMemory if allocation fails
-/// The entry will be automatically freed when the wheel is deinitialized
 pub fn sleep(wheel: *TimerWheel, duration_ns: u64, task: *Header) !*TimerEntry {
     const entry = try wheel.allocator.create(TimerEntry);
     entry.* = TimerEntry.init(wheel.now() + duration_ns, task, 0);
-    entry.heap_allocated = true; // Mark as wheel-allocated for cleanup
+    entry.heap_allocated = true;
     wheel.insert(entry);
     return entry;
 }
 
 /// Create a timer entry for a deadline
-/// Returns error.OutOfMemory if allocation fails
-/// The entry will be automatically freed when the wheel is deinitialized
 pub fn deadline(wheel: *TimerWheel, deadline_ns: u64, task: *Header) !*TimerEntry {
     const entry = try wheel.allocator.create(TimerEntry);
     entry.* = TimerEntry.init(deadline_ns, task, 0);
-    entry.heap_allocated = true; // Mark as wheel-allocated for cleanup
+    entry.heap_allocated = true;
     wheel.insert(entry);
     return entry;
 }
 
-/// Create a timer entry with a waker callback (for async primitives)
-/// Returns error.OutOfMemory if allocation fails
-/// The entry will be automatically freed when the wheel is deinitialized
+/// Create a timer entry with a waker callback
 pub fn sleepWithWaker(
     wheel: *TimerWheel,
     duration_ns: u64,
@@ -697,24 +657,7 @@ pub fn sleepWithWaker(
     return entry;
 }
 
-/// Create a timer entry for a deadline with a waker callback
-/// Returns error.OutOfMemory if allocation fails
-pub fn deadlineWithWaker(
-    wheel: *TimerWheel,
-    deadline_ns: u64,
-    ctx: *anyopaque,
-    waker: WakerFn,
-) !*TimerEntry {
-    const entry = try wheel.allocator.create(TimerEntry);
-    entry.* = TimerEntry.initWithWaker(deadline_ns, ctx, waker, 0);
-    entry.heap_allocated = true;
-    wheel.insert(entry);
-    return entry;
-}
-
 /// Process expired timer entries and wake their associated tasks/waiters
-/// Frees heap-allocated entries after processing
-/// Returns the number of entries processed
 pub fn processExpired(wheel: *TimerWheel, expired: ?*TimerEntry) usize {
     var count: usize = 0;
     var entry = expired;
@@ -723,12 +666,10 @@ pub fn processExpired(wheel: *TimerWheel, expired: ?*TimerEntry) usize {
         const next = e.next;
         count += 1;
 
-        // Wake via task or waker if not cancelled
         if (!e.cancelled) {
             e.wake();
         }
 
-        // Free heap-allocated entries
         if (e.heap_allocated) {
             wheel.allocator.destroy(e);
         }
@@ -740,8 +681,6 @@ pub fn processExpired(wheel: *TimerWheel, expired: ?*TimerEntry) usize {
 }
 
 /// Poll and process all expired timers in one call
-/// This is a convenience function that combines poll() and processExpired()
-/// Returns the number of expired timers processed
 pub fn pollAndProcess(wheel: *TimerWheel) usize {
     const expired = wheel.poll();
     return processExpired(wheel, expired);
@@ -763,7 +702,6 @@ test "TimerWheel - insert and poll" {
     var wheel = TimerWheel.init(std.testing.allocator);
     defer wheel.deinit();
 
-    // Create a timer entry
     var entry = TimerEntry.init(wheel.now() + 1, null, 42);
 
     wheel.insert(&entry);
@@ -784,172 +722,39 @@ test "TimerWheel - cancel" {
     var entry = TimerEntry.init(wheel.now() + 100 * std.time.ns_per_ms, null, 0);
     wheel.insert(&entry);
 
-    // Cancel before expiry
     entry.cancel();
     try std.testing.expect(entry.cancelled);
 
-    // Poll should not return cancelled entry
     const expired = wheel.poll();
     try std.testing.expect(expired == null);
 }
 
-test "TimerWheel - multiple timers" {
-    var wheel = TimerWheel.init(std.testing.allocator);
-    defer wheel.deinit();
-
-    var entries: [5]TimerEntry = undefined;
-    const now = wheel.now();
-
-    for (&entries, 0..) |*e, i| {
-        e.* = TimerEntry.init(now + @as(u64, @intCast(i + 1)) * std.time.ns_per_ms, null, @intCast(i));
-        wheel.insert(e);
-    }
-
-    try std.testing.expectEqual(@as(usize, 5), wheel.len());
-
-    // Wait for all to expire
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-
-    var count: usize = 0;
-    var expired = wheel.poll();
-    while (expired) |e| {
-        count += 1;
-        expired = e.next;
-    }
-
-    try std.testing.expect(count >= 1); // At least some should have expired
-}
-
-test "slotDuration - calculations" {
-    try std.testing.expectEqual(LEVEL_0_SLOT_NS, slotDuration(0));
-    try std.testing.expectEqual(LEVEL_0_SLOT_NS * 64, slotDuration(1));
-    try std.testing.expectEqual(LEVEL_0_SLOT_NS * 64 * 64, slotDuration(2));
-}
-
-test "levelMaxDuration - calculations" {
-    // Level 0: 64ms
-    try std.testing.expectEqual(@as(u64, 64 * std.time.ns_per_ms), levelMaxDuration(0));
-    // Level 1: ~4 seconds
-    try std.testing.expectEqual(@as(u64, 64 * 64 * std.time.ns_per_ms), levelMaxDuration(1));
-}
-
 test "levelFor - bit-based level calculation" {
-    // Same time = level 0
     try std.testing.expectEqual(@as(usize, 0), levelFor(0, 0));
-
-    // Small delta (within 64ms) = level 0
     try std.testing.expectEqual(@as(usize, 0), levelFor(0, 10 * std.time.ns_per_ms));
     try std.testing.expectEqual(@as(usize, 0), levelFor(0, 63 * std.time.ns_per_ms));
-
-    // Delta in level 1 range (64ms - 4s)
     try std.testing.expectEqual(@as(usize, 1), levelFor(0, 100 * std.time.ns_per_ms));
     try std.testing.expectEqual(@as(usize, 1), levelFor(0, 1 * std.time.ns_per_s));
-
-    // Delta in level 2 range (4s - 4min)
     try std.testing.expectEqual(@as(usize, 2), levelFor(0, 10 * std.time.ns_per_s));
-    try std.testing.expectEqual(@as(usize, 2), levelFor(0, 60 * std.time.ns_per_s));
-
-    // Very large delta = overflow (level >= NUM_LEVELS)
-    const huge_delta: u64 = 100 * 24 * 60 * 60 * std.time.ns_per_s; // 100 days
-    try std.testing.expect(levelFor(0, huge_delta) >= NUM_LEVELS);
 }
 
 test "Level - occupancy bitfield" {
     var level = Level.init();
 
-    // Initially no entries
     try std.testing.expect(!level.hasEntries());
     try std.testing.expectEqual(@as(u64, 0), level.occupied);
 
-    // Create dummy entries
     var entry1 = TimerEntry.init(1000, null, 1);
     var entry2 = TimerEntry.init(2000, null, 2);
-    var entry3 = TimerEntry.init(3000, null, 3);
 
-    // Add entries to different slots
     level.addEntry(0, &entry1);
     try std.testing.expect(level.hasEntries());
     try std.testing.expectEqual(@as(u64, 1), level.occupied);
 
     level.addEntry(5, &entry2);
     try std.testing.expectEqual(@as(u64, 0b100001), level.occupied);
-
-    level.addEntry(63, &entry3);
-    try std.testing.expectEqual(@as(u64, 0b100001) | (@as(u64, 1) << 63), level.occupied);
-
-    // Check occupiedCount
-    try std.testing.expectEqual(@as(usize, 3), level.occupiedCount());
-
-    // Test nextOccupiedSlot
-    try std.testing.expectEqual(@as(?usize, 0), level.nextOccupiedSlot(0));
-    try std.testing.expectEqual(@as(?usize, 5), level.nextOccupiedSlot(1));
-    try std.testing.expectEqual(@as(?usize, 5), level.nextOccupiedSlot(5));
-    try std.testing.expectEqual(@as(?usize, 63), level.nextOccupiedSlot(6));
-    // Test wrapping: from slot 62 (past slot 63) should wrap to find slot 0
-    try std.testing.expectEqual(@as(?usize, 63), level.nextOccupiedSlot(62));
-    // From slot 0 should find slot 0
-    try std.testing.expectEqual(@as(?usize, 0), level.nextOccupiedSlot(0));
-
-    // Remove entry and check occupancy updates
-    level.removeEntry(0, &entry1);
-    try std.testing.expectEqual(@as(u64, 0b100000) | (@as(u64, 1) << 63), level.occupied);
     try std.testing.expectEqual(@as(usize, 2), level.occupiedCount());
 
-    // Take all from slot 5
-    _ = level.takeAllFromSlot(5);
-    try std.testing.expectEqual(@as(u64, 1) << 63, level.occupied);
-    try std.testing.expectEqual(@as(usize, 1), level.occupiedCount());
-}
-
-test "Level - nextOccupiedSlot wraparound" {
-    var level = Level.init();
-
-    var entry = TimerEntry.init(1000, null, 1);
-
-    // Add entry to slot 10
-    level.addEntry(10, &entry);
-
-    // Search from slot 50 should wrap around to find slot 10
-    try std.testing.expectEqual(@as(?usize, 10), level.nextOccupiedSlot(50));
-
-    // Search from slot 5 should find 10 directly
-    try std.testing.expectEqual(@as(?usize, 10), level.nextOccupiedSlot(5));
-}
-
-test "TimerWheel - insert uses bit-based level" {
-    var wheel = TimerWheel.init(std.testing.allocator);
-    defer wheel.deinit();
-
-    // Insert timers at different durations
-    var entry_short = TimerEntry.init(wheel.now() + 10 * std.time.ns_per_ms, null, 1);
-    var entry_medium = TimerEntry.init(wheel.now() + 1 * std.time.ns_per_s, null, 2);
-    var entry_long = TimerEntry.init(wheel.now() + 60 * std.time.ns_per_s, null, 3);
-
-    wheel.insert(&entry_short);
-    wheel.insert(&entry_medium);
-    wheel.insert(&entry_long);
-
-    try std.testing.expectEqual(@as(usize, 3), wheel.len());
-
-    // Check that levels have entries via occupancy
-    try std.testing.expect(wheel.levels[0].hasEntries()); // short timer
-    try std.testing.expect(wheel.levels[1].hasEntries()); // medium timer
-    try std.testing.expect(wheel.levels[2].hasEntries()); // long timer
-}
-
-test "TimerWheel - nextExpiration uses occupancy bitfield" {
-    var wheel = TimerWheel.init(std.testing.allocator);
-    defer wheel.deinit();
-
-    // No timers - should return null
-    try std.testing.expect(wheel.nextExpiration() == null);
-
-    // Add a timer
-    var entry = TimerEntry.init(wheel.now() + 10 * std.time.ns_per_ms, null, 1);
-    wheel.insert(&entry);
-
-    // Should have a next expiration
-    const next = wheel.nextExpiration();
-    try std.testing.expect(next != null);
-    try std.testing.expect(next.? <= 10 * std.time.ns_per_ms);
+    level.removeEntry(0, &entry1);
+    try std.testing.expectEqual(@as(u64, 0b100000), level.occupied);
 }

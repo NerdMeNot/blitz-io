@@ -1,20 +1,22 @@
 //! Stress tests for blitz_io I/O utilities
 //!
 //! Tests buffered I/O, copy operations, and line iteration under load.
+//!
+//! ## Test Categories
+//!
+//! - **Copy**: Large data transfers and boundary conditions
+//! - **BufReader**: Buffered reads with various sizes
+//! - **BufWriter**: Buffered writes with various sizes
+//! - **Lines**: Line iteration stress
+//! - **Concurrent**: Multiple independent I/O operations
 
 const std = @import("std");
-const builtin = @import("builtin");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
 const io = blitz_io.io;
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 
-// Use smaller iteration counts in debug mode for faster test runs
-const is_debug = builtin.mode == .Debug;
-const LARGE_DATA_SIZE: usize = if (is_debug) 10_000 else 100_000;
-const MEDIUM_ITERATIONS: usize = if (is_debug) 100 else 1000;
-const SMALL_ITERATIONS: usize = if (is_debug) 1_000 else 10_000;
-const LINE_COUNT: usize = if (is_debug) 100 else 1000;
+const config = @import("test_config");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Fixtures
@@ -76,8 +78,8 @@ const TestWriter = struct {
 test "copy stress - large data transfer" {
     const allocator = testing.allocator;
 
-    // Create large test data (1MB in release, 64KB in debug)
-    const data_size = if (is_debug) 64 * 1024 else 1024 * 1024;
+    // Create large test data using integration config for large data
+    const data_size = config.integration.large_data_size;
     const large_data = try allocator.alloc(u8, data_size);
     defer allocator.free(large_data);
 
@@ -98,7 +100,8 @@ test "copy stress - large data transfer" {
 
 test "copy stress - many small copies" {
     const allocator = testing.allocator;
-    const iterations = MEDIUM_ITERATIONS;
+    // Use stress iterations for moderate count
+    const iterations = config.stress.iterations;
 
     var writer = TestWriter.init(allocator);
     defer writer.deinit();
@@ -145,8 +148,8 @@ test "copy stress - copyN boundary conditions" {
 test "BufReader stress - many small reads" {
     const allocator = testing.allocator;
 
-    // Create test data
-    const data_size = LARGE_DATA_SIZE;
+    // Create test data - use high_throughput for significant read count
+    const data_size = config.stress.high_throughput;
     const test_data = try allocator.alloc(u8, data_size);
     defer allocator.free(test_data);
 
@@ -173,7 +176,8 @@ test "BufReader stress - many small reads" {
 test "BufReader stress - mixed read sizes" {
     const allocator = testing.allocator;
 
-    const data_size = LARGE_DATA_SIZE / 2;
+    // Half of high_throughput for mixed size test
+    const data_size = config.stress.high_throughput / 2;
     const test_data = try allocator.alloc(u8, data_size);
     defer allocator.free(test_data);
 
@@ -207,8 +211,8 @@ test "BufWriter stress - many small writes" {
     var buf_writer = io.BufWriter(TestWriter).init(writer);
     defer buf_writer.writer().deinit();
 
-    // Write one byte at a time
-    const iterations = SMALL_ITERATIONS;
+    // Write one byte at a time - use high_throughput for many writes
+    const iterations = config.stress.high_throughput;
     for (0..iterations) |i| {
         try buf_writer.writeByte(@truncate(i));
     }
@@ -248,11 +252,11 @@ test "BufWriter stress - mixed write sizes" {
 test "Lines stress - many lines" {
     const allocator = testing.allocator;
 
-    // Generate test data with many lines
+    // Generate test data with many lines - use stress iterations
     var data_builder: std.ArrayList(u8) = .empty;
     defer data_builder.deinit(allocator);
 
-    const line_count = LINE_COUNT;
+    const line_count = config.stress.iterations;
     for (0..line_count) |i| {
         const line = try std.fmt.allocPrint(allocator, "line {d}: some test data here\n", .{i});
         defer allocator.free(line);
@@ -415,11 +419,11 @@ test "FixedBufferWriter stress - exact capacity usage" {
 test "NullWriter stress - high throughput discard" {
     var w = io.NullWriter.writer();
 
-    // Write a lot of data that gets discarded
+    // Write a lot of data that gets discarded - use high_throughput
     var data: [8192]u8 = undefined;
     @memset(&data, 'x');
 
-    for (0..SMALL_ITERATIONS) |_| {
+    for (0..config.stress.high_throughput) |_| {
         try w.writeAll(&data);
     }
 

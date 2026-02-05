@@ -7,7 +7,6 @@
 //! - NOTIFIED flag: Prevents lost wakeups when wake happens during poll
 //! - Reference counting: Ensures proper cleanup with concurrent ref/unref
 //! - State transitions: IDLE -> SCHEDULED -> RUNNING -> COMPLETE
-//! - Cancel vs complete race: Task may be cancelled while running
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,14 +17,12 @@ const concurrency = blitz.testing.concurrency;
 const Config = concurrency.Config;
 const ConcurrentCounter = concurrency.ConcurrentCounter;
 const Barrier = concurrency.Barrier;
-const Latch = concurrency.Latch;
 const ThreadRng = concurrency.ThreadRng;
 
-// Import task types
-const task_mod = blitz.executor.task;
-const Header = task_mod.Header;
-const Waker = task_mod.Waker;
-const OwnedTasks = task_mod.OwnedTasks;
+// Import task types from the correct location
+const Header = blitz.coroutine.Header;
+const State = blitz.coroutine.State;
+const Waker = blitz.executor.Waker;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Task Implementation
@@ -46,14 +43,13 @@ const TestTask = struct {
     const vtable = Header.VTable{
         .poll = pollImpl,
         .drop = dropImpl,
-        .get_output = getOutputImpl,
         .schedule = scheduleImpl,
     };
 
     fn create(allocator: Allocator) !*TestTask {
         const self = try allocator.create(TestTask);
         self.* = .{
-            .header = Header.init(&vtable, 0),
+            .header = Header.init(&vtable),
             .allocator = allocator,
             .poll_count = std.atomic.Value(usize).init(0),
             .drop_count = std.atomic.Value(usize).init(0),
@@ -63,13 +59,13 @@ const TestTask = struct {
         return self;
     }
 
-    fn pollImpl(header: *Header) bool {
+    fn pollImpl(header: *Header) Header.PollResult {
         const self: *TestTask = @fieldParentPtr("header", header);
         _ = self.poll_count.fetchAdd(1, .acq_rel);
 
         // Transition to running
         if (!header.transitionToRunning()) {
-            return false;
+            return .pending;
         }
 
         // Create and store waker
@@ -83,14 +79,14 @@ const TestTask = struct {
         const prev_state = header.transitionToIdle();
 
         // Check NOTIFIED flag
-        if (prev_state & Header.State.NOTIFIED != 0) {
-            header.clearNotified();
+        if (prev_state.notified) {
+            _ = header.clearNotified();
             if (header.transitionToScheduled()) {
                 header.schedule();
             }
         }
 
-        return false; // Not complete
+        return .pending; // Not complete
     }
 
     fn dropImpl(header: *Header) void {
@@ -98,14 +94,11 @@ const TestTask = struct {
         _ = self.drop_count.fetchAdd(1, .acq_rel);
 
         if (self.waker_stored) |*w| {
-            w.drop();
+            var waker = w.*;
+            waker.drop();
         }
 
         self.allocator.destroy(self);
-    }
-
-    fn getOutputImpl(_: *Header) ?*anyopaque {
-        return null;
     }
 
     fn scheduleImpl(_: *Header) void {
@@ -140,9 +133,9 @@ fn testNotifiedFlag(config: Config, allocator: Allocator) !void {
                         rng.maybeYield(50);
 
                         const prev = ctx.task.header.transitionToIdle();
-                        if (prev & Header.State.NOTIFIED != 0) {
+                        if (prev.notified) {
                             _ = ctx.notified_count.increment();
-                            ctx.task.header.clearNotified();
+                            _ = ctx.task.header.clearNotified();
                         }
                     }
                 }
@@ -169,7 +162,10 @@ fn testNotifiedFlag(config: Config, allocator: Allocator) !void {
 
     const task = try TestTask.create(allocator);
     defer {
-        task.header.unref();
+        // Clean up task
+        if (task.header.unref()) {
+            task.header.drop();
+        }
     }
 
     var barrier = Barrier.init(2);
@@ -231,7 +227,7 @@ fn testRefCounting(config: Config, allocator: Allocator) !void {
 
             // Remove refs
             for (0..ctx.refs_per_thread) |_| {
-                ctx.task.header.unref();
+                _ = ctx.task.header.unref();
             }
         }
     };
@@ -254,91 +250,83 @@ fn testRefCounting(config: Config, allocator: Allocator) !void {
     );
 
     // Final unref should trigger drop
-    const final_count = task.header.getRefCountValue();
-    if (final_count != 1) {
-        std.debug.print("Expected refcount 1, got {d}\n", .{final_count});
+    const state = State.fromU64(task.header.state.load(.acquire));
+    if (state.ref_count != 1) {
+        std.debug.print("Expected refcount 1, got {d}\n", .{state.ref_count});
         return error.TestFailed;
     }
 
     // This should trigger drop
-    task.header.unref();
+    if (task.header.unref()) {
+        task.header.drop();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 3: OwnedTasks Concurrent Insert/Remove
+// Test 3: State Transitions Under Contention
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Test OwnedTasks under concurrent insert and remove.
-fn testOwnedTasksConcurrent(config: Config, allocator: Allocator) !void {
+/// Test state transitions work correctly under high contention.
+fn testStateTransitionsContention(config: Config, allocator: Allocator) !void {
     const Context = struct {
-        owned: *OwnedTasks,
-        tasks: []Header,
+        headers: []Header,
         barrier: *Barrier,
-        insert_count: ConcurrentCounter,
-        remove_count: ConcurrentCounter,
+        transition_count: ConcurrentCounter,
 
         fn worker(ctx: *@This(), tid: usize) void {
-            const tasks_per_thread = ctx.tasks.len / 4; // Assume 4 threads
-            const start = tid * tasks_per_thread;
-            const end = @min(start + tasks_per_thread, ctx.tasks.len);
+            const headers_per_thread = ctx.headers.len / 4;
+            const start = tid * headers_per_thread;
+            const end = @min(start + headers_per_thread, ctx.headers.len);
 
             // Wait for all threads
             _ = ctx.barrier.wait();
 
-            // Insert tasks
-            for (ctx.tasks[start..end]) |*t| {
-                if (ctx.owned.insert(t)) {
-                    _ = ctx.insert_count.increment();
+            // Perform state transitions
+            for (ctx.headers[start..end]) |*h| {
+                // idle -> scheduled
+                if (h.transitionToScheduled()) {
+                    _ = ctx.transition_count.increment();
+
+                    // scheduled -> running
+                    if (h.transitionToRunning()) {
+                        _ = ctx.transition_count.increment();
+
+                        // running -> idle
+                        _ = h.transitionToIdle();
+                        _ = ctx.transition_count.increment();
+                    }
                 }
-            }
-
-            // Wait again
-            _ = ctx.barrier.wait();
-
-            // Remove tasks
-            for (ctx.tasks[start..end]) |*t| {
-                ctx.owned.remove(t);
-                _ = ctx.remove_count.increment();
             }
         }
     };
 
-    var owned = OwnedTasks.init();
-
-    const num_tasks = config.task_count;
-    const tasks = try allocator.alloc(Header, num_tasks);
-    defer allocator.free(tasks);
+    const num_headers = config.task_count;
+    const headers = try allocator.alloc(Header, num_headers);
+    defer allocator.free(headers);
 
     const dummy_vtable = Header.VTable{
         .poll = struct {
-            fn f(_: *Header) bool {
-                return true;
+            fn f(_: *Header) Header.PollResult {
+                return .complete;
             }
         }.f,
         .drop = struct {
             fn f(_: *Header) void {}
-        }.f,
-        .get_output = struct {
-            fn f(_: *Header) ?*anyopaque {
-                return null;
-            }
         }.f,
         .schedule = struct {
             fn f(_: *Header) void {}
         }.f,
     };
 
-    for (tasks, 0..) |*t, i| {
-        t.* = Header.init(&dummy_vtable, i);
+    for (headers) |*h| {
+        h.* = Header.init(&dummy_vtable);
     }
 
     var barrier = Barrier.init(4);
     var ctx = Context{
-        .owned = &owned,
-        .tasks = tasks,
+        .headers = headers,
         .barrier = &barrier,
-        .insert_count = ConcurrentCounter.init(0),
-        .remove_count = ConcurrentCounter.init(0),
+        .transition_count = ConcurrentCounter.init(0),
     };
 
     try concurrency.runConcurrent(
@@ -349,18 +337,10 @@ fn testOwnedTasksConcurrent(config: Config, allocator: Allocator) !void {
         allocator,
     );
 
-    // Verify counts match
-    const inserted = ctx.insert_count.load();
-    const removed = ctx.remove_count.load();
-
-    if (inserted != removed) {
-        std.debug.print("Insert/remove mismatch: {d} vs {d}\n", .{ inserted, removed });
-        return error.TestFailed;
-    }
-
-    // OwnedTasks should be empty
-    if (owned.len() != 0) {
-        std.debug.print("OwnedTasks not empty: {d}\n", .{owned.len()});
+    // Verify some transitions occurred
+    const transitions = ctx.transition_count.load();
+    if (transitions == 0) {
+        std.debug.print("No transitions occurred - test may be broken\n", .{});
         return error.TestFailed;
     }
 }
@@ -387,12 +367,12 @@ test "task state - reference counting stress" {
     }
 }
 
-test "task state - OwnedTasks concurrent" {
+test "task state - transitions under contention" {
     const configs = [_]Config{
         .{ .thread_count = 4, .task_count = 1000 },
         .{ .thread_count = 4, .task_count = 4000 },
     };
     for (configs) |config| {
-        try testOwnedTasksConcurrent(config, std.testing.allocator);
+        try testStateTransitionsContention(config, std.testing.allocator);
     }
 }

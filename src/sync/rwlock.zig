@@ -30,11 +30,15 @@
 //! Reference: tokio/src/sync/rwlock.rs
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const LinkedList = @import("../util/linked_list.zig").LinkedList;
 const Pointers = @import("../util/linked_list.zig").Pointers;
 const WakeList = @import("../util/wake_list.zig").WakeList;
+const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+
+// Unified waiter for the simple blocking API
+const unified_waiter = @import("waiter.zig");
+const UnifiedWaiter = unified_waiter.Waiter;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiters
@@ -49,6 +53,8 @@ pub const ReadWaiter = struct {
     waker_ctx: ?*anyopaque = null,
     acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(ReadWaiter) = .{},
+    /// Debug-mode invocation tracking (detects use-after-free)
+    invocation: InvocationId = .{},
 
     const Self = @This();
 
@@ -70,14 +76,26 @@ pub const ReadWaiter = struct {
     }
 
     pub fn isAcquired(self: *const Self) bool {
-        return self.acquired.load(.acquire);
+        return self.acquired.load(.seq_cst);
     }
 
+    /// Get invocation token (for debug tracking)
+    pub fn token(self: *const Self) InvocationId.Id {
+        return self.invocation.get();
+    }
+
+    /// Verify invocation token matches (debug mode)
+    pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
+        self.invocation.verify(tok);
+    }
+
+    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.acquired.store(false, .release);
+        self.acquired.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
+        self.invocation.bump();
     }
 };
 
@@ -87,6 +105,8 @@ pub const WriteWaiter = struct {
     waker_ctx: ?*anyopaque = null,
     acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(WriteWaiter) = .{},
+    /// Debug-mode invocation tracking (detects use-after-free)
+    invocation: InvocationId = .{},
 
     const Self = @This();
 
@@ -108,14 +128,26 @@ pub const WriteWaiter = struct {
     }
 
     pub fn isAcquired(self: *const Self) bool {
-        return self.acquired.load(.acquire);
+        return self.acquired.load(.seq_cst);
     }
 
+    /// Get invocation token (for debug tracking)
+    pub fn token(self: *const Self) InvocationId.Id {
+        return self.invocation.get();
+    }
+
+    /// Verify invocation token matches (debug mode)
+    pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
+        self.invocation.verify(tok);
+    }
+
+    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.acquired.store(false, .release);
+        self.acquired.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
+        self.invocation.bump();
     }
 };
 
@@ -184,12 +216,12 @@ pub const RwLock = struct {
         if (!self.writer_active and self.write_waiters.count() == 0) {
             self.readers += 1;
             self.mutex.unlock();
-            waiter.acquired.store(true, .release);
+            waiter.acquired.store(true, .seq_cst);
             return true;
         }
 
         // Must wait
-        waiter.acquired.store(false, .release);
+        waiter.acquired.store(false, .seq_cst);
         self.read_waiters.pushBack(waiter);
         self.mutex.unlock();
 
@@ -214,7 +246,7 @@ pub const RwLock = struct {
                 waker_fn = w.waker;
                 waker_ctx = w.waker_ctx;
                 // After this, waiter may be freed by waiting thread
-                w.acquired.store(true, .release);
+                w.acquired.store(true, .seq_cst);
                 self.writer_active = true;
             }
         }
@@ -275,12 +307,12 @@ pub const RwLock = struct {
         if (!self.writer_active and self.readers == 0) {
             self.writer_active = true;
             self.mutex.unlock();
-            waiter.acquired.store(true, .release);
+            waiter.acquired.store(true, .seq_cst);
             return true;
         }
 
         // Must wait
-        waiter.acquired.store(false, .release);
+        waiter.acquired.store(false, .seq_cst);
         self.write_waiters.pushBack(waiter);
         self.mutex.unlock();
 
@@ -307,7 +339,7 @@ pub const RwLock = struct {
                 writer_waker_fn = w.waker;
                 writer_waker_ctx = w.waker_ctx;
                 // After this, waiter may be freed by waiting thread
-                w.acquired.store(true, .release);
+                w.acquired.store(true, .seq_cst);
                 self.writer_active = true;
             }
         } else {
@@ -320,7 +352,7 @@ pub const RwLock = struct {
                     }
                 }
                 // After this, waiter may be freed by waiting thread
-                r.acquired.store(true, .release);
+                r.acquired.store(true, .seq_cst);
                 self.readers += 1;
             }
         }
@@ -385,6 +417,104 @@ pub const RwLock = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.write_waiters.count();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Blocking API (using unified Waiter)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Blocking read lock acquisition.
+    /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
+    ///
+    /// Example:
+    /// ```zig
+    /// rwlock.readLockBlocking();
+    /// defer rwlock.readUnlock();
+    /// // Read shared data
+    /// ```
+    pub fn readLockBlocking(self: *Self) void {
+        // Fast path: try to acquire without waiting
+        if (self.tryReadLock()) {
+            return;
+        }
+
+        // Slow path: use unified waiter
+        var waiter = ReadWaiter.init();
+
+        // Set up waker bridge to unified waiter
+        var unified = UnifiedWaiter.init();
+        const WakerBridge = struct {
+            fn wake(ctx: *anyopaque) void {
+                const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
+                uw.notify();
+            }
+        };
+        waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+
+        self.mutex.lock();
+
+        // Re-check under lock
+        if (!self.writer_active and self.write_waiters.count() == 0) {
+            self.readers += 1;
+            self.mutex.unlock();
+            return;
+        }
+
+        // Add to waiters list
+        waiter.acquired.store(false, .seq_cst);
+        self.read_waiters.pushBack(&waiter);
+
+        self.mutex.unlock();
+
+        // Wait until notified - this yields in task context, blocks in thread context
+        unified.wait();
+    }
+
+    /// Blocking write lock acquisition.
+    /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
+    ///
+    /// Example:
+    /// ```zig
+    /// rwlock.writeLockBlocking();
+    /// defer rwlock.writeUnlock();
+    /// // Modify shared data
+    /// ```
+    pub fn writeLockBlocking(self: *Self) void {
+        // Fast path: try to acquire without waiting
+        if (self.tryWriteLock()) {
+            return;
+        }
+
+        // Slow path: use unified waiter
+        var waiter = WriteWaiter.init();
+
+        // Set up waker bridge to unified waiter
+        var unified = UnifiedWaiter.init();
+        const WakerBridge = struct {
+            fn wake(ctx: *anyopaque) void {
+                const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
+                uw.notify();
+            }
+        };
+        waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+
+        self.mutex.lock();
+
+        // Re-check under lock
+        if (!self.writer_active and self.readers == 0) {
+            self.writer_active = true;
+            self.mutex.unlock();
+            return;
+        }
+
+        // Add to waiters list
+        waiter.acquired.store(false, .seq_cst);
+        self.write_waiters.pushBack(&waiter);
+
+        self.mutex.unlock();
+
+        // Wait until notified - this yields in task context, blocks in thread context
+        unified.wait();
     }
 };
 
@@ -746,4 +876,108 @@ test "RwLock - writer FIFO ordering" {
     for (&write_waiters) |*w| {
         try std.testing.expect(w.isAcquired());
     }
+}
+
+test "RwLock - readLockBlocking simple" {
+    var rwlock = RwLock.init();
+
+    // First lock should succeed immediately
+    rwlock.readLockBlocking();
+    try std.testing.expectEqual(@as(usize, 1), rwlock.readerCount());
+
+    // Second reader also succeeds
+    rwlock.readLockBlocking();
+    try std.testing.expectEqual(@as(usize, 2), rwlock.readerCount());
+
+    rwlock.readUnlock();
+    rwlock.readUnlock();
+    try std.testing.expectEqual(@as(usize, 0), rwlock.readerCount());
+}
+
+test "RwLock - writeLockBlocking simple" {
+    var rwlock = RwLock.init();
+
+    // First lock should succeed immediately
+    rwlock.writeLockBlocking();
+    try std.testing.expect(rwlock.isWriteLocked());
+
+    rwlock.writeUnlock();
+    try std.testing.expect(!rwlock.isWriteLocked());
+
+    // Second lock should also work
+    rwlock.writeLockBlocking();
+    try std.testing.expect(rwlock.isWriteLocked());
+
+    rwlock.writeUnlock();
+    try std.testing.expect(!rwlock.isWriteLocked());
+}
+
+test "RwLock - readLockBlocking with contention" {
+    var rwlock = RwLock.init();
+    var counter: u32 = 0;
+    var done = std.atomic.Value(bool).init(false);
+
+    // Writer holds lock
+    rwlock.writeLockBlocking();
+
+    // Start a thread that will try to read-lock
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(rw: *RwLock, c: *u32, d: *std.atomic.Value(bool)) void {
+            rw.readLockBlocking(); // Should block until main thread unlocks
+            c.* += 1;
+            rw.readUnlock();
+            d.store(true, .release);
+        }
+    }.run, .{ &rwlock, &counter, &done });
+
+    // Give the thread time to start and block
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Counter should still be 0 (thread is blocked)
+    try std.testing.expectEqual(@as(u32, 0), counter);
+
+    // Unlock - this should wake the other thread
+    rwlock.writeUnlock();
+
+    // Wait for the thread to finish
+    thread.join();
+
+    // Now counter should be 1
+    try std.testing.expectEqual(@as(u32, 1), counter);
+    try std.testing.expect(done.load(.acquire));
+}
+
+test "RwLock - writeLockBlocking with contention" {
+    var rwlock = RwLock.init();
+    var counter: u32 = 0;
+    var done = std.atomic.Value(bool).init(false);
+
+    // Reader holds lock
+    rwlock.readLockBlocking();
+
+    // Start a thread that will try to write-lock
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(rw: *RwLock, c: *u32, d: *std.atomic.Value(bool)) void {
+            rw.writeLockBlocking(); // Should block until main thread unlocks
+            c.* += 1;
+            rw.writeUnlock();
+            d.store(true, .release);
+        }
+    }.run, .{ &rwlock, &counter, &done });
+
+    // Give the thread time to start and block
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Counter should still be 0 (thread is blocked)
+    try std.testing.expectEqual(@as(u32, 0), counter);
+
+    // Unlock - this should wake the other thread
+    rwlock.readUnlock();
+
+    // Wait for the thread to finish
+    thread.join();
+
+    // Now counter should be 1
+    try std.testing.expectEqual(@as(u32, 1), counter);
+    try std.testing.expect(done.load(.acquire));
 }

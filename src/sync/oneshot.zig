@@ -33,7 +33,6 @@
 //! Reference: tokio/src/sync/oneshot.rs
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
@@ -134,13 +133,13 @@ pub fn Oneshot(comptime T: type) type {
 
                 self.shared.mutex.lock();
 
-                const state: State = @enumFromInt(self.shared.state.load(.acquire));
+                const state: State = @enumFromInt(self.shared.state.load(.seq_cst));
 
                 switch (state) {
                     .empty => {
                         // No receiver waiting, store value
                         self.shared.value = value;
-                        self.shared.state.store(@intFromEnum(State.value_sent), .release);
+                        self.shared.state.store(@intFromEnum(State.value_sent), .seq_cst);
                         self.shared.mutex.unlock();
                         return true;
                     },
@@ -158,7 +157,7 @@ pub fn Oneshot(comptime T: type) type {
 
                         // Clear waiter pointer and update state
                         self.shared.waiter = null;
-                        self.shared.state.store(@intFromEnum(State.value_sent), .release);
+                        self.shared.state.store(@intFromEnum(State.value_sent), .seq_cst);
 
                         self.shared.mutex.unlock();
 
@@ -180,7 +179,7 @@ pub fn Oneshot(comptime T: type) type {
 
             /// Check if receiver is still alive.
             pub fn isReceiverAlive(self: *const Sender) bool {
-                const state: State = @enumFromInt(self.shared.state.load(.acquire));
+                const state: State = @enumFromInt(self.shared.state.load(.seq_cst));
                 return state != .closed;
             }
 
@@ -191,7 +190,7 @@ pub fn Oneshot(comptime T: type) type {
 
                 self.shared.mutex.lock();
 
-                const state: State = @enumFromInt(self.shared.state.load(.acquire));
+                const state: State = @enumFromInt(self.shared.state.load(.seq_cst));
 
                 if (state == .receiver_waiting) {
                     // Copy waiter pointer and waker info BEFORE setting closed flag
@@ -204,7 +203,7 @@ pub fn Oneshot(comptime T: type) type {
 
                     // Clear waiter pointer and update state
                     self.shared.waiter = null;
-                    self.shared.state.store(@intFromEnum(State.closed), .release);
+                    self.shared.state.store(@intFromEnum(State.closed), .seq_cst);
 
                     self.shared.mutex.unlock();
 
@@ -215,7 +214,7 @@ pub fn Oneshot(comptime T: type) type {
                         }
                     }
                 } else {
-                    self.shared.state.store(@intFromEnum(State.closed), .release);
+                    self.shared.state.store(@intFromEnum(State.closed), .seq_cst);
                     self.shared.mutex.unlock();
                 }
             }
@@ -231,7 +230,7 @@ pub fn Oneshot(comptime T: type) type {
             pub fn tryRecv(self: *Receiver) ?T {
                 if (self.received) return null;
 
-                const state: State = @enumFromInt(self.shared.state.load(.acquire));
+                const state: State = @enumFromInt(self.shared.state.load(.seq_cst));
 
                 if (state == .value_sent) {
                     self.received = true;
@@ -251,7 +250,7 @@ pub fn Oneshot(comptime T: type) type {
             pub fn tryRecvResult(self: *Receiver) TryRecvResult {
                 if (self.received) return .{ .closed = {} };
 
-                const state: State = @enumFromInt(self.shared.state.load(.acquire));
+                const state: State = @enumFromInt(self.shared.state.load(.seq_cst));
 
                 switch (state) {
                     .value_sent => {
@@ -279,7 +278,7 @@ pub fn Oneshot(comptime T: type) type {
 
                 self.shared.mutex.lock();
 
-                const state: State = @enumFromInt(self.shared.state.load(.acquire));
+                const state: State = @enumFromInt(self.shared.state.load(.seq_cst));
 
                 switch (state) {
                     .value_sent => {
@@ -297,7 +296,7 @@ pub fn Oneshot(comptime T: type) type {
                     .empty => {
                         // Register waiter (store pointer so sender can set waiter.value)
                         self.shared.waiter = waiter;
-                        self.shared.state.store(@intFromEnum(State.receiver_waiting), .release);
+                        self.shared.state.store(@intFromEnum(State.receiver_waiting), .seq_cst);
                         self.shared.mutex.unlock();
                         return false;
                     },
@@ -313,11 +312,11 @@ pub fn Oneshot(comptime T: type) type {
             pub fn cancelRecv(self: *Receiver) void {
                 self.shared.mutex.lock();
 
-                const state: State = @enumFromInt(self.shared.state.load(.acquire));
+                const state: State = @enumFromInt(self.shared.state.load(.seq_cst));
 
                 if (state == .receiver_waiting) {
                     self.shared.waiter = null;
-                    self.shared.state.store(@intFromEnum(State.empty), .release);
+                    self.shared.state.store(@intFromEnum(State.empty), .seq_cst);
                 }
 
                 self.shared.mutex.unlock();
@@ -329,7 +328,7 @@ pub fn Oneshot(comptime T: type) type {
                 self.received = true;
 
                 self.shared.mutex.lock();
-                self.shared.state.store(@intFromEnum(State.closed), .release);
+                self.shared.state.store(@intFromEnum(State.closed), .seq_cst);
                 self.shared.mutex.unlock();
             }
         };

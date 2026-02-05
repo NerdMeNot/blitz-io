@@ -31,7 +31,6 @@
 //! Reference: tokio/src/runtime/io/scheduled_io.rs
 
 const std = @import("std");
-const builtin = @import("builtin");
 const bit = @import("../util/bit.zig");
 const linked_list = @import("../util/linked_list.zig");
 const cacheline = @import("../util/cacheline.zig");

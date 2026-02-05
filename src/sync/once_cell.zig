@@ -23,11 +23,15 @@
 //! Reference: tokio/src/sync/once_cell.rs
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const LinkedList = @import("../util/linked_list.zig").LinkedList;
 const Pointers = @import("../util/linked_list.zig").Pointers;
 const WakeList = @import("../util/wake_list.zig").WakeList;
+const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+
+// Unified waiter for the simple blocking API
+const unified_waiter = @import("waiter.zig");
+const UnifiedWaiter = unified_waiter.Waiter;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
@@ -50,8 +54,11 @@ pub const WakerFn = *const fn (*anyopaque) void;
 pub const InitWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
-    complete: bool = false,
+    /// Whether initialization completed (atomic for cross-thread visibility)
+    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(InitWaiter) = .{},
+    /// Debug-mode invocation tracking (detects use-after-free)
+    invocation: InvocationId = .{},
 
     const Self = @This();
 
@@ -73,14 +80,26 @@ pub const InitWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.complete;
+        return self.complete.load(.seq_cst);
     }
 
+    /// Get invocation token (for debug tracking)
+    pub fn token(self: *const Self) InvocationId.Id {
+        return self.invocation.get();
+    }
+
+    /// Verify invocation token matches (debug mode)
+    pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
+        self.invocation.verify(tok);
+    }
+
+    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.complete = false;
+        self.complete.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
+        self.invocation.bump();
     }
 };
 
@@ -134,7 +153,7 @@ pub fn OnceCell(comptime T: type) type {
 
         /// Check if initialized.
         pub fn isInitialized(self: *const Self) bool {
-            return @as(State, @enumFromInt(self.state.load(.acquire))) == .initialized;
+            return @as(State, @enumFromInt(self.state.load(.seq_cst))) == .initialized;
         }
 
         /// Get the value if initialized.
@@ -159,8 +178,8 @@ pub fn OnceCell(comptime T: type) type {
             const result = self.state.cmpxchgStrong(
                 @intFromEnum(State.empty),
                 @intFromEnum(State.initializing),
-                .acq_rel,
-                .acquire,
+                .seq_cst,
+                .seq_cst,
             );
 
             if (result != null) {
@@ -189,8 +208,8 @@ pub fn OnceCell(comptime T: type) type {
             const result = self.state.cmpxchgStrong(
                 @intFromEnum(State.empty),
                 @intFromEnum(State.initializing),
-                .acq_rel,
-                .acquire,
+                .seq_cst,
+                .seq_cst,
             );
 
             if (result == null) {
@@ -222,8 +241,8 @@ pub fn OnceCell(comptime T: type) type {
             const result = self.state.cmpxchgStrong(
                 @intFromEnum(State.empty),
                 @intFromEnum(State.initializing),
-                .acq_rel,
-                .acquire,
+                .seq_cst,
+                .seq_cst,
             );
 
             if (result == null) {
@@ -248,7 +267,7 @@ pub fn OnceCell(comptime T: type) type {
         ) ?*T {
             // Fast path: already initialized
             if (self.isInitialized()) {
-                waiter.complete = true;
+                waiter.complete.store(true, .seq_cst);
                 return &self.value;
             }
 
@@ -256,21 +275,21 @@ pub fn OnceCell(comptime T: type) type {
             const result = self.state.cmpxchgStrong(
                 @intFromEnum(State.empty),
                 @intFromEnum(State.initializing),
-                .acq_rel,
-                .acquire,
+                .seq_cst,
+                .seq_cst,
             );
 
             if (result == null) {
                 // We won - initialize
                 self.value = init_fn();
                 self.completeInit();
-                waiter.complete = true;
+                waiter.complete.store(true, .seq_cst);
                 return &self.value;
             }
 
             // Check if already initialized (race between cmpxchg and now)
             if (self.isInitialized()) {
-                waiter.complete = true;
+                waiter.complete.store(true, .seq_cst);
                 return &self.value;
             }
 
@@ -280,11 +299,11 @@ pub fn OnceCell(comptime T: type) type {
             // Re-check under lock
             if (self.isInitialized()) {
                 self.mutex.unlock();
-                waiter.complete = true;
+                waiter.complete.store(true, .seq_cst);
                 return &self.value;
             }
 
-            waiter.complete = false;
+            waiter.complete.store(false, .seq_cst);
             self.waiters.pushBack(waiter);
             self.mutex.unlock();
 
@@ -317,13 +336,16 @@ pub fn OnceCell(comptime T: type) type {
             self.mutex.lock();
 
             // Set to initialized
-            self.state.store(@intFromEnum(State.initialized), .release);
+            self.state.store(@intFromEnum(State.initialized), .seq_cst);
 
             // Wake all waiters
+            // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
             while (self.waiters.popFront()) |w| {
-                w.complete = true;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.complete.store(true, .seq_cst);
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }
@@ -335,11 +357,40 @@ pub fn OnceCell(comptime T: type) type {
         }
 
         /// Wait for initialization to complete (blocking).
+        /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
         fn waitForInit(self: *Self) void {
-            // Spin until initialized
-            while (!self.isInitialized()) {
-                std.atomic.spinLoopHint();
+            // Fast path: already initialized
+            if (self.isInitialized()) {
+                return;
             }
+
+            // Set up waiter with unified waiter bridge
+            var waiter = InitWaiter.init();
+            var unified = UnifiedWaiter.init();
+            const WakerBridge = struct {
+                fn wake(ctx: *anyopaque) void {
+                    const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
+                    uw.notify();
+                }
+            };
+            waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+
+            self.mutex.lock();
+
+            // Re-check under lock
+            if (self.isInitialized()) {
+                self.mutex.unlock();
+                return;
+            }
+
+            // Add to waiters list
+            waiter.complete.store(false, .seq_cst);
+            self.waiters.pushBack(&waiter);
+
+            self.mutex.unlock();
+
+            // Wait until notified - yields in task context, blocks in thread context
+            unified.wait();
         }
     };
 }
@@ -435,7 +486,7 @@ test "OnceCell - async wait" {
     cell.completeInit();
 
     try std.testing.expect(woken);
-    try std.testing.expect(waiter.complete);
+    try std.testing.expect(waiter.complete.load(.acquire));
     try std.testing.expectEqual(@as(u32, 42), cell.get().?.*);
 }
 

@@ -1,12 +1,21 @@
 //! Stress tests for blitz_io.Oneshot
 //!
 //! Tests the single-value channel under concurrent scenarios.
+//!
+//! ## Test Categories
+//!
+//! - **Send/recv pairs**: Concurrent oneshot channel creation and completion
+//! - **Ordering**: Receiver waits before send, send before receiver
+//! - **Large values**: Data integrity with larger payloads
+//! - **Rapid cycles**: High-frequency channel creation and completion
 
 const std = @import("std");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 const Oneshot = blitz_io.sync.Oneshot;
+
+const config = @import("test_config");
 
 /// Large value type for stress testing
 const OneshotLargeValue = struct {
@@ -35,7 +44,8 @@ test "Oneshot stress - many send/recv pairs" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_pairs = 100;
+    // Use tasks_medium for debug/release scaling
+    const num_pairs = config.stress.tasks_medium;
     var received_values: [num_pairs]std.atomic.Value(u64) = undefined;
     for (&received_values) |*v| {
         v.* = std.atomic.Value(u64).init(0);
@@ -67,7 +77,7 @@ fn oneshotSender(allocator: std.mem.Allocator, value: u64, result: *std.atomic.V
     inner_scope.spawn(oneshotReceiver, .{ &shared, result }) catch return;
 
     // Small delay to let receiver start waiting
-    std.atomic.spinLoopHint();
+    std.Thread.yield() catch {};
 
     // Send value
     var sender = Oneshot(u64).Sender{ .shared = &shared };
@@ -89,7 +99,7 @@ fn oneshotReceiver(shared: *Oneshot(u64).Shared, result: *std.atomic.Value(u64))
                 result.store(value, .release);
                 break;
             }
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
     }
 }
@@ -100,7 +110,8 @@ test "Oneshot stress - receiver waits before send" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_channels = 50;
+    // Use tasks_low for debug/release scaling
+    const num_channels = config.stress.tasks_low;
     var results: [num_channels]std.atomic.Value(u64) = undefined;
     for (&results) |*r| {
         r.* = std.atomic.Value(u64).init(0);
@@ -145,7 +156,7 @@ fn waitingReceiver(shared: *Oneshot(u64).Shared, result: *std.atomic.Value(u64))
             result.store(value, .release);
             break;
         }
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 }
 
@@ -155,7 +166,8 @@ test "Oneshot stress - send before receiver starts" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_channels = 50;
+    // Use tasks_low for debug/release scaling
+    const num_channels = config.stress.tasks_low;
     var results: [num_channels]std.atomic.Value(u64) = undefined;
     for (&results) |*r| {
         r.* = std.atomic.Value(u64).init(0);
@@ -201,7 +213,7 @@ fn immediateReceiver(shared: *Oneshot(u64).Shared, result: *std.atomic.Value(u64
                 result.store(value, .release);
                 break;
             }
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
     }
 }
@@ -212,6 +224,7 @@ test "Oneshot stress - large values" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
+    // Fewer channels for large value test (64 * 8 = 512 bytes per value)
     const num_channels = 30;
     var checksums: [num_channels]std.atomic.Value(u64) = undefined;
     for (&checksums) |*c| {
@@ -261,7 +274,7 @@ fn largeValueReceiver(
             checksum_result.store(value.checksum(), .release);
             break;
         }
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 }
 
@@ -273,7 +286,8 @@ test "Oneshot stress - rapid creation and completion" {
 
     var completed = std.atomic.Value(usize).init(0);
 
-    const iterations = 500;
+    // Use iterations for task spawning (1000 in release, reasonable for channel creation)
+    const iterations = config.stress.iterations;
 
     for (0..iterations) |i| {
         try scope.spawn(rapidOneshotCycle, .{ allocator, @as(u64, @intCast(i)), &completed });
@@ -304,6 +318,6 @@ fn rapidReceiver(shared: *Oneshot(u64).Shared) void {
     var receiver = Oneshot(u64).Receiver{ .shared = shared };
 
     while (receiver.tryRecv() == null) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 }

@@ -1,11 +1,19 @@
 //! Stress tests for concurrent patterns
 //!
 //! Tests high throughput concurrent operations using Scope.
+//!
+//! ## Test Categories
+//!
+//! - **High throughput**: Atomic counter with many increments
+//! - **MPSC pattern**: Multiple producers, single consumer ring buffer
+//! - **Fan out/in**: Parallel work distribution and result collection
 
 const std = @import("std");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
+
+const config = @import("test_config");
 
 test "Concurrent stress - high throughput atomic counter" {
     const allocator = testing.allocator;
@@ -15,8 +23,9 @@ test "Concurrent stress - high throughput atomic counter" {
 
     var counter = std.atomic.Value(u64).init(0);
 
-    const num_tasks = 100;
-    const increments_per_task = 100;
+    // Use config values for debug/release scaling
+    const num_tasks = config.stress.tasks_medium;
+    const increments_per_task = config.stress.ops_per_task;
 
     for (0..num_tasks) |_| {
         try scope.spawn(multiIncrement, .{ &counter, increments_per_task });
@@ -39,8 +48,9 @@ test "Concurrent stress - multiple producers single consumer" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_producers = 10;
-    const items_per_producer = 1000;
+    // Use config values for MPSC pattern
+    const num_producers = config.stress.producers;
+    const items_per_producer = config.stress.items_per_producer;
 
     // Ring buffer for MPSC pattern
     var buffer: [10000]u64 = undefined;
@@ -121,6 +131,7 @@ test "Concurrent stress - fan out fan in" {
     // Fan out: spawn many tasks that do work
     // Fan in: collect all results
 
+    // Fixed at 50 to match array size and mathematical verification below
     var results: [50]u64 = undefined;
     for (results[0..], 0..) |*r, i| {
         try scope.spawnWithResult(fanOutWork, .{@as(u32, @intCast(i))}, r);

@@ -26,7 +26,6 @@
 //! Reference: tokio/src/sync/notify.rs
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const LinkedList = @import("../util/linked_list.zig").LinkedList;
 const Pointers = @import("../util/linked_list.zig").Pointers;
@@ -69,8 +68,8 @@ pub const Waiter = struct {
         const waker_ctx = self.waker_ctx;
 
         // Now safe to set the flag - we have our own copies
-        // Use release ordering so the waiting thread sees all prior writes
-        self.notified.store(true, .release);
+        // Use SeqCst like Tokio for proper cross-thread synchronization
+        self.notified.store(true, .seq_cst);
 
         // Wake using copied function pointers
         if (waker_fn) |wf| {
@@ -80,14 +79,14 @@ pub const Waiter = struct {
         }
     }
 
-    /// Check if notified (uses acquire ordering for cross-thread visibility)
+    /// Check if notified (uses SeqCst for cross-thread visibility)
     pub fn isNotified(self: *const Self) bool {
-        return self.notified.load(.acquire);
+        return self.notified.load(.seq_cst);
     }
 
     /// Reset for reuse
     pub fn reset(self: *Self) void {
-        self.notified.store(false, .release);
+        self.notified.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -141,23 +140,42 @@ pub const Notify = struct {
     /// Notify one waiting task.
     /// If no task is waiting, stores a permit that will be consumed by the next wait.
     pub fn notifyOne(self: *Self) void {
-        // Fast path: check if anyone is waiting
-        const state = self.state.load(.acquire);
-        if (state & State.WAITING == 0) {
-            // No waiters - try to store a permit
-            _ = self.state.fetchOr(State.PERMIT, .release);
-            return;
+        // Fast path: try to transition EMPTY -> NOTIFIED
+        // Use SeqCst like Tokio for proper cross-thread synchronization
+        var curr = self.state.load(.seq_cst);
+
+        while (curr & State.WAITING == 0) {
+            // No waiters - try to store a permit via CAS
+            const new = curr | State.PERMIT;
+            const result = self.state.cmpxchgWeak(curr, new, .seq_cst, .seq_cst);
+            if (result == null) {
+                // Successfully stored permit
+                return;
+            }
+            // CAS failed, reload and retry
+            curr = result.?;
         }
 
-        // Slow path: need to wake a waiter
+        // Slow path: there are waiters, must acquire lock
         self.mutex.lock();
+
+        // CRITICAL: Reload state while holding lock (Tokio pattern)
+        // State can only transition OUT of WAITING while lock is held
+        curr = self.state.load(.seq_cst);
+
+        if (curr & State.WAITING == 0) {
+            // No waiters anymore, store permit
+            _ = self.state.fetchOr(State.PERMIT, .seq_cst);
+            self.mutex.unlock();
+            return;
+        }
 
         // Pop one waiter
         const waiter = self.waiters.popFront();
 
-        // Update state
+        // Update state if list is now empty
         if (self.waiters.isEmpty()) {
-            _ = self.state.fetchAnd(~State.WAITING, .release);
+            _ = self.state.fetchAnd(~State.WAITING, .seq_cst);
         }
 
         self.mutex.unlock();
@@ -165,9 +183,6 @@ pub const Notify = struct {
         // Wake outside the lock
         if (waiter) |w| {
             w.wake();
-        } else {
-            // No waiter found, store a permit
-            _ = self.state.fetchOr(State.PERMIT, .release);
         }
     }
 
@@ -175,7 +190,8 @@ pub const Notify = struct {
     /// Does NOT store a permit if no tasks are waiting.
     pub fn notifyAll(self: *Self) void {
         // Fast path: check if anyone is waiting
-        const state = self.state.load(.acquire);
+        // Use SeqCst like Tokio for proper cross-thread synchronization
+        const state = self.state.load(.seq_cst);
         if (state & State.WAITING == 0) {
             return;
         }
@@ -192,7 +208,7 @@ pub const Notify = struct {
             const waker_ctx = waiter.waker_ctx;
 
             // Now safe to set the flag (atomic for cross-thread visibility)
-            waiter.notified.store(true, .release);
+            waiter.notified.store(true, .seq_cst);
 
             if (waker_fn) |wf| {
                 if (waker_ctx) |ctx| {
@@ -202,7 +218,7 @@ pub const Notify = struct {
         }
 
         // Clear WAITING flag
-        _ = self.state.fetchAnd(~State.WAITING, .release);
+        _ = self.state.fetchAnd(~State.WAITING, .seq_cst);
 
         self.mutex.unlock();
 
@@ -217,18 +233,19 @@ pub const Notify = struct {
     /// The waiter must be kept alive until notified or cancelled.
     pub fn wait(self: *Self, waiter: *Waiter) bool {
         // Fast path: check for permit
-        var state = self.state.load(.acquire);
+        // Use SeqCst like Tokio for proper cross-thread synchronization
+        var state = self.state.load(.seq_cst);
         if (state & State.PERMIT != 0) {
             // Try to consume permit
             const result = self.state.cmpxchgWeak(
                 state,
                 state & ~State.PERMIT,
-                .acq_rel,
-                .acquire,
+                .seq_cst,
+                .seq_cst,
             );
             if (result == null) {
                 // Consumed permit
-                waiter.notified.store(true, .release);
+                waiter.notified.store(true, .seq_cst);
                 return true;
             }
             // CAS failed, fall through to slow path
@@ -238,20 +255,20 @@ pub const Notify = struct {
         self.mutex.lock();
 
         // Re-check for permit under lock
-        state = self.state.load(.acquire);
+        state = self.state.load(.seq_cst);
         if (state & State.PERMIT != 0) {
-            _ = self.state.fetchAnd(~State.PERMIT, .release);
+            _ = self.state.fetchAnd(~State.PERMIT, .seq_cst);
             self.mutex.unlock();
-            waiter.notified.store(true, .release);
+            waiter.notified.store(true, .seq_cst);
             return true;
         }
 
         // Add to waiters list
-        waiter.notified.store(false, .release);
+        waiter.notified.store(false, .seq_cst);
         self.waiters.pushBack(waiter);
 
         // Set WAITING flag
-        _ = self.state.fetchOr(State.WAITING, .release);
+        _ = self.state.fetchOr(State.WAITING, .seq_cst);
 
         self.mutex.unlock();
 
@@ -282,7 +299,7 @@ pub const Notify = struct {
 
             // Update state if list is now empty
             if (self.waiters.isEmpty()) {
-                _ = self.state.fetchAnd(~State.WAITING, .release);
+                _ = self.state.fetchAnd(~State.WAITING, .seq_cst);
             }
         }
 
@@ -291,7 +308,7 @@ pub const Notify = struct {
 
     /// Check if there are pending permits (for testing/debugging).
     pub fn hasPermit(self: *const Self) bool {
-        return self.state.load(.acquire) & State.PERMIT != 0;
+        return self.state.load(.seq_cst) & State.PERMIT != 0;
     }
 
     /// Get the number of waiters (for debugging).

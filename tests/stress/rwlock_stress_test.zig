@@ -1,20 +1,23 @@
 //! Stress tests for blitz_io.RwLock
 //!
 //! Tests the read-write lock under high contention scenarios.
+//! Uses readLockBlocking() and writeLockBlocking() for proper blocking without spin-waiting.
+//!
+//! ## Test Categories
+//!
+//! - **Concurrent readers**: Multiple simultaneous read locks
+//! - **Exclusive writers**: Write lock exclusivity verification
+//! - **Mixed workload**: Readers and writers competing
+//! - **Writer priority**: Writers not starved by readers
+//! - **Data integrity**: Checksum verification under contention
 
 const std = @import("std");
-const builtin = @import("builtin");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 const RwLock = blitz_io.sync.RwLock;
-const WriteWaiter = blitz_io.sync.WriteWaiter;
 
-// Use smaller iteration counts in debug mode
-const is_debug = builtin.mode == .Debug;
-const NUM_READERS: usize = if (is_debug) 20 else 50;
-const NUM_WRITERS: usize = if (is_debug) 10 else 20;
-const NUM_OPS: usize = if (is_debug) 50 else 100;
+const config = @import("test_config");
 
 test "RwLock stress - multiple concurrent readers" {
     const allocator = testing.allocator;
@@ -27,7 +30,7 @@ test "RwLock stress - multiple concurrent readers" {
     var current_readers = std.atomic.Value(usize).init(0);
     var read_value: u64 = 42;
 
-    for (0..NUM_READERS) |_| {
+    for (0..config.stress.readers) |_| {
         try scope.spawn(concurrentReader, .{
             &rwlock,
             &read_value,
@@ -50,9 +53,8 @@ fn concurrentReader(
     max_observed: *std.atomic.Value(usize),
 ) void {
     for (0..10) |_| {
-        while (!rwlock.tryReadLock()) {
-            std.atomic.spinLoopHint();
-        }
+        // Use proper blocking instead of spin-waiting
+        rwlock.readLockBlocking();
 
         // Track concurrent readers
         const now_reading = current.fetchAdd(1, .acq_rel) + 1;
@@ -71,10 +73,8 @@ fn concurrentReader(
         // Read the value (verify it's consistent)
         _ = value.*;
 
-        // Hold read lock briefly
-        for (0..50) |_| {
-            std.atomic.spinLoopHint();
-        }
+        // Hold read lock briefly - yield instead of spin
+        std.Thread.yield() catch {};
 
         _ = current.fetchSub(1, .acq_rel);
         rwlock.readUnlock();
@@ -90,21 +90,19 @@ test "RwLock stress - exclusive write access" {
     var rwlock = RwLock.init();
     var counter: usize = 0;
 
-    for (0..NUM_WRITERS) |_| {
-        try scope.spawn(exclusiveWriter, .{ &rwlock, &counter, NUM_OPS });
+    for (0..config.stress.writers) |_| {
+        try scope.spawn(exclusiveWriter, .{ &rwlock, &counter, config.stress.ops_per_task });
     }
 
     try scope.wait();
 
     // All increments should be accounted for
-    try testing.expectEqual(@as(usize, NUM_WRITERS * NUM_OPS), counter);
+    try testing.expectEqual(@as(usize, config.stress.writers * config.stress.ops_per_task), counter);
 }
 
 fn exclusiveWriter(rwlock: *RwLock, counter: *usize, count: usize) void {
     for (0..count) |_| {
-        while (!rwlock.tryWriteLock()) {
-            std.atomic.spinLoopHint();
-        }
+        rwlock.writeLockBlocking();
 
         // Critical section
         counter.* += 1;
@@ -124,26 +122,26 @@ test "RwLock stress - readers and writers mixed" {
     var reads = std.atomic.Value(usize).init(0);
     var writes = std.atomic.Value(usize).init(0);
 
-    const num_writers = NUM_WRITERS / 2;
+    const num_writers = config.stress.writers / 2;
 
     // Spawn readers
-    for (0..NUM_READERS) |_| {
-        try scope.spawn(mixedReader, .{ &rwlock, &value, &reads, NUM_OPS });
+    for (0..config.stress.readers) |_| {
+        try scope.spawn(mixedReader, .{ &rwlock, &value, &reads, config.stress.ops_per_task });
     }
 
     // Spawn writers
     for (0..num_writers) |_| {
-        try scope.spawn(mixedWriter, .{ &rwlock, &value, &writes, NUM_OPS });
+        try scope.spawn(mixedWriter, .{ &rwlock, &value, &writes, config.stress.ops_per_task });
     }
 
     try scope.wait();
 
     // Verify all operations completed
-    try testing.expectEqual(@as(usize, NUM_READERS * NUM_OPS), reads.load(.acquire));
-    try testing.expectEqual(@as(usize, num_writers * NUM_OPS), writes.load(.acquire));
+    try testing.expectEqual(@as(usize, config.stress.readers * config.stress.ops_per_task), reads.load(.acquire));
+    try testing.expectEqual(@as(usize, num_writers * config.stress.ops_per_task), writes.load(.acquire));
 
     // Value should equal number of writes
-    try testing.expectEqual(@as(u64, num_writers * NUM_OPS), value);
+    try testing.expectEqual(@as(u64, num_writers * config.stress.ops_per_task), value);
 }
 
 fn mixedReader(
@@ -153,9 +151,7 @@ fn mixedReader(
     count: usize,
 ) void {
     for (0..count) |_| {
-        while (!rwlock.tryReadLock()) {
-            std.atomic.spinLoopHint();
-        }
+        rwlock.readLockBlocking();
 
         // Read (just access the value)
         _ = value.*;
@@ -172,9 +168,7 @@ fn mixedWriter(
     count: usize,
 ) void {
     for (0..count) |_| {
-        while (!rwlock.tryWriteLock()) {
-            std.atomic.spinLoopHint();
-        }
+        rwlock.writeLockBlocking();
 
         // Write
         value.* += 1;
@@ -200,9 +194,7 @@ test "RwLock stress - writer priority" {
     // Spawn a writer that will wait
     try scope.spawn(struct {
         fn work(rw: *RwLock, v: *u64, completed: *std.atomic.Value(bool)) void {
-            while (!rw.tryWriteLock()) {
-                std.atomic.spinLoopHint();
-            }
+            rw.writeLockBlocking();
             v.* = 999;
             rw.writeUnlock();
             completed.store(true, .release);
@@ -241,13 +233,13 @@ test "RwLock stress - data integrity under contention" {
     var integrity_violations = std.atomic.Value(usize).init(0);
 
     // Readers verify checksum
-    for (0..NUM_READERS) |_| {
-        try scope.spawn(checksumReader, .{ &rwlock, &data, &integrity_violations, NUM_OPS });
+    for (0..config.stress.readers) |_| {
+        try scope.spawn(checksumReader, .{ &rwlock, &data, &integrity_violations, config.stress.ops_per_task });
     }
 
     // Writers update data maintaining checksum
-    for (0..NUM_WRITERS / 2) |_| {
-        try scope.spawn(checksumWriter, .{ &rwlock, &data, NUM_OPS });
+    for (0..config.stress.writers / 2) |_| {
+        try scope.spawn(checksumWriter, .{ &rwlock, &data, config.stress.ops_per_task });
     }
 
     try scope.wait();
@@ -271,9 +263,7 @@ fn checksumReader(
     count: usize,
 ) void {
     for (0..count) |_| {
-        while (!rwlock.tryReadLock()) {
-            std.atomic.spinLoopHint();
-        }
+        rwlock.readLockBlocking();
 
         // Read and verify checksum
         const checksum = computeChecksum(data);
@@ -296,9 +286,7 @@ fn checksumWriter(
     const random = prng.random();
 
     for (0..count) |_| {
-        while (!rwlock.tryWriteLock()) {
-            std.atomic.spinLoopHint();
-        }
+        rwlock.writeLockBlocking();
 
         // Update data while maintaining checksum = 0
         // Change a random element and adjust last element to maintain checksum
@@ -314,7 +302,7 @@ fn checksumWriter(
     }
 }
 
-test "RwLock stress - waiter-based acquisition" {
+test "RwLock stress - blocking acquisition" {
     const allocator = testing.allocator;
 
     var scope = Scope.init(allocator);
@@ -323,11 +311,12 @@ test "RwLock stress - waiter-based acquisition" {
     var rwlock = RwLock.init();
     var counter: usize = 0;
 
-    const num_writers = if (is_debug) 10 else 30;
-    const increments = if (is_debug) 10 else 20;
+    // Use config values for blocking test
+    const num_writers = config.stress.tasks_low;
+    const increments = config.stress.small;
 
     for (0..num_writers) |_| {
-        try scope.spawn(waiterWriter, .{ &rwlock, &counter, increments });
+        try scope.spawn(blockingWriter, .{ &rwlock, &counter, increments });
     }
 
     try scope.wait();
@@ -335,16 +324,9 @@ test "RwLock stress - waiter-based acquisition" {
     try testing.expectEqual(@as(usize, num_writers * increments), counter);
 }
 
-fn waiterWriter(rwlock: *RwLock, counter: *usize, count: usize) void {
+fn blockingWriter(rwlock: *RwLock, counter: *usize, count: usize) void {
     for (0..count) |_| {
-        var waiter = WriteWaiter.init();
-
-        if (!rwlock.writeLock(&waiter)) {
-            while (!waiter.isAcquired()) {
-                std.atomic.spinLoopHint();
-            }
-        }
-
+        rwlock.writeLockBlocking();
         counter.* += 1;
         rwlock.writeUnlock();
     }
@@ -359,8 +341,8 @@ test "RwLock stress - rapid read/write transitions" {
     var rwlock = RwLock.init();
     var state = std.atomic.Value(u64).init(0);
 
-    for (0..NUM_READERS) |_| {
-        try scope.spawn(rapidTransitioner, .{ &rwlock, &state, NUM_OPS });
+    for (0..config.stress.readers) |_| {
+        try scope.spawn(rapidTransitioner, .{ &rwlock, &state, config.stress.ops_per_task });
     }
 
     try scope.wait();
@@ -380,16 +362,12 @@ fn rapidTransitioner(
     for (0..count) |_| {
         if (random.boolean()) {
             // Read
-            while (!rwlock.tryReadLock()) {
-                std.atomic.spinLoopHint();
-            }
+            rwlock.readLockBlocking();
             _ = state.load(.acquire);
             rwlock.readUnlock();
         } else {
             // Write
-            while (!rwlock.tryWriteLock()) {
-                std.atomic.spinLoopHint();
-            }
+            rwlock.writeLockBlocking();
             _ = state.fetchAdd(1, .acq_rel);
             rwlock.writeUnlock();
         }

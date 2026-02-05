@@ -339,7 +339,7 @@ const driver_mod = @import("driver.zig");
 const TimerDriver = driver_mod.TimerDriver;
 const TimerHandle = driver_mod.TimerHandle;
 
-const timer_mod = @import("../executor/timer.zig");
+const timer_mod = @import("../coroutine/timer.zig");
 const TimerEntry = timer_mod.TimerEntry;
 
 /// Tick using the TimerDriver for automatic wakeup.

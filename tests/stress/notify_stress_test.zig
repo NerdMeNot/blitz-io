@@ -1,13 +1,23 @@
 //! Stress tests for blitz_io.Notify
 //!
 //! Tests the task notification primitive under high contention scenarios.
+//!
+//! ## Test Categories
+//!
+//! - **notifyOne**: Single waiter wakeup semantics
+//! - **notifyAll**: Broadcast wakeup to all waiters
+//! - **Rapid cycles**: High-frequency notify/wait patterns
+//! - **Permit semantics**: notify-before-wait behavior
+//! - **Multiple bursts**: Batch registration and wakeup
 
 const std = @import("std");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 const Notify = blitz_io.sync.Notify;
 const NotifyWaiter = blitz_io.sync.NotifyWaiter;
+
+const config = @import("test_config");
 
 test "Notify stress - notifyOne wakes single waiter" {
     const allocator = testing.allocator;
@@ -19,7 +29,8 @@ test "Notify stress - notifyOne wakes single waiter" {
     var woken_count = std.atomic.Value(usize).init(0);
     var registered_count = std.atomic.Value(usize).init(0);
 
-    const num_waiters = 50;
+    // Use tasks_low for debug/release scaling
+    const num_waiters = config.stress.tasks_low;
 
     // Spawn waiters - they signal when registered
     for (0..num_waiters) |_| {
@@ -28,7 +39,7 @@ test "Notify stress - notifyOne wakes single waiter" {
 
     // Wait for ALL waiters to actually register (not just sleep and hope)
     while (registered_count.load(.acquire) < num_waiters) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     // Now all waiters are in the queue - wake them one by one
@@ -53,7 +64,7 @@ fn notifyWaiter(notify: *Notify, woken: *std.atomic.Value(usize), registered: *s
     if (!immediate) {
         // Spin until notified
         while (!waiter.isNotified()) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
     }
 
@@ -70,7 +81,8 @@ test "Notify stress - notifyAll wakes all waiters" {
     var woken_count = std.atomic.Value(usize).init(0);
     var all_registered = std.atomic.Value(usize).init(0);
 
-    const num_waiters = 100;
+    // Use tasks_medium for larger broadcast test
+    const num_waiters = config.stress.tasks_medium;
 
     // Spawn waiters that signal when registered
     for (0..num_waiters) |_| {
@@ -79,7 +91,7 @@ test "Notify stress - notifyAll wakes all waiters" {
 
     // Wait for all to register
     while (all_registered.load(.acquire) < num_waiters) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     // Wake all at once
@@ -97,12 +109,16 @@ fn notifyAllWaiter(
 ) void {
     var waiter = NotifyWaiter.init();
 
+    // wait() returns true if notified immediately, false if we need to wait
+    // IMPORTANT: Register AFTER wait() so main only calls notifyAll once
+    // all waiters are actually in the queue
+    const immediate = notify.wait(&waiter);
+
     _ = registered.fetchAdd(1, .acq_rel);
 
-    // wait() returns true if notified immediately, false if we need to wait
-    if (!notify.wait(&waiter)) {
+    if (!immediate) {
         while (!waiter.isNotified()) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
     }
 
@@ -119,9 +135,10 @@ test "Notify stress - rapid notify/wait cycles" {
     var notify_count = std.atomic.Value(usize).init(0);
     var wait_count = std.atomic.Value(usize).init(0);
 
+    // 10 each for moderate contention, cycles from config
     const num_notifiers = 10;
     const num_waiters = 10;
-    const cycles = 100;
+    const cycles = config.stress.iterations;
 
     // Spawn notifiers
     for (0..num_notifiers) |_| {
@@ -145,7 +162,7 @@ fn rapidNotifier(notify: *Notify, count: *std.atomic.Value(usize), cycles: usize
     for (0..cycles) |_| {
         notify.notifyOne();
         _ = count.fetchAdd(1, .acq_rel);
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 }
 
@@ -159,7 +176,7 @@ fn rapidWaiter(notify: *Notify, count: *std.atomic.Value(usize), cycles: usize) 
             // Spin briefly, then give up (permit may have been consumed)
             var spins: usize = 0;
             while (!waiter.isNotified() and spins < 1000) : (spins += 1) {
-                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
             }
             if (!waiter.isNotified()) {
                 notify.cancelWait(&waiter);
@@ -176,22 +193,27 @@ test "Notify stress - permit semantics (notify before wait)" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var notify = Notify.init();
-    var immediate_wakes = std.atomic.Value(usize).init(0);
+    var completed = std.atomic.Value(usize).init(0);
 
-    const iterations = 1000;
+    // Use iterations for task spawning (1000 in release, not 100k)
+    // Each task gets its own Notify to test permit semantics correctly
+    // (permits don't accumulate, so sharing would cause races)
+    const iterations = config.stress.iterations;
 
     for (0..iterations) |_| {
-        try scope.spawn(permitTest, .{ &notify, &immediate_wakes });
+        try scope.spawn(permitTest, .{&completed});
     }
 
     try scope.wait();
 
-    // All should have been woken (permit should work)
-    try testing.expectEqual(@as(usize, iterations), immediate_wakes.load(.acquire));
+    // All tasks should have completed
+    try testing.expectEqual(@as(usize, iterations), completed.load(.acquire));
 }
 
-fn permitTest(notify: *Notify, immediate: *std.atomic.Value(usize)) void {
+fn permitTest(completed: *std.atomic.Value(usize)) void {
+    // Each task uses its own Notify to test permit semantics
+    var notify = Notify.init();
+
     // Notify first (stores permit)
     notify.notifyOne();
 
@@ -200,15 +222,14 @@ fn permitTest(notify: *Notify, immediate: *std.atomic.Value(usize)) void {
     // wait() returns true if permit consumed immediately
     const was_immediate = notify.wait(&waiter);
 
-    if (was_immediate or waiter.isNotified()) {
-        _ = immediate.fetchAdd(1, .acq_rel);
-    } else {
-        // Permit wasn't available, spin wait
+    if (!was_immediate) {
+        // Should not happen with own Notify, but handle it
         while (!waiter.isNotified()) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
-        _ = immediate.fetchAdd(1, .acq_rel);
     }
+
+    _ = completed.fetchAdd(1, .acq_rel);
 }
 
 test "Notify stress - multiple notifyAll bursts" {
@@ -221,6 +242,7 @@ test "Notify stress - multiple notifyAll bursts" {
     var total_wakes = std.atomic.Value(usize).init(0);
     var registered = std.atomic.Value(usize).init(0);
 
+    // 20 waiters × 5 bursts tests repeated batch notification
     const num_waiters = 20;
     const bursts = 5;
 
@@ -233,7 +255,7 @@ test "Notify stress - multiple notifyAll bursts" {
         // Wait for this batch to actually register
         const expected = (burst + 1) * num_waiters;
         while (registered.load(.acquire) < expected) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
 
         // Wake all
@@ -256,7 +278,7 @@ fn burstWaiter(notify: *Notify, wakes: *std.atomic.Value(usize), registered: *st
 
     if (!immediate) {
         while (!waiter.isNotified()) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
     }
 

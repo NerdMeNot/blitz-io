@@ -33,7 +33,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const timer_mod = @import("../executor/timer.zig");
+const timer_mod = @import("../coroutine/timer.zig");
 const TimerWheel = timer_mod.TimerWheel;
 const TimerEntry = timer_mod.TimerEntry;
 pub const WakerFn = timer_mod.WakerFn;

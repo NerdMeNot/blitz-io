@@ -16,7 +16,7 @@
 //! // All tasks proceed together
 //!
 //! // Check if this task was the leader (last to arrive)
-//! if (waiter.is_leader) {
+//! if (waiter.is_leader.load(.acquire)) {
 //!     // Do one-time work
 //! }
 //! ```
@@ -30,11 +30,15 @@
 //! Reference: tokio/src/sync/barrier.rs
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const LinkedList = @import("../util/linked_list.zig").LinkedList;
 const Pointers = @import("../util/linked_list.zig").Pointers;
 const WakeList = @import("../util/wake_list.zig").WakeList;
+const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+
+// Unified waiter for the simple blocking API
+const unified_waiter = @import("waiter.zig");
+const UnifiedWaiter = unified_waiter.Waiter;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
@@ -48,14 +52,17 @@ pub const Waiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
 
-    /// Whether this waiter has been released
-    released: bool = false,
+    /// Whether this waiter has been released (atomic for cross-thread visibility)
+    released: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Whether this waiter was the leader (last to arrive)
-    is_leader: bool = false,
+    /// Whether this waiter was the leader (last to arrive) - atomic for cross-thread visibility
+    is_leader: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Intrusive list pointers
     pointers: Pointers(Waiter) = .{},
+
+    /// Debug-mode invocation tracking (detects use-after-free)
+    invocation: InvocationId = .{},
 
     const Self = @This();
 
@@ -77,15 +84,27 @@ pub const Waiter = struct {
     }
 
     pub fn isReleased(self: *const Self) bool {
-        return self.released;
+        return self.released.load(.seq_cst);
     }
 
+    /// Get invocation token (for debug tracking)
+    pub fn token(self: *const Self) InvocationId.Id {
+        return self.invocation.get();
+    }
+
+    /// Verify invocation token matches (debug mode)
+    pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
+        self.invocation.verify(tok);
+    }
+
+    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.released = false;
-        self.is_leader = false;
+        self.released.store(false, .seq_cst);
+        self.is_leader.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
+        self.invocation.bump();
     }
 };
 
@@ -145,11 +164,14 @@ pub const Barrier = struct {
             is_leader = true;
 
             // Wake all waiters
+            // CRITICAL: Copy waker info BEFORE setting released flag to avoid use-after-free
             while (self.waiters.popFront()) |w| {
-                w.released = true;
-                w.is_leader = false;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.released.store(true, .seq_cst);
+                w.is_leader.store(false, .seq_cst);
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }
@@ -165,14 +187,14 @@ pub const Barrier = struct {
             wake_list.wakeAll();
 
             // Leader returns immediately
-            waiter.released = true;
-            waiter.is_leader = true;
+            waiter.released.store(true, .seq_cst);
+            waiter.is_leader.store(true, .seq_cst);
             return true;
         }
 
         // Not the last one - wait
-        waiter.released = false;
-        waiter.is_leader = false;
+        waiter.released.store(false, .seq_cst);
+        waiter.is_leader.store(false, .seq_cst);
         self.waiters.pushBack(waiter);
 
         self.mutex.unlock();
@@ -206,6 +228,83 @@ pub const Barrier = struct {
         defer self.mutex.unlock();
         return self.waiters.count();
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Blocking API (using unified Waiter)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Blocking wait at barrier.
+    /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
+    ///
+    /// Returns BarrierWaitResult indicating if this task was the leader (last to arrive).
+    ///
+    /// Example:
+    /// ```zig
+    /// const result = barrier.waitBlocking();
+    /// if (result.is_leader) {
+    ///     // This task was last to arrive - do one-time work
+    /// }
+    /// // All tasks proceed together
+    /// ```
+    pub fn waitBlocking(self: *Self) BarrierWaitResult {
+        var wake_list: WakeList(64) = .{};
+        var waiter = Waiter.init();
+
+        // Set up waker bridge to unified waiter
+        var unified = UnifiedWaiter.init();
+        const WakerBridge = struct {
+            fn wake(ctx: *anyopaque) void {
+                const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
+                uw.notify();
+            }
+        };
+        waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+
+        self.mutex.lock();
+
+        self.arrived += 1;
+
+        if (self.arrived >= self.num_tasks) {
+            // We're the last one - release everyone
+
+            // Wake all waiters - copy waker info BEFORE setting released flag
+            while (self.waiters.popFront()) |w| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.released.store(true, .seq_cst);
+                w.is_leader.store(false, .seq_cst);
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
+                        wake_list.push(.{ .context = ctx, .wake_fn = wf });
+                    }
+                }
+            }
+
+            // Reset for next generation
+            self.arrived = 0;
+            self.generation +%= 1;
+
+            self.mutex.unlock();
+
+            // Wake all outside lock
+            wake_list.wakeAll();
+
+            // Leader returns immediately
+            return .{ .is_leader = true };
+        }
+
+        // Not the last one - wait
+        waiter.released.store(false, .seq_cst);
+        waiter.is_leader.store(false, .seq_cst);
+        self.waiters.pushBack(&waiter);
+
+        self.mutex.unlock();
+
+        // Wait until notified - yields in task context, blocks in thread context
+        unified.wait();
+
+        return .{ .is_leader = false };
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,7 +329,7 @@ test "Barrier - single task" {
 
     // Single task is always leader and returns immediately
     try std.testing.expect(immediate);
-    try std.testing.expect(waiter.is_leader);
+    try std.testing.expect(waiter.is_leader.load(.acquire));
     try std.testing.expect(waiter.isReleased());
 }
 
@@ -262,7 +361,7 @@ test "Barrier - multiple tasks sync" {
     const immediate = barrier.wait(&leader_waiter);
 
     try std.testing.expect(immediate);
-    try std.testing.expect(leader_waiter.is_leader);
+    try std.testing.expect(leader_waiter.is_leader.load(.acquire));
 
     // All others woken
     for (woken) |w| {
@@ -270,7 +369,7 @@ test "Barrier - multiple tasks sync" {
     }
     for (&waiters) |*w| {
         try std.testing.expect(w.isReleased());
-        try std.testing.expect(!w.is_leader);
+        try std.testing.expect(!w.is_leader.load(.acquire));
     }
 
     // Barrier reset
@@ -287,7 +386,7 @@ test "Barrier - reusable" {
 
     var w2 = Waiter.init();
     try std.testing.expect(barrier.wait(&w2));
-    try std.testing.expect(w2.is_leader);
+    try std.testing.expect(w2.is_leader.load(.acquire));
 
     try std.testing.expectEqual(@as(usize, 1), barrier.currentGeneration());
 
@@ -297,7 +396,7 @@ test "Barrier - reusable" {
 
     var w4 = Waiter.init();
     try std.testing.expect(barrier.wait(&w4));
-    try std.testing.expect(w4.is_leader);
+    try std.testing.expect(w4.is_leader.load(.acquire));
 
     try std.testing.expectEqual(@as(usize, 2), barrier.currentGeneration());
 }
@@ -311,7 +410,7 @@ test "Barrier - only one leader" {
     for (&waiters) |*w| {
         w.* = Waiter.init();
         _ = barrier.wait(w);
-        if (w.is_leader) leaders += 1;
+        if (w.is_leader.load(.acquire)) leaders += 1;
     }
 
     try std.testing.expectEqual(@as(usize, 1), leaders);
@@ -349,7 +448,7 @@ test "Barrier - large task count" {
     const immediate = barrier.wait(&waiters[num_tasks - 1]);
 
     try std.testing.expect(immediate);
-    try std.testing.expect(waiters[num_tasks - 1].is_leader);
+    try std.testing.expect(waiters[num_tasks - 1].is_leader.load(.acquire));
 
     // All N-1 waiters should have been woken
     try std.testing.expectEqual(@as(usize, num_tasks - 1), woken_count);
@@ -362,7 +461,7 @@ test "Barrier - large task count" {
     // Exactly one leader
     var leaders: usize = 0;
     for (&waiters) |*w| {
-        if (w.is_leader) leaders += 1;
+        if (w.is_leader.load(.acquire)) leaders += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), leaders);
 
@@ -387,7 +486,7 @@ test "Barrier - multiple generations leader consistency" {
 
         // Count leaders in this generation
         for (&waiters) |*w| {
-            if (w.is_leader) leaders += 1;
+            if (w.is_leader.load(.acquire)) leaders += 1;
         }
 
         try std.testing.expectEqual(@as(usize, 1), leaders);
@@ -435,12 +534,12 @@ test "Barrier - waiter reset and reuse" {
     try std.testing.expect(barrier.wait(&leader));
 
     try std.testing.expect(waiter.isReleased());
-    try std.testing.expect(!waiter.is_leader);
+    try std.testing.expect(!waiter.is_leader.load(.acquire));
 
     // Reset waiter for reuse
     waiter.reset();
     try std.testing.expect(!waiter.isReleased());
-    try std.testing.expect(!waiter.is_leader);
+    try std.testing.expect(!waiter.is_leader.load(.acquire));
     try std.testing.expect(waiter.waker == null);
 
     // Second usage with same waiter
@@ -450,6 +549,62 @@ test "Barrier - waiter reset and reuse" {
     try std.testing.expect(barrier.wait(&leader2));
 
     try std.testing.expect(waiter.isReleased());
-    try std.testing.expect(!waiter.is_leader);
+    try std.testing.expect(!waiter.is_leader.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), barrier.currentGeneration());
+}
+
+test "Barrier - waitBlocking simple" {
+    var barrier = Barrier.init(1);
+
+    // Single task is always leader
+    const result = barrier.waitBlocking();
+    try std.testing.expect(result.is_leader);
+}
+
+test "Barrier - waitBlocking with contention" {
+    var barrier = Barrier.init(3);
+    var leader_count = std.atomic.Value(u32).init(0);
+    var arrived_count = std.atomic.Value(u32).init(0);
+
+    // Start two threads that will wait at the barrier
+    const thread1 = try std.Thread.spawn(.{}, struct {
+        fn run(b: *Barrier, lc: *std.atomic.Value(u32), ac: *std.atomic.Value(u32)) void {
+            _ = ac.fetchAdd(1, .seq_cst);
+            const result = b.waitBlocking();
+            if (result.is_leader) {
+                _ = lc.fetchAdd(1, .seq_cst);
+            }
+        }
+    }.run, .{ &barrier, &leader_count, &arrived_count });
+
+    const thread2 = try std.Thread.spawn(.{}, struct {
+        fn run(b: *Barrier, lc: *std.atomic.Value(u32), ac: *std.atomic.Value(u32)) void {
+            _ = ac.fetchAdd(1, .seq_cst);
+            const result = b.waitBlocking();
+            if (result.is_leader) {
+                _ = lc.fetchAdd(1, .seq_cst);
+            }
+        }
+    }.run, .{ &barrier, &leader_count, &arrived_count });
+
+    // Wait until both threads have arrived
+    while (arrived_count.load(.acquire) < 2) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    // Give threads time to actually call waitBlocking
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Main thread is the third arrival - should release everyone
+    const result = barrier.waitBlocking();
+    if (result.is_leader) {
+        _ = leader_count.fetchAdd(1, .seq_cst);
+    }
+
+    // Wait for threads to finish
+    thread1.join();
+    thread2.join();
+
+    // Exactly one leader
+    try std.testing.expectEqual(@as(u32, 1), leader_count.load(.acquire));
 }

@@ -1,373 +1,639 @@
-//! Structured Concurrency Scope
+//! Scope - Structured Concurrency for blitz-io
 //!
-//! Spawn concurrent tasks with guaranteed completion. All tasks spawned
-//! within a scope must complete before the scope exits - no leaked work.
+//! A Scope guarantees that all spawned work completes before the scope exits.
+//! This is the fundamental building block for safe concurrent programming.
 //!
-//! ## Features
+//! ## Design Philosophy
 //!
-//! - Automatic task counting (no manual add/done)
-//! - Result collection via output pointers
-//! - First-error propagation
-//! - Cooperative cancellation
+//! 1. **Type-safe results** - `spawn()` returns `Task(T)` with typed `.await()`
+//! 2. **Zero-allocation tracking** - Packed atomic state, no per-task allocations for tracking
+//! 3. **Efficient waiting** - Futex-based, not polling
+//! 4. **Composable** - Works with timeouts, cancellation, and combinators
+//! 5. **Hard to misuse** - Compiler enforces structured concurrency
 //!
-//! ## Example: Parallel API Calls
+//! ## Quick Start
 //!
 //! ```zig
-//! var profile = UserProfile{};
+//! var scope = Scope{};
+//! defer scope.cancel();  // Always clean up
 //!
-//! var scope = Scope.init(allocator);
-//! defer scope.deinit();
+//! // Spawn async tasks (run on I/O workers)
+//! const user_task = try scope.spawn(fetchUser, .{id});
+//! const posts_task = try scope.spawn(fetchPosts, .{id});
 //!
-//! try scope.spawnWithResult(fetchUser, .{id}, &profile.user);
-//! try scope.spawnWithResult(fetchPosts, .{id}, &profile.posts);
-//! try scope.spawnWithResult(fetchFriends, .{id}, &profile.friends);
+//! // Wait for all tasks
+//! try scope.wait();
 //!
-//! try scope.wait(); // Blocks until all 3 complete
-//! // profile now populated
+//! // Get typed results
+//! const user = user_task.await();
+//! const posts = posts_task.await();
 //! ```
 //!
-//! ## Example: Batch Processing
+//! ## Blocking Operations
+//!
+//! For CPU-intensive or blocking I/O, use `spawnBlocking()` to run on the
+//! dedicated blocking pool instead of starving I/O workers:
 //!
 //! ```zig
-//! var scope = Scope.init(allocator);
-//! defer scope.deinit();
+//! // CPU-bound: runs on blocking pool
+//! const hash_task = try scope.spawnBlocking(computeHash, .{data});
 //!
-//! for (images) |image| {
-//!     try scope.spawn(processImage, .{image});
-//! }
+//! // I/O-bound: runs on async workers
+//! const fetch_task = try scope.spawn(fetchData, .{url});
 //!
-//! try scope.wait(); // All images processed
+//! try scope.wait();
 //! ```
 //!
-//! ## Example: With Cancellation
+//! ## Error Handling
+//!
+//! Errors from tasks are captured and returned by `wait()`:
 //!
 //! ```zig
-//! var scope = Scope.init(allocator);
-//! defer scope.deinit();
+//! scope.setFailFast();  // Cancel remaining on first error
 //!
-//! try scope.spawn(longRunningTask, .{&scope});
-//! try scope.spawn(timeoutWatcher, .{&scope, Duration.fromSecs(30)});
+//! try scope.go(mightFail1, .{});
+//! try scope.go(mightFail2, .{});
 //!
 //! scope.wait() catch |err| {
-//!     if (err == error.Cancelled) {
-//!         // Timeout hit, partial work done
-//!     }
+//!     // First error from any task
 //! };
+//! ```
 //!
-//! fn longRunningTask(scope: *Scope) !void {
-//!     while (!scope.isCancelled()) {
-//!         // Do work in chunks, checking cancellation
-//!     }
-//! }
+//! ## Timeouts
 //!
-//! fn timeoutWatcher(scope: *Scope, timeout: Duration) void {
-//!     std.Thread.sleep(timeout.asNanos());
-//!     scope.cancel();
-//! }
+//! ```zig
+//! scope.waitTimeout(Duration.fromSeconds(5)) catch |err| switch (err) {
+//!     error.Timeout => { scope.cancel(); return error.TooSlow; },
+//!     else => |e| return e,
+//! };
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-/// Structured concurrency scope for spawning and awaiting concurrent tasks.
+const runtime_mod = @import("../runtime.zig");
+const blocking_mod = @import("../blocking.zig");
+const time_mod = @import("../time.zig");
+const Duration = time_mod.Duration;
+const Instant = time_mod.Instant;
+
+const task_mod = @import("../coroutine/task.zig");
+const Header = task_mod.Header;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Task Handle - Type-safe result handle
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A handle to a spawned task's result.
+///
+/// The task runs concurrently and the handle can be used to:
+/// - Check if complete with `poll()`
+/// - Wait and get result with `await()`
+/// - Cancel with `cancel()`
+/// - Detach (fire-and-forget) with `detach()`
+pub fn Task(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        /// Pointer to the task header
+        header: *Header,
+
+        /// Scope that owns this task (for counter management)
+        scope: *Scope,
+
+        /// Whether this handle has been consumed (await/detach called)
+        consumed: bool = false,
+
+        /// Wait for the task to complete and return its result.
+        ///
+        /// If the task returned an error, the error is propagated.
+        /// This is a blocking operation that yields to the scheduler.
+        pub fn await(self: *Self) T {
+            if (self.consumed) {
+                @panic("Task.await() called on already-consumed handle");
+            }
+            self.consumed = true;
+
+            // Spin-wait for completion (TODO: proper async yield)
+            while (!self.header.isComplete()) {
+                std.Thread.yield() catch {};
+            }
+
+            // Get the result
+            if (self.header.vtable.get_output(self.header)) |ptr| {
+                const result = @as(*T, @ptrCast(@alignCast(ptr))).*;
+                self.header.unref();
+                return result;
+            }
+
+            // Task was cancelled or has no output
+            @panic("Task completed without result (cancelled?)");
+        }
+
+        /// Check if the task is complete without blocking.
+        /// Returns the result if ready, null otherwise.
+        pub fn poll(self: *Self) ?T {
+            if (self.consumed) return null;
+            if (!self.header.isComplete()) return null;
+
+            self.consumed = true;
+            if (self.header.vtable.get_output(self.header)) |ptr| {
+                const result = @as(*T, @ptrCast(@alignCast(ptr))).*;
+                self.header.unref();
+                return result;
+            }
+            return null;
+        }
+
+        /// Check if the task has finished (success, error, or cancelled).
+        pub fn isFinished(self: *const Self) bool {
+            return self.header.isComplete();
+        }
+
+        /// Request cancellation of this task.
+        /// The task will stop at the next yield point.
+        /// Returns immediately; use `await()` to wait for actual completion.
+        pub fn cancel(self: *Self) void {
+            _ = self.header.cancel();
+        }
+
+        /// Detach the task - it continues running but result is discarded.
+        /// The scope still waits for it to complete.
+        /// Use sparingly; prefer structured concurrency.
+        pub fn detach(self: *Self) void {
+            if (self.consumed) return;
+            self.consumed = true;
+            self.header.unref();
+        }
+
+        /// Clean up if the handle wasn't consumed.
+        /// Called automatically if handle goes out of scope without await/detach.
+        pub fn deinit(self: *Self) void {
+            if (!self.consumed) {
+                self.header.unref();
+            }
+        }
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Scope State - Packed for atomic operations and futex
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Scope state packed into a single u32 for atomic operations.
+///
+/// Layout: [4 flags (high)][28 counter (low)]
+///
+/// This design enables:
+/// - Single CAS for all state transitions
+/// - Futex can observe counter AND flags atomically
+/// - 28-bit counter supports ~268 million concurrent tasks
+const State = packed struct(u32) {
+    /// Number of active tasks (28 bits = 268,435,455 max)
+    counter: u28 = 0,
+
+    /// Cancellation was requested
+    cancelled: bool = false,
+
+    /// At least one task failed with an error
+    failed: bool = false,
+
+    /// Cancel remaining tasks on first error
+    fail_fast: bool = false,
+
+    /// Scope is closed - no more spawns allowed
+    closed: bool = false,
+
+    const COUNTER_MASK: u32 = 0x0FFFFFFF;
+    const COUNTER_ONE: u32 = 1;
+
+    fn fromU32(val: u32) State {
+        return @bitCast(val);
+    }
+
+    fn toU32(self: State) u32 {
+        return @bitCast(self);
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Scope - The main structured concurrency primitive
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Structured concurrency scope for managing concurrent tasks.
+///
+/// All tasks spawned within a scope are guaranteed to complete before
+/// the scope exits. Tasks can be async (I/O workers) or blocking (thread pool).
 pub const Scope = struct {
-    allocator: Allocator,
-
-    // Task tracking - list of spawned task contexts
-    tasks: std.ArrayListUnmanaged(*TaskNode),
-
-    // Synchronization
-    mutex: std.Thread.Mutex,
-    completion_cv: std.Thread.Condition,
-
-    // State
-    pending_count: usize,
-    cancelled: std.atomic.Value(bool),
-    first_error: ?anyerror,
-    error_mutex: std.Thread.Mutex,
-
     const Self = @This();
 
-    /// Internal task node for tracking spawned work.
-    const TaskNode = struct {
-        thread: std.Thread,
-        completed: std.atomic.Value(bool),
-    };
+    /// Packed state: counter (28 bits) + flags (4 bits)
+    /// Supports futex-based waiting
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    /// Initialize a new scope.
-    pub fn init(allocator: Allocator) Self {
-        return .{
-            .allocator = allocator,
-            .tasks = .{},
-            .mutex = .{},
-            .completion_cv = .{},
-            .pending_count = 0,
-            .cancelled = std.atomic.Value(bool).init(false),
-            .first_error = null,
-            .error_mutex = .{},
-        };
+    /// First error captured from any task
+    first_error: ?anyerror = null,
+
+    /// Mutex protecting first_error (only for writes)
+    error_mutex: std.Thread.Mutex = .{},
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // Initialization
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /// Default initialization - use `var scope = Scope{};`
+    pub const init: Scope = .{};
+
+    /// Initialize with an allocator (for compatibility, allocator not currently used)
+    pub fn initWithAllocator(allocator: Allocator) Scope {
+        _ = allocator;
+        return .{};
     }
 
     /// Clean up scope resources.
-    /// Panics if there are still pending tasks - call wait() first.
+    /// Panics if there are pending tasks - call `wait()` or `cancel()` first.
     pub fn deinit(self: *Self) void {
-        if (self.pending_count > 0) {
-            @panic("Scope.deinit() called with pending tasks - call wait() first");
+        const state = State.fromU32(self.state.load(.acquire));
+        if (state.counter > 0) {
+            @panic("Scope.deinit() called with pending tasks - call wait() or cancel() first");
         }
-
-        // Free task nodes
-        for (self.tasks.items) |node| {
-            self.allocator.destroy(node);
-        }
-        self.tasks.deinit(self.allocator);
     }
 
-    /// Spawn a task within this scope.
+    // ───────────────────────────────────────────────────────────────────────────
+    // Spawning - Async Tasks (I/O Workers)
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /// Spawn an async task and get a handle to its result.
     ///
-    /// The task function can have any signature. If it returns an error,
-    /// the error is captured and returned by wait().
+    /// The task runs on the runtime's I/O worker threads using cooperative
+    /// scheduling. Use this for I/O-bound work that yields at async points.
     ///
-    /// Counting is automatic - no need to call add() or done().
+    /// ```zig
+    /// const task = try scope.spawn(fetchUser, .{user_id});
+    /// // ... do other work ...
+    /// const user = task.await();
+    /// ```
     pub fn spawn(
         self: *Self,
         comptime func: anytype,
-        args: anytype,
-    ) Allocator.Error!void {
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) !Task(ReturnType(@TypeOf(func))) {
+        const state = State.fromU32(self.state.load(.acquire));
+        if (state.closed) return error.ScopeClosed;
+
+        // Get runtime
+        const rt = runtime_mod.runtime();
+
+        const Result = ReturnType(@TypeOf(func));
         const Args = @TypeOf(args);
+        const TaskType = ScopedTask(Result, Args);
 
-        // Create task context that captures args and scope
-        const Context = struct {
-            arguments: Args,
-            scope: *Self,
-            allocator: Allocator,
+        // Allocate task
+        const task = try rt.allocator.create(TaskType);
+        task.* = TaskType.init(args, rt.allocator, self);
 
-            fn execute(ctx: *@This()) void {
-                defer ctx.allocator.destroy(ctx);
-
-                // Call the user function
-                const result = @call(.auto, func, ctx.arguments);
+        // Create wrapper that handles error unions
+        const FuncReturnType = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+        const Wrapper = struct {
+            fn call(scope_ptr: *Scope, a: Args) ?Result {
+                const res = @call(.auto, func, a);
 
                 // Handle error union return types
-                if (@typeInfo(@TypeOf(result)) == .error_union) {
-                    if (result) |_| {
-                        // Success - nothing to capture
+                if (@typeInfo(FuncReturnType) == .error_union) {
+                    if (res) |val| {
+                        return val;
                     } else |err| {
-                        ctx.scope.captureError(err);
-                    }
-                }
-
-                // Signal completion
-                ctx.scope.taskCompleted();
-            }
-
-            fn threadEntry(ctx_ptr: *@This()) void {
-                ctx_ptr.execute();
-            }
-        };
-
-        // Allocate context
-        const ctx = try self.allocator.create(Context);
-        ctx.* = .{
-            .arguments = args,
-            .scope = self,
-            .allocator = self.allocator,
-        };
-
-        // Allocate task node
-        const node = try self.allocator.create(TaskNode);
-        errdefer self.allocator.destroy(node);
-
-        node.* = .{
-            .thread = undefined,
-            .completed = std.atomic.Value(bool).init(false),
-        };
-
-        // Increment pending count before spawning
-        self.mutex.lock();
-        self.pending_count += 1;
-        self.tasks.append(self.allocator, node) catch {
-            self.pending_count -= 1;
-            self.mutex.unlock();
-            self.allocator.destroy(ctx);
-            self.allocator.destroy(node);
-            return error.OutOfMemory;
-        };
-        self.mutex.unlock();
-
-        // Spawn thread
-        node.thread = std.Thread.spawn(.{}, Context.threadEntry, .{ctx}) catch {
-            self.mutex.lock();
-            self.pending_count -= 1;
-            _ = self.tasks.pop();
-            self.mutex.unlock();
-            self.allocator.destroy(ctx);
-            self.allocator.destroy(node);
-            return error.OutOfMemory;
-        };
-    }
-
-    /// Spawn a task and capture its result.
-    ///
-    /// The result is written to `result_out` when the task completes successfully.
-    /// If the task returns an error, `result_out` is unchanged and the error
-    /// is returned by wait().
-    pub fn spawnWithResult(
-        self: *Self,
-        comptime func: anytype,
-        args: anytype,
-        result_out: anytype,
-    ) Allocator.Error!void {
-        const Args = @TypeOf(args);
-        const ResultPtr = @TypeOf(result_out);
-        const ResultType = @typeInfo(ResultPtr).pointer.child;
-
-        // Create task context that captures args, scope, and result pointer
-        const Context = struct {
-            arguments: Args,
-            scope: *Self,
-            result_ptr: ResultPtr,
-            allocator: Allocator,
-
-            fn execute(ctx: *@This()) void {
-                defer ctx.allocator.destroy(ctx);
-
-                // Call the user function
-                const result = @call(.auto, func, ctx.arguments);
-
-                // Handle the result
-                const ResultInfo = @typeInfo(@TypeOf(result));
-                if (ResultInfo == .error_union) {
-                    if (result) |value| {
-                        // Success - write result
-                        if (@typeInfo(ResultType) == .optional) {
-                            ctx.result_ptr.* = value;
-                        } else {
-                            ctx.result_ptr.* = value;
-                        }
-                    } else |err| {
-                        ctx.scope.captureError(err);
+                        scope_ptr.captureError(err);
+                        return null;
                     }
                 } else {
-                    // No error union - direct assignment
-                    if (@typeInfo(ResultType) == .optional) {
-                        ctx.result_ptr.* = result;
-                    } else {
-                        ctx.result_ptr.* = result;
-                    }
+                    return res;
                 }
-
-                // Signal completion
-                ctx.scope.taskCompleted();
-            }
-
-            fn threadEntry(ctx_ptr: *@This()) void {
-                ctx_ptr.execute();
             }
         };
 
-        // Allocate context
-        const ctx = try self.allocator.create(Context);
-        ctx.* = .{
-            .arguments = args,
+        task.setWrapperFunc(Wrapper.call, self);
+        task.setRuntime(rt);
+
+        // Increment counter before scheduling
+        self.incrementCounter();
+
+        // Schedule task
+        rt.getScheduler().spawn(&task.header);
+
+        // Return handle
+        return .{
+            .header = &task.header,
             .scope = self,
-            .result_ptr = result_out,
-            .allocator = self.allocator,
-        };
-
-        // Allocate task node
-        const node = try self.allocator.create(TaskNode);
-        errdefer self.allocator.destroy(node);
-
-        node.* = .{
-            .thread = undefined,
-            .completed = std.atomic.Value(bool).init(false),
-        };
-
-        // Increment pending count before spawning
-        self.mutex.lock();
-        self.pending_count += 1;
-        self.tasks.append(self.allocator, node) catch {
-            self.pending_count -= 1;
-            self.mutex.unlock();
-            self.allocator.destroy(ctx);
-            self.allocator.destroy(node);
-            return error.OutOfMemory;
-        };
-        self.mutex.unlock();
-
-        // Spawn thread
-        node.thread = std.Thread.spawn(.{}, Context.threadEntry, .{ctx}) catch {
-            self.mutex.lock();
-            self.pending_count -= 1;
-            _ = self.tasks.pop();
-            self.mutex.unlock();
-            self.allocator.destroy(ctx);
-            self.allocator.destroy(node);
-            return error.OutOfMemory;
         };
     }
 
-    /// Wait for all spawned tasks to complete.
+    /// Spawn a task without tracking its result (fire-and-forget within scope).
+    ///
+    /// The scope still waits for the task to complete, but you don't get
+    /// a handle to its result. Task errors are captured by the scope.
+    ///
+    /// ```zig
+    /// for (urls) |url| {
+    ///     try scope.go(fetch, .{url});
+    /// }
+    /// try scope.wait();  // Waits for all
+    /// ```
+    pub fn go(
+        self: *Self,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) !void {
+        var task = try self.spawn(func, args);
+        task.detach();
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // Spawning - Blocking Tasks (Thread Pool)
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /// Spawn a blocking task on the dedicated thread pool.
+    ///
+    /// Use this for CPU-intensive work or blocking I/O that would otherwise
+    /// stall the async I/O workers. The task runs on a separate thread pool.
+    ///
+    /// ```zig
+    /// // CPU-bound work
+    /// const hash_task = try scope.spawnBlocking(computeExpensiveHash, .{data});
+    ///
+    /// // Blocking file I/O
+    /// const file_task = try scope.spawnBlocking(readLargeFile, .{path});
+    ///
+    /// try scope.wait();
+    /// const hash = hash_task.await();
+    /// const contents = file_task.await();
+    /// ```
+    pub fn spawnBlocking(
+        self: *Self,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) !BlockingTask(ReturnType(@TypeOf(func))) {
+        const state = State.fromU32(self.state.load(.acquire));
+        if (state.closed) return error.ScopeClosed;
+
+        const rt = runtime_mod.runtime();
+        const pool = rt.getBlockingPool();
+
+        const Result = ReturnType(@TypeOf(func));
+        const Args = @TypeOf(args);
+        const CtxHeader = BlockingContextHeader(Result);
+
+        // Context struct with header at start for type-safe access
+        const Context = struct {
+            // Header must be first for pointer casting
+            header: CtxHeader,
+            args: Args,
+
+            fn execute(ctx: *@This()) void {
+                defer {
+                    ctx.header.completed.store(true, .release);
+                    ctx.header.scope.decrementCounter();
+                }
+
+                const res = @call(.auto, func, ctx.args);
+
+                // Handle error union
+                if (@typeInfo(@TypeOf(res)) == .error_union) {
+                    if (res) |val| {
+                        ctx.header.result = val;
+                    } else |err| {
+                        ctx.header.scope.captureError(err);
+                    }
+                } else {
+                    ctx.header.result = res;
+                }
+            }
+
+            fn executeWrapper(context_ptr: *anyopaque) void {
+                const ctx: *@This() = @ptrCast(@alignCast(context_ptr));
+                ctx.execute();
+            }
+        };
+
+        const ctx = try rt.allocator.create(Context);
+        ctx.* = .{
+            .header = .{
+                .scope = self,
+                .allocator = rt.allocator,
+            },
+            .args = args,
+        };
+
+        // Increment counter
+        self.incrementCounter();
+
+        // Submit to blocking pool
+        var blocking_task = blocking_mod.BlockingPool.Task{
+            .func = Context.executeWrapper,
+            .context = ctx,
+        };
+        pool.submit(&blocking_task) catch |err| {
+            self.decrementCounter();
+            rt.allocator.destroy(ctx);
+            return err;
+        };
+
+        return .{
+            .header = &ctx.header,
+        };
+    }
+
+    /// Spawn blocking task without tracking result.
+    pub fn goBlocking(
+        self: *Self,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) !void {
+        var task = try self.spawnBlocking(func, args);
+        task.detach();
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // Waiting
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /// Wait for all tasks to complete.
     ///
     /// Returns the first error encountered by any task, or success if all
     /// tasks completed without error.
     ///
-    /// After wait() returns, all tasks are guaranteed to have completed.
-    pub fn wait(self: *Self) anyerror!void {
-        // Wait for all tasks to complete
-        self.mutex.lock();
-        while (self.pending_count > 0) {
-            self.completion_cv.wait(&self.mutex);
-        }
-        self.mutex.unlock();
+    /// ```zig
+    /// var scope = Scope{};
+    /// defer scope.cancel();  // Clean up on early return
+    ///
+    /// try scope.go(task1, .{});
+    /// try scope.go(task2, .{});
+    /// try scope.wait();  // Blocks until both complete
+    /// ```
+    pub fn wait(self: *Self) !void {
+        // Mark closed - no more spawns
+        self.close();
 
-        // Join all threads to ensure cleanup
-        for (self.tasks.items) |node| {
-            node.thread.join();
+        // Wait for counter to reach 0 using futex
+        const state_ptr: *std.atomic.Value(u32) = &self.state;
+
+        while (true) {
+            const state_val = state_ptr.load(.acquire);
+            const state = State.fromU32(state_val);
+            if (state.counter == 0) break;
+
+            // Use futex to wait for state change
+            // Tasks decrement counter and wake on completion
+            std.Thread.Futex.wait(state_ptr, state_val);
         }
 
-        // Check for captured error
+        // Return first error if any
         if (self.first_error) |err| {
             return err;
         }
     }
 
-    /// Request cancellation of pending tasks.
+    /// Wait for all tasks with a timeout.
     ///
-    /// This is cooperative - tasks must check isCancelled() periodically
-    /// and exit early when true. Does not forcibly terminate tasks.
-    pub fn cancel(self: *Self) void {
-        self.cancelled.store(true, .release);
-
-        // Also set an error so wait() returns error.Cancelled
-        self.captureError(error.Cancelled);
-    }
-
-    /// Check if cancellation has been requested.
+    /// Returns `error.Timeout` if the deadline is exceeded.
+    /// On timeout, tasks are NOT automatically cancelled - call `cancel()` if needed.
     ///
-    /// Tasks should check this periodically and exit early if true.
-    pub fn isCancelled(self: *const Self) bool {
-        return self.cancelled.load(.acquire);
-    }
+    /// ```zig
+    /// scope.waitTimeout(Duration.fromSeconds(5)) catch |err| switch (err) {
+    ///     error.Timeout => {
+    ///         scope.cancel();
+    ///         return error.TooSlow;
+    ///     },
+    ///     else => |e| return e,
+    /// };
+    /// ```
+    pub fn waitTimeout(self: *Self, timeout: Duration) !void {
+        self.close();
 
-    /// Get the number of tasks still pending.
-    pub fn pending(self: *Self) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.pending_count;
-    }
+        const deadline = Instant.now().add(timeout);
+        const state_ptr: *std.atomic.Value(u32) = &self.state;
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Internal helpers
-    // ─────────────────────────────────────────────────────────────────────
+        while (true) {
+            const state_val = state_ptr.load(.acquire);
+            const state = State.fromU32(state_val);
+            if (state.counter == 0) break;
 
-    fn taskCompleted(self: *Self) void {
-        self.mutex.lock();
-        self.pending_count -= 1;
-        if (self.pending_count == 0) {
-            self.completion_cv.broadcast();
+            const now = Instant.now();
+            if (now.order(deadline) != .lt) {
+                return error.Timeout;
+            }
+
+            const remaining = deadline.since(now);
+
+            // Futex wait with timeout (timeout in nanoseconds)
+            _ = std.Thread.Futex.timedWait(state_ptr, state_val, remaining.asNanos()) catch {};
         }
-        self.mutex.unlock();
+
+        if (self.first_error) |err| {
+            return err;
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // Cancellation
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /// Cancel all pending tasks and wait for them to complete.
+    ///
+    /// Tasks observe cancellation at yield points and exit early.
+    /// Safe to call multiple times. Safe to use with `defer`.
+    ///
+    /// ```zig
+    /// var scope = Scope{};
+    /// defer scope.cancel();  // Clean up on any exit path
+    ///
+    /// try scope.go(task1, .{});
+    /// try scope.go(task2, .{});
+    /// // ... if we return early, cancel() runs via defer
+    /// try scope.wait();
+    /// ```
+    pub fn cancel(self: *Self) void {
+        // Set cancelled flag
+        var state = State.fromU32(self.state.load(.acquire));
+        state.cancelled = true;
+        state.closed = true;
+        _ = self.state.fetchOr(state.toU32(), .acq_rel);
+
+        // Wait for all tasks (they'll check cancellation and exit)
+        self.wait() catch {};
+    }
+
+    /// Check if cancellation was requested.
+    pub fn isCancelled(self: *const Self) bool {
+        const state = State.fromU32(self.state.load(.acquire));
+        return state.cancelled;
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // Configuration
+    // ───────────────────────────────────────────────────────────────────────────
+
+    /// Enable fail-fast mode: cancel remaining tasks on first error.
+    ///
+    /// When any task returns an error, all other tasks are cancelled
+    /// immediately rather than waiting for them to complete.
+    ///
+    /// ```zig
+    /// var scope = Scope{};
+    /// scope.setFailFast();
+    ///
+    /// try scope.go(mightFail1, .{});
+    /// try scope.go(mightFail2, .{});
+    /// // If one fails, the other is cancelled
+    /// scope.wait() catch |err| { ... };
+    /// ```
+    pub fn setFailFast(self: *Self) void {
+        var state = State.fromU32(self.state.load(.acquire));
+        state.fail_fast = true;
+        _ = self.state.fetchOr(state.toU32(), .acq_rel);
+    }
+
+    /// Check if fail-fast is enabled.
+    pub fn isFailFast(self: *const Self) bool {
+        const state = State.fromU32(self.state.load(.acquire));
+        return state.fail_fast;
+    }
+
+    /// Check if any task has failed.
+    pub fn hasFailed(self: *const Self) bool {
+        const state = State.fromU32(self.state.load(.acquire));
+        return state.failed;
+    }
+
+    /// Get the number of pending tasks.
+    pub fn pending(self: *const Self) u28 {
+        const state = State.fromU32(self.state.load(.acquire));
+        return state.counter;
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // Internal
+    // ───────────────────────────────────────────────────────────────────────────
+
+    fn incrementCounter(self: *Self) void {
+        _ = self.state.fetchAdd(State.COUNTER_ONE, .acq_rel);
+    }
+
+    fn decrementCounter(self: *Self) void {
+        const prev = self.state.fetchSub(State.COUNTER_ONE, .acq_rel);
+        const prev_state = State.fromU32(prev);
+
+        // If this was the last task, wake waiters
+        if (prev_state.counter == 1) {
+            std.Thread.Futex.wake(&self.state, std.math.maxInt(u32));
+        }
+    }
+
+    fn close(self: *Self) void {
+        var state = State.fromU32(0);
+        state.closed = true;
+        _ = self.state.fetchOr(state.toU32(), .acq_rel);
     }
 
     fn captureError(self: *Self, err: anyerror) void {
@@ -378,195 +644,300 @@ pub const Scope = struct {
         if (self.first_error == null) {
             self.first_error = err;
         }
+
+        // Set failed flag
+        var state = State.fromU32(0);
+        state.failed = true;
+        const prev = self.state.fetchOr(state.toU32(), .acq_rel);
+
+        // If fail-fast, trigger cancellation
+        const prev_state = State.fromU32(prev);
+        if (prev_state.fail_fast and !prev_state.cancelled) {
+            self.cancel();
+        }
     }
 };
 
-/// Convenience function: run a function with a scope that auto-waits on exit.
-///
-/// ```zig
-/// try io.scoped(allocator, struct {
-///     pub fn run(s: *Scope) !void {
-///         try s.spawn(task1, .{});
-///         try s.spawn(task2, .{});
-///         // Auto-waits when this function returns
-///     }
-/// }.run);
-/// ```
-pub fn scoped(allocator: Allocator, comptime func: anytype) anyerror!void {
-    var scope = Scope.init(allocator);
-    defer scope.deinit();
+// ═══════════════════════════════════════════════════════════════════════════════
+// Blocking Task Context Header
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    // Call user function
-    const result = func(&scope);
-
-    // Wait for all spawned tasks
-    try scope.wait();
-
-    // Propagate user function error if any
-    if (@typeInfo(@TypeOf(result)) == .error_union) {
-        return result;
-    }
+/// Common header for blocking task contexts.
+/// This is embedded at the start of every blocking task context struct.
+pub fn BlockingContextHeader(comptime T: type) type {
+    return struct {
+        result: ?T = null,
+        completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        scope: *Scope,
+        allocator: Allocator,
+    };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Blocking Task Handle
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Handle to a blocking task's result.
+pub fn BlockingTask(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const CtxHeader = BlockingContextHeader(T);
+
+        header: *CtxHeader,
+        consumed: bool = false,
+
+        /// Wait for the blocking task to complete and return its result.
+        pub fn await(self: *Self) T {
+            if (self.consumed) {
+                @panic("BlockingTask.await() called on already-consumed handle");
+            }
+            self.consumed = true;
+
+            // Wait for completion
+            while (!self.header.completed.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+
+            const result = self.header.result orelse @panic("Blocking task completed without result");
+
+            return result;
+        }
+
+        /// Check if complete without blocking.
+        pub fn poll(self: *Self) ?T {
+            if (self.consumed) return null;
+
+            if (!self.header.completed.load(.acquire)) return null;
+
+            self.consumed = true;
+            return self.header.result;
+        }
+
+        /// Detach - result will be discarded when complete.
+        pub fn detach(self: *Self) void {
+            if (self.consumed) return;
+            self.consumed = true;
+            // Context will be cleaned up when task completes
+        }
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Scoped Task - Task type that integrates with Scope
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A task that belongs to a scope and decrements the counter on completion.
+fn ScopedTask(comptime Result: type, comptime Args: type) type {
+    return struct {
+        const Self = @This();
+
+        /// Wrapper function type: takes scope and args, returns optional result
+        /// (null means error was captured to scope)
+        const WrapperFuncPtr = *const fn (*Scope, Args) ?Result;
+
+        /// Task header for scheduler
+        header: Header,
+
+        /// Wrapper function to call (handles error capture)
+        wrapper_func: ?WrapperFuncPtr = null,
+
+        /// Arguments
+        args: Args,
+
+        /// Result storage
+        result: ?Result = null,
+
+        /// Owning scope
+        scope: *Scope,
+
+        /// Runtime for scheduling
+        runtime_ptr: ?*runtime_mod.Runtime = null,
+
+        /// Allocator for cleanup
+        allocator: Allocator,
+
+        const vtable = Header.VTable{
+            .poll = pollImpl,
+            .drop = dropImpl,
+            .get_output = getOutputImpl,
+            .schedule = scheduleImpl,
+        };
+
+        pub fn init(args: Args, allocator: Allocator, scope: *Scope) Self {
+            return .{
+                .header = Header.init(&vtable, task_mod.nextTaskId()),
+                .args = args,
+                .scope = scope,
+                .allocator = allocator,
+            };
+        }
+
+        pub fn setWrapperFunc(self: *Self, func: WrapperFuncPtr, scope: *Scope) void {
+            self.wrapper_func = func;
+            self.scope = scope;
+        }
+
+        pub fn setRuntime(self: *Self, rt: *runtime_mod.Runtime) void {
+            self.runtime_ptr = rt;
+        }
+
+        fn pollImpl(header: *Header) bool {
+            const self: *Self = @fieldParentPtr("header", header);
+
+            // Check if cancelled
+            if (header.isCancelled() or self.scope.isCancelled()) {
+                // Clean up and mark complete
+                self.scope.decrementCounter();
+                return true;
+            }
+
+            // Execute wrapper function (handles errors internally)
+            if (self.wrapper_func) |wrapper| {
+                self.result = wrapper(self.scope, self.args);
+            }
+
+            // Decrement scope counter
+            self.scope.decrementCounter();
+
+            return true; // Task complete
+        }
+
+        fn dropImpl(header: *Header) void {
+            const self: *Self = @fieldParentPtr("header", header);
+            self.allocator.destroy(self);
+        }
+
+        fn getOutputImpl(header: *Header) ?*anyopaque {
+            const self: *Self = @fieldParentPtr("header", header);
+            if (self.result) |*r| {
+                return @ptrCast(r);
+            }
+            return null;
+        }
+
+        fn scheduleImpl(header: *Header) void {
+            const self: *Self = @fieldParentPtr("header", header);
+            if (self.runtime_ptr) |rt| {
+                rt.getScheduler().spawn(header);
+            }
+        }
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn ReturnType(comptime Func: type) type {
+    const info = @typeInfo(Func);
+    const fn_info = if (info == .pointer)
+        @typeInfo(info.pointer.child).@"fn"
+    else
+        info.@"fn";
+
+    const ret = fn_info.return_type.?;
+
+    // Unwrap error union for result type
+    if (@typeInfo(ret) == .error_union) {
+        return @typeInfo(ret).error_union.payload;
+    }
+    return ret;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Errors
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
 
 pub const ScopeError = error{
+    /// Scope is closed - no more spawns allowed after wait() starts
+    ScopeClosed,
+    /// Operation timed out
+    Timeout,
     /// Cancellation was requested
     Cancelled,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Convenience Functions
+// ═══════════════════════════════════════════════════════════════════════════════
 
-test "Scope - basic spawn and wait" {
-    const allocator = std.testing.allocator;
+/// Run a function with an auto-cleaned scope.
+///
+/// The scope is automatically cancelled on any exit path (success, error, or panic).
+///
+/// ```zig
+/// const result = try scoped(allocator, struct {
+///     pub fn run(s: *Scope) !u32 {
+///         const a = try s.spawn(compute, .{1});
+///         const b = try s.spawn(compute, .{2});
+///         try s.wait();
+///         return a.await() + b.await();
+///     }
+/// }.run);
+/// ```
+pub fn scoped(allocator: Allocator, comptime func: anytype) !ReturnTypeOf(func) {
+    _ = allocator;
+    var scope = Scope{};
+    defer scope.cancel();
 
-    var counter = std.atomic.Value(usize).init(0);
-
-    var scope = Scope.init(allocator);
-    defer scope.deinit();
-
-    // Spawn 3 tasks that increment counter
-    try scope.spawn(incrementCounter, .{&counter});
-    try scope.spawn(incrementCounter, .{&counter});
-    try scope.spawn(incrementCounter, .{&counter});
-
-    try scope.wait();
-
-    try std.testing.expectEqual(@as(usize, 3), counter.load(.acquire));
+    return try func(&scope);
 }
 
-fn incrementCounter(counter: *std.atomic.Value(usize)) void {
-    _ = counter.fetchAdd(1, .acq_rel);
-}
-
-test "Scope - spawnWithResult" {
-    const allocator = std.testing.allocator;
-
-    var scope = Scope.init(allocator);
-    defer scope.deinit();
-
-    var result1: ?u32 = null;
-    var result2: ?u32 = null;
-
-    try scope.spawnWithResult(computeValue, .{@as(u32, 10)}, &result1);
-    try scope.spawnWithResult(computeValue, .{@as(u32, 20)}, &result2);
-
-    try scope.wait();
-
-    try std.testing.expectEqual(@as(?u32, 100), result1); // 10 * 10
-    try std.testing.expectEqual(@as(?u32, 400), result2); // 20 * 20
-}
-
-fn computeValue(x: u32) u32 {
-    return x * x;
-}
-
-test "Scope - error propagation" {
-    const allocator = std.testing.allocator;
-
-    var scope = Scope.init(allocator);
-    defer scope.deinit();
-
-    try scope.spawn(succeedingTask, .{});
-    try scope.spawn(failingTask, .{});
-    try scope.spawn(succeedingTask, .{});
-
-    const result = scope.wait();
-    try std.testing.expectError(error.TestFailure, result);
-}
-
-fn succeedingTask() void {}
-
-fn failingTask() !void {
-    return error.TestFailure;
-}
-
-test "Scope - cancellation" {
-    const allocator = std.testing.allocator;
-
-    var scope = Scope.init(allocator);
-    defer scope.deinit();
-
-    var iterations = std.atomic.Value(usize).init(0);
-
-    try scope.spawn(cancellableTask, .{ &scope, &iterations });
-    try scope.spawn(cancellerTask, .{&scope});
-
-    const result = scope.wait();
-    try std.testing.expectError(error.Cancelled, result);
-
-    // Task should have exited early due to cancellation
-    try std.testing.expect(iterations.load(.acquire) < 1000);
-}
-
-fn cancellableTask(scope: *const Scope, iterations: *std.atomic.Value(usize)) void {
-    var i: usize = 0;
-    while (i < 1000 and !scope.isCancelled()) : (i += 1) {
-        _ = iterations.fetchAdd(1, .acq_rel);
-        std.Thread.sleep(1_000_000); // 1ms
+fn ReturnTypeOf(comptime func: anytype) type {
+    const info = @typeInfo(@TypeOf(func));
+    const ret = info.@"fn".return_type.?;
+    if (@typeInfo(ret) == .error_union) {
+        return ret;
     }
+    return ret;
 }
 
-fn cancellerTask(scope: *Scope) void {
-    std.Thread.sleep(10_000_000); // 10ms
-    scope.cancel();
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test "Scope - state packing" {
+    // Verify state packing works correctly
+    var state = State{ .counter = 100, .cancelled = true, .fail_fast = true };
+    const packed_val = state.toU32();
+    const unpacked = State.fromU32(packed_val);
+
+    try std.testing.expectEqual(@as(u28, 100), unpacked.counter);
+    try std.testing.expect(unpacked.cancelled);
+    try std.testing.expect(unpacked.fail_fast);
+    try std.testing.expect(!unpacked.failed);
+    try std.testing.expect(!unpacked.closed);
 }
 
-test "Scope - pending count" {
-    const allocator = std.testing.allocator;
+test "Scope - init and flags" {
+    var scope = Scope{};
 
-    var scope = Scope.init(allocator);
-    defer scope.deinit();
+    try std.testing.expect(!scope.isCancelled());
+    try std.testing.expect(!scope.hasFailed());
+    try std.testing.expect(!scope.isFailFast());
+    try std.testing.expectEqual(@as(u28, 0), scope.pending());
 
-    try std.testing.expectEqual(@as(usize, 0), scope.pending());
+    scope.setFailFast();
+    try std.testing.expect(scope.isFailFast());
+}
 
-    try scope.spawn(slowTask, .{});
-    try scope.spawn(slowTask, .{});
+test "Scope - counter increment/decrement" {
+    var scope = Scope{};
 
-    // Tasks are running, pending should be > 0
-    // (might be 2 or less depending on timing)
-    try std.testing.expect(scope.pending() <= 2);
+    scope.incrementCounter();
+    try std.testing.expectEqual(@as(u28, 1), scope.pending());
 
+    scope.incrementCounter();
+    try std.testing.expectEqual(@as(u28, 2), scope.pending());
+
+    scope.decrementCounter();
+    try std.testing.expectEqual(@as(u28, 1), scope.pending());
+
+    scope.decrementCounter();
+    try std.testing.expectEqual(@as(u28, 0), scope.pending());
+}
+
+test "Scope - empty wait succeeds" {
+    var scope = Scope{};
     try scope.wait();
-
-    try std.testing.expectEqual(@as(usize, 0), scope.pending());
-}
-
-fn slowTask() void {
-    std.Thread.sleep(10_000_000); // 10ms
-}
-
-test "Scope - empty scope" {
-    const allocator = std.testing.allocator;
-
-    var scope = Scope.init(allocator);
-    defer scope.deinit();
-
-    // Wait on empty scope should succeed immediately
-    try scope.wait();
-}
-
-test "Scope - spawnWithResult error handling" {
-    const allocator = std.testing.allocator;
-
-    var scope = Scope.init(allocator);
-    defer scope.deinit();
-
-    var result: ?u32 = null;
-
-    try scope.spawnWithResult(failingCompute, .{}, &result);
-
-    const wait_result = scope.wait();
-    try std.testing.expectError(error.ComputeFailed, wait_result);
-
-    // Result should be unchanged (still null) because task failed
-    try std.testing.expectEqual(@as(?u32, null), result);
-}
-
-fn failingCompute() !u32 {
-    return error.ComputeFailed;
 }

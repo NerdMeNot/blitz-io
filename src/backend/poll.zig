@@ -24,7 +24,6 @@
 //! Reference: POSIX.1-2017, Stevens UNIX Network Programming
 
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
 
 const completion = @import("completion.zig");

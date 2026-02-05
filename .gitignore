@@ -1,6 +1,7 @@
 # Zig build artifacts
 zig-out/
 .zig-cache/
+libroot.a
 
 # Reference implementations (not part of this project)
 tokio/

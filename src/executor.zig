@@ -8,20 +8,27 @@
 //! - Timer wheel for sleep/timeout operations
 //! - Integration with I/O backends
 //!
+//! NOTE: This module now re-exports types from the coroutine system.
+//! The coroutine-based scheduler provides Tokio-grade optimizations:
+//! - Cooperative budgeting
+//! - LIFO poll caps
+//! - Batch global queue operations
+//! - Searcher limiting
+//! - Parked worker bitmap
+//! - Adaptive global queue interval
+//! - Hierarchical timer wheel
+//! - Shield-based cancellation
+//!
 //! ## Quick Start
 //!
 //! ```zig
 //! const blitz_io = @import("blitz-io");
 //!
 //! pub fn main() !void {
-//!     var executor = try blitz_io.Executor.init(allocator, .{});
-//!     defer executor.deinit();
+//!     var runtime = try blitz_io.Runtime.init(allocator, .{});
+//!     defer runtime.deinit();
 //!
-//!     try executor.start();
-//!
-//!     // Spawn async tasks...
-//!
-//!     executor.shutdown();
+//!     _ = try runtime.run(myAsyncMain, .{});
 //! }
 //! ```
 
@@ -29,78 +36,145 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public API
+// Re-exports from Coroutine System
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const task = @import("executor/task.zig");
-pub const scheduler = @import("executor/scheduler.zig");
-pub const worker = @import("executor/worker.zig");
-pub const local_queue = @import("executor/local_queue.zig");
-pub const global_queue = @import("executor/global_queue.zig");
-pub const timer = @import("executor/timer.zig");
-pub const pool = @import("executor/pool.zig");
+const coro_scheduler = @import("coroutine/scheduler.zig");
+const coro_task = @import("coroutine/task.zig");
+const coro_timer = @import("coroutine/timer.zig");
+const coro_pool = @import("util/pool.zig");
+
+const builtin = @import("builtin");
 
 /// Task header - the core task type visible to the scheduler
-pub const Header = task.Header;
+pub const Header = coro_task.Header;
 
-/// Waker - handle to wake a task when I/O is ready
-pub const Waker = task.Waker;
+/// Task state machine
+pub const State = coro_task.State;
 
-/// Poll result from task execution
-pub const PollResult = task.PollResult;
+/// Waker - handle to wake a task when I/O is ready.
+/// This is a lightweight handle that can be cloned and stored.
+/// IMPORTANT: Wakers are single-use. Calling wake() twice is a bug.
+pub const Waker = struct {
+    /// Pointer to the task header
+    header: *Header,
 
-/// Type-erased task wrapper
-pub const RawTask = task.RawTask;
+    /// Debug flag to detect double-use (only in debug builds)
+    consumed: if (builtin.mode == .Debug) bool else void,
 
-/// Join handle for awaiting task results
-pub const JoinHandle = task.JoinHandle;
+    /// Create a waker for a task
+    pub fn init(header: *Header) Waker {
+        header.ref(); // Waker holds a reference
+        return .{
+            .header = header,
+            .consumed = if (builtin.mode == .Debug) false else {},
+        };
+    }
+
+    /// Clone the waker (increments ref count)
+    pub fn clone(self: Waker) Waker {
+        if (builtin.mode == .Debug) {
+            std.debug.assert(!self.consumed); // Cannot clone consumed waker
+        }
+        self.header.ref();
+        return .{
+            .header = self.header,
+            .consumed = if (builtin.mode == .Debug) false else {},
+        };
+    }
+
+    /// Wake the task (schedule it for polling)
+    /// Consumes the waker - do not use after calling this
+    pub fn wake(self: *Waker) void {
+        if (builtin.mode == .Debug) {
+            std.debug.assert(!self.consumed); // Double wake detected!
+            self.consumed = true;
+        }
+
+        if (self.header.transitionToScheduled()) {
+            self.header.schedule();
+        }
+        // Drop our reference
+        _ = self.header.unref();
+        self.header = undefined;
+    }
+
+    /// Wake the task by ref (for use with optional pointers)
+    /// Consumes the waker
+    pub fn wakeByRef(self: *Waker) void {
+        self.wake();
+    }
+
+    /// Drop the waker without waking
+    /// Use this if you no longer need the waker
+    pub fn drop(self: *Waker) void {
+        if (builtin.mode == .Debug) {
+            std.debug.assert(!self.consumed); // Double drop detected!
+            self.consumed = true;
+        }
+        _ = self.header.unref();
+        self.header = undefined;
+    }
+
+    /// Check if waker is still valid (not consumed)
+    pub fn isValid(self: *const Waker) bool {
+        if (builtin.mode == .Debug) {
+            return !self.consumed;
+        }
+        return true;
+    }
+};
+
+/// Lifecycle states
+pub const Lifecycle = coro_task.Lifecycle;
+
+/// Task queue (intrusive linked list)
+pub const TaskQueue = coro_task.TaskQueue;
+
+/// Global task queue
+pub const GlobalTaskQueue = coro_task.GlobalTaskQueue;
 
 /// Scheduler configuration
-pub const SchedulerConfig = scheduler.Config;
+pub const SchedulerConfig = coro_scheduler.Config;
 
 /// The main scheduler
-pub const Scheduler = scheduler.Scheduler;
+pub const Scheduler = coro_scheduler.Scheduler;
 
 /// Worker thread
-pub const Worker = worker.Worker;
+pub const Worker = coro_scheduler.Worker;
 
-/// Local task queue (lock-free SPSC)
-pub const LocalQueue = local_queue.LocalQueue;
-
-/// Global task queue (MPMC)
-pub const GlobalQueue = global_queue.GlobalQueue;
-
-/// Sharded global task queue (MPMC with reduced contention)
-pub const ShardedGlobalQueue = global_queue.ShardedGlobalQueue;
+/// Idle state coordination
+pub const IdleState = coro_scheduler.IdleState;
 
 /// Timer wheel for efficient timeout handling
-pub const TimerWheel = timer.TimerWheel;
+pub const TimerWheel = coro_timer.TimerWheel;
 
 /// Timer entry
-pub const TimerEntry = timer.TimerEntry;
-
-// I/O Backend (owned by scheduler for centralized platform detection)
-// Access backend types directly via blitz-io.backend module
-const backend_mod = @import("backend.zig");
-
-/// Detect the best backend for this platform
-pub const detectBestBackend = backend_mod.detectBestBackend;
-
-/// Generate a unique task ID
-pub const nextTaskId = task.nextTaskId;
-
-/// Get the current worker ID
-pub const getCurrentWorkerId = worker.getCurrentWorkerId;
-
-/// Check if on a worker thread
-pub const isWorkerThread = worker.isWorkerThread;
+pub const TimerEntry = coro_timer.TimerEntry;
 
 /// Lock-free object pool for O(1) allocation
-/// Zig advantage: explicit allocator control enables specialized pooling
-pub const ObjectPool = pool.ObjectPool;
+pub const ObjectPool = coro_pool.ObjectPool;
+
+// I/O Backend types (re-exported from scheduler)
+pub const Backend = coro_scheduler.Backend;
+pub const BackendType = coro_scheduler.BackendType;
+pub const BackendConfig = coro_scheduler.BackendConfig;
+pub const Completion = coro_scheduler.Completion;
+pub const Operation = coro_scheduler.Operation;
+
+// Backend detection
+const backend_mod = @import("backend.zig");
+pub const detectBestBackend = backend_mod.detectBestBackend;
+
+// Thread-local context
+pub const getCurrentWorkerIndex = coro_scheduler.getCurrentWorkerIndex;
+pub const getCurrentScheduler = coro_scheduler.getCurrentScheduler;
+
+// Timer operations
+pub const timer = coro_timer;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Executor - High-Level Interface
+// Executor - High-Level Interface (Backward Compatibility)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Configuration for the executor
@@ -108,146 +182,144 @@ pub const Config = struct {
     /// Number of worker threads (null = auto-detect based on CPU cores)
     num_workers: ?usize = null,
 
-    /// Scheduling strategy
-    strategy: SchedulerConfig.Strategy = .work_stealing,
+    /// Enable work stealing
+    enable_stealing: bool = true,
 
-    /// Enable thread affinity (pin workers to cores)
-    thread_affinity: bool = false,
+    /// I/O backend type (null = auto-detect)
+    backend_type: ?BackendType = null,
 
-    /// I/O backend configuration (optional)
-    io_config: ?IoConfig = null,
-
-    pub const IoConfig = struct {
-        /// Backend type (null = auto-detect)
-        backend_type: ?BackendType = null,
-
-        /// Size of the I/O ring/queue
-        ring_size: u32 = 256,
-    };
-
-    pub const BackendType = enum {
-        io_uring,
-        kqueue,
-        epoll,
-        iocp,
-        poll,
-        auto,
-    };
+    /// Maximum I/O completions per tick
+    max_io_completions: u32 = 256,
 };
 
-/// The main executor combining scheduler and I/O
+/// The main executor - wraps the coroutine scheduler
 pub const Executor = struct {
     const Self = @This();
 
     /// Memory allocator
     allocator: Allocator,
 
-    /// Task scheduler
-    sched: Scheduler,
-
-    /// Timer wheel
-    timers: TimerWheel,
+    /// Coroutine scheduler
+    scheduler: *Scheduler,
 
     /// Configuration
     config: Config,
 
     /// Create a new executor
     pub fn init(allocator: Allocator, config: Config) !Self {
+        const stack_pool = @import("coroutine/stack_pool.zig");
+        if (stack_pool.getGlobal() == null) {
+            stack_pool.initGlobalDefault();
+        }
+
         const sched_config = SchedulerConfig{
-            .num_workers = config.num_workers,
-            .strategy = config.strategy,
-            .thread_affinity = config.thread_affinity,
+            .num_workers = config.num_workers orelse 0,
+            .enable_stealing = config.enable_stealing,
+            .backend_type = config.backend_type,
+            .max_io_completions = config.max_io_completions,
         };
+
+        const sched = try Scheduler.init(allocator, sched_config);
 
         return Self{
             .allocator = allocator,
-            .sched = try Scheduler.init(allocator, sched_config),
-            .timers = TimerWheel.init(allocator),
+            .scheduler = sched,
             .config = config,
         };
     }
 
     /// Clean up executor resources
     pub fn deinit(self: *Self) void {
-        self.timers.deinit();
-        self.sched.deinit();
+        self.scheduler.deinit();
     }
 
     /// Start the executor
     pub fn start(self: *Self) !void {
-        try self.sched.start();
+        try self.scheduler.start();
     }
 
-    /// Signal shutdown
+    /// Wait for workers to be ready
+    pub fn waitForReady(self: *Self) void {
+        self.scheduler.waitForWorkersReady();
+    }
+
+    /// Start and wait for workers to be ready
+    pub fn startAndWait(self: *Self) !void {
+        try self.scheduler.startAndWait();
+    }
+
+    /// Signal shutdown and wait for completion
     pub fn shutdown(self: *Self) void {
-        self.sched.shutdown();
+        self.scheduler.shutdownAndWait();
     }
 
     /// Spawn a task
     pub fn spawn(self: *Self, task_header: *Header) void {
-        self.sched.spawn(task_header);
-    }
-
-    /// Create and spawn a task from a function
-    /// Returns a join handle for awaiting the result
-    pub fn spawnTask(
-        self: *Self,
-        comptime F: type,
-        comptime Output: type,
-        func: F,
-    ) !JoinHandle(Output) {
-        const Task = RawTask(F, Output);
-        const t = try Task.init(self.allocator, func, nextTaskId());
-
-        // Set up scheduler callback
-        t.setScheduler(self, scheduleCallback);
-
-        // Spawn it
-        self.spawn(t.getHeader());
-
-        return JoinHandle(Output).init(t.getHeader());
-    }
-
-    fn scheduleCallback(ctx: *anyopaque, header: *Header) void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        self.sched.spawn(header);
-    }
-
-    /// Schedule a sleep timer
-    pub fn sleepNs(self: *Self, duration_ns: u64, task_header: *Header) *TimerEntry {
-        return timer.sleep(&self.timers, duration_ns, task_header);
+        self.scheduler.spawn(task_header);
     }
 
     /// Get the number of worker threads
     pub fn numWorkers(self: *const Self) usize {
-        return self.sched.workers.len;
+        return self.scheduler.workers.len;
     }
 
     /// Get executor metrics
     pub fn getMetrics(self: *const Self) Metrics {
-        const sched_metrics = self.sched.getMetrics();
+        const sched_stats = self.scheduler.getStats();
         return Metrics{
-            .scheduler = sched_metrics,
-            .active_timers = self.timers.len(),
+            .num_workers = sched_stats.num_workers,
+            .total_spawned = sched_stats.total_spawned,
+            .total_polled = sched_stats.total_polled,
+            .total_stolen = sched_stats.total_stolen,
+            .total_parked = sched_stats.total_parked,
+            .active_timers = self.scheduler.activeTimers(),
         };
     }
 
     pub const Metrics = struct {
-        scheduler: Scheduler.Metrics,
+        num_workers: usize,
+        total_spawned: u64,
+        total_polled: u64,
+        total_stolen: u64,
+        total_parked: u64,
         active_timers: usize,
     };
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Legacy type aliases (pointing to coroutine system)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// PollResult from the coroutine task system
+pub const PollResult = coro_task.Header.PollResult;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-test "executor modules compile" {
-    _ = task;
-    _ = scheduler;
-    _ = worker;
-    _ = local_queue;
-    _ = global_queue;
-    _ = timer;
-    _ = pool;
+test "executor - new coroutine types compile" {
+    _ = Scheduler;
+    _ = Worker;
+    _ = Header;
+    _ = State;
+    _ = TaskQueue;
+    _ = GlobalTaskQueue;
+    _ = TimerWheel;
+    _ = TimerEntry;
+    _ = ObjectPool;
+    _ = IdleState;
+}
+
+test "executor - Executor init and deinit" {
+    var exec = try Executor.init(std.testing.allocator, .{
+        .num_workers = 1,
+    });
+    defer exec.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), exec.numWorkers());
+}
+
+test "executor - coroutine types compile" {
+    // Verify all coroutine-based types compile
+    _ = PollResult;
 }

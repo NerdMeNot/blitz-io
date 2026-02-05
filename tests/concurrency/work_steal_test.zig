@@ -1,13 +1,14 @@
-//! Work Stealing Queue Concurrency Tests
+//! Work Stealing Deque Concurrency Tests
 //!
-//! Tests the correctness of local queue work stealing under concurrent access.
+//! Tests the correctness of the Chase-Lev work stealing deque under concurrent access.
 //! Uses the parameterized testing framework from src/test/concurrency.zig.
 //!
 //! Critical areas tested:
 //! - Pop vs steal race: Owner pops while thief steals
-//! - LIFO visibility: LIFO slot must be visible before steal
-//! - ABA prevention: Ensure no data corruption from index wraparound
-//! - Global queue sharding: Concurrent push/pop across shards
+//! - Multiple thieves: Multiple threads stealing concurrently
+//! - FIFO stealing: Thieves get items in FIFO order
+//! - LIFO owner: Owner gets items in LIFO order
+//! - Rapid operations: High-frequency push/pop/steal stress test
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,44 +19,11 @@ const concurrency = blitz.testing.concurrency;
 const Config = concurrency.Config;
 const ConcurrentCounter = concurrency.ConcurrentCounter;
 const Barrier = concurrency.Barrier;
-const Latch = concurrency.Latch;
 const ThreadRng = concurrency.ThreadRng;
 
-// Import queue types
-const LocalQueue = blitz.executor.LocalQueue;
-const ShardedGlobalQueue = blitz.executor.ShardedGlobalQueue;
-const Header = blitz.executor.task.Header;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Test Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-const dummy_vtable = Header.VTable{
-    .poll = struct {
-        fn f(_: *Header) bool {
-            return true;
-        }
-    }.f,
-    .drop = struct {
-        fn f(_: *Header) void {}
-    }.f,
-    .get_output = struct {
-        fn f(_: *Header) ?*anyopaque {
-            return null;
-        }
-    }.f,
-    .schedule = struct {
-        fn f(_: *Header) void {}
-    }.f,
-};
-
-fn createHeaders(allocator: Allocator, count: usize) ![]Header {
-    const headers = try allocator.alloc(Header, count);
-    for (headers, 0..) |*h, i| {
-        h.* = Header.init(&dummy_vtable, i);
-    }
-    return headers;
-}
+// Import the Chase-Lev deque
+const Deque = blitz.coroutine.Deque;
+const StealResult = blitz.coroutine.StealResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 1: Pop vs Steal Race
@@ -64,26 +32,26 @@ fn createHeaders(allocator: Allocator, count: usize) ![]Header {
 /// Test that pop and steal don't lose or duplicate items.
 fn testPopVsSteal(config: Config, allocator: Allocator) !void {
     const Context = struct {
-        queue: *LocalQueue,
-        headers: []Header,
+        deque: *Deque(u32),
         barrier: *Barrier,
         pop_count: ConcurrentCounter,
         steal_count: ConcurrentCounter,
         seed: u64,
+        item_count: usize,
 
         fn owner(ctx: *@This(), _: usize) void {
             var rng = ThreadRng.init(ctx.seed);
 
             // Push items
-            for (ctx.headers) |*h| {
-                _ = ctx.queue.push(h);
+            for (0..ctx.item_count) |i| {
+                ctx.deque.push(@intCast(i));
             }
 
             // Signal ready
             _ = ctx.barrier.wait();
 
             // Pop items (racing with stealer)
-            while (ctx.queue.pop()) |_| {
+            while (ctx.deque.pop()) |_| {
                 _ = ctx.pop_count.increment();
                 rng.maybeYield(10);
             }
@@ -96,25 +64,31 @@ fn testPopVsSteal(config: Config, allocator: Allocator) !void {
             _ = ctx.barrier.wait();
 
             // Steal items (racing with owner)
-            while (ctx.queue.steal()) |_| {
-                _ = ctx.steal_count.increment();
-                rng.maybeYield(10);
+            while (true) {
+                const result = ctx.deque.steal();
+                switch (result.result) {
+                    .success => {
+                        _ = ctx.steal_count.increment();
+                        rng.maybeYield(10);
+                    },
+                    .empty => break,
+                    .retry => continue,
+                }
             }
         }
     };
 
-    var queue = LocalQueue.init();
-    const headers = try createHeaders(allocator, config.task_count);
-    defer allocator.free(headers);
+    var deque = try Deque(u32).init(allocator, 256);
+    defer deque.deinit();
 
     var barrier = Barrier.init(2);
     var ctx = Context{
-        .queue = &queue,
-        .headers = headers,
+        .deque = &deque,
         .barrier = &barrier,
         .pop_count = ConcurrentCounter.init(0),
         .steal_count = ConcurrentCounter.init(0),
         .seed = config.getEffectiveSeed(),
+        .item_count = config.task_count,
     };
 
     try concurrency.runConcurrent(
@@ -155,18 +129,18 @@ fn testMultipleThieves(config: Config, allocator: Allocator) !void {
     const num_thieves = config.thread_count - 1;
 
     const Context = struct {
-        queue: *LocalQueue,
-        headers: []Header,
+        deque: *Deque(u32),
         barrier: *Barrier,
         stolen_count: ConcurrentCounter,
         popped_count: ConcurrentCounter,
         seed: u64,
         num_thieves: usize,
+        item_count: usize,
 
         fn owner(ctx: *@This()) void {
             // Push all items
-            for (ctx.headers) |*h| {
-                _ = ctx.queue.push(h);
+            for (0..ctx.item_count) |i| {
+                ctx.deque.push(@intCast(i));
             }
 
             // Signal ready
@@ -174,9 +148,9 @@ fn testMultipleThieves(config: Config, allocator: Allocator) !void {
 
             // Pop our share
             var popped: usize = 0;
-            while (ctx.queue.pop()) |_| {
+            while (ctx.deque.pop()) |_| {
                 popped += 1;
-                if (popped > ctx.headers.len / (ctx.num_thieves + 1)) {
+                if (popped > ctx.item_count / (ctx.num_thieves + 1)) {
                     break;
                 }
             }
@@ -191,10 +165,15 @@ fn testMultipleThieves(config: Config, allocator: Allocator) !void {
 
             // Steal
             var stolen: usize = 0;
-            for (0..ctx.headers.len) |_| {
-                if (ctx.queue.steal()) |_| {
-                    stolen += 1;
-                    rng.maybeYield(5);
+            for (0..ctx.item_count) |_| {
+                const result = ctx.deque.steal();
+                switch (result.result) {
+                    .success => {
+                        stolen += 1;
+                        rng.maybeYield(5);
+                    },
+                    .empty => break,
+                    .retry => {},
                 }
             }
             _ = ctx.stolen_count.fetchAdd(stolen, .acq_rel);
@@ -203,19 +182,18 @@ fn testMultipleThieves(config: Config, allocator: Allocator) !void {
 
     if (num_thieves == 0) return;
 
-    var queue = LocalQueue.init();
-    const headers = try createHeaders(allocator, config.task_count);
-    defer allocator.free(headers);
+    var deque = try Deque(u32).init(allocator, 256);
+    defer deque.deinit();
 
     var barrier = Barrier.init(config.thread_count);
     var ctx = Context{
-        .queue = &queue,
-        .headers = headers,
+        .deque = &deque,
         .barrier = &barrier,
         .stolen_count = ConcurrentCounter.init(0),
         .popped_count = ConcurrentCounter.init(0),
         .seed = config.getEffectiveSeed(),
         .num_thieves = num_thieves,
+        .item_count = config.task_count,
     };
 
     try concurrency.runConcurrent(
@@ -246,147 +224,65 @@ fn testMultipleThieves(config: Config, allocator: Allocator) !void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 3: LIFO Slot Visibility
+// Test 3: FIFO Steal Order
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Test that LIFO pushes are visible to steals.
-fn testLifoVisibility(config: Config, allocator: Allocator) !void {
-    const Context = struct {
-        queue: *LocalQueue,
-        headers: []Header,
-        barrier: *Barrier,
-        lifo_seen: ConcurrentCounter,
+/// Test that steals return items in FIFO order.
+fn testFifoStealOrder(config: Config, allocator: Allocator) !void {
+    _ = config;
 
-        fn owner(ctx: *@This()) void {
-            // Push via LIFO repeatedly
-            for (ctx.headers) |*h| {
-                const displaced = ctx.queue.pushLifo(h);
-                if (displaced != null) {
-                    // LIFO slot was occupied - that's fine
-                }
-            }
+    var deque = try Deque(u32).init(allocator, 64);
+    defer deque.deinit();
 
-            _ = ctx.barrier.wait();
+    // Push items in order 0, 1, 2, 3...
+    for (0..10) |i| {
+        deque.push(@intCast(i));
+    }
+
+    // Steal should return 0, 1, 2... (FIFO)
+    for (0..10) |expected| {
+        const result = deque.steal();
+        if (result.result != .success) {
+            return error.TestFailed;
         }
-
-        fn checker(ctx: *@This()) void {
-            _ = ctx.barrier.wait();
-
-            // Steal and count LIFO items
-            var seen: usize = 0;
-            while (ctx.queue.steal()) |_| {
-                seen += 1;
-            }
-            ctx.lifo_seen.store(seen);
+        if (result.item.? != expected) {
+            std.debug.print("FIFO order violated: expected {d}, got {d}\n", .{
+                expected,
+                result.item.?,
+            });
+            return error.TestFailed;
         }
-    };
-
-    var queue = LocalQueue.init();
-    const headers = try createHeaders(allocator, @min(config.task_count, 100));
-    defer allocator.free(headers);
-
-    var barrier = Barrier.init(2);
-    var ctx = Context{
-        .queue = &queue,
-        .headers = headers,
-        .barrier = &barrier,
-        .lifo_seen = ConcurrentCounter.init(0),
-    };
-
-    try concurrency.runConcurrent(
-        Context,
-        struct {
-            fn run(c: *Context, tid: usize) void {
-                if (tid == 0) {
-                    c.owner();
-                } else {
-                    c.checker();
-                }
-            }
-        }.run,
-        &ctx,
-        2,
-        allocator,
-    );
-
-    // Some items should have been visible
-    // (exact count depends on timing, but should be > 0 for reasonable test)
-    // This is a weak check but validates the basic functionality
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 4: Global Queue Concurrent Push/Pop
+// Test 4: LIFO Pop Order
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Test global queue under concurrent push and pop.
-fn testGlobalQueueConcurrent(config: Config, allocator: Allocator) !void {
-    const Context = struct {
-        queue: *ShardedGlobalQueue,
-        headers: []Header,
-        barrier: *Barrier,
-        pushed: ConcurrentCounter,
-        popped: ConcurrentCounter,
+/// Test that owner pops return items in LIFO order.
+fn testLifoPopOrder(config: Config, allocator: Allocator) !void {
+    _ = config;
 
-        fn worker(ctx: *@This(), tid: usize) void {
-            const chunk_size = ctx.headers.len / 4; // Assume 4 workers
-            const start = tid * chunk_size;
-            const end = @min(start + chunk_size, ctx.headers.len);
+    var deque = try Deque(u32).init(allocator, 64);
+    defer deque.deinit();
 
-            // Wait for all
-            _ = ctx.barrier.wait();
-
-            // Push our chunk
-            for (ctx.headers[start..end]) |*h| {
-                if (ctx.queue.push(h)) {
-                    _ = ctx.pushed.increment();
-                }
-            }
-
-            // Wait again
-            _ = ctx.barrier.wait();
-
-            // Pop items (any shard)
-            for (0..chunk_size * 2) |_| {
-                if (ctx.queue.pop()) |_| {
-                    _ = ctx.popped.increment();
-                }
-            }
-        }
-    };
-
-    var queue = ShardedGlobalQueue.init();
-    const headers = try createHeaders(allocator, config.task_count);
-    defer allocator.free(headers);
-
-    var barrier = Barrier.init(4);
-    var ctx = Context{
-        .queue = &queue,
-        .headers = headers,
-        .barrier = &barrier,
-        .pushed = ConcurrentCounter.init(0),
-        .popped = ConcurrentCounter.init(0),
-    };
-
-    try concurrency.runConcurrent(
-        Context,
-        Context.worker,
-        &ctx,
-        4,
-        allocator,
-    );
-
-    // Pop remaining
-    while (queue.pop()) |_| {
-        _ = ctx.popped.increment();
+    // Push items in order 0, 1, 2, 3...
+    for (0..10) |i| {
+        deque.push(@intCast(i));
     }
 
-    // Verify counts match
-    const pushed = ctx.pushed.load();
-    const popped = ctx.popped.load();
-
-    if (pushed != popped) {
-        std.debug.print("Push/pop mismatch: {d} vs {d}\n", .{ pushed, popped });
-        return error.TestFailed;
+    // Pop should return 9, 8, 7... (LIFO)
+    var expected: u32 = 9;
+    while (deque.pop()) |item| {
+        if (item != expected) {
+            std.debug.print("LIFO order violated: expected {d}, got {d}\n", .{
+                expected,
+                item,
+            });
+            return error.TestFailed;
+        }
+        if (expected == 0) break;
+        expected -= 1;
     }
 }
 
@@ -394,14 +290,14 @@ fn testGlobalQueueConcurrent(config: Config, allocator: Allocator) !void {
 // Test 5: Stress Test - Rapid Push/Pop/Steal
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// High-frequency operations to stress the queue.
+/// High-frequency operations to stress the deque.
 fn testRapidOperations(config: Config, allocator: Allocator) !void {
     const Context = struct {
-        queue: *LocalQueue,
-        headers: []Header,
+        deque: *Deque(u32),
         barrier: *Barrier,
         total_ops: ConcurrentCounter,
         seed: u64,
+        item_count: usize,
 
         fn worker(ctx: *@This(), tid: usize) void {
             var rng = ThreadRng.init(ctx.seed +% tid);
@@ -410,20 +306,18 @@ fn testRapidOperations(config: Config, allocator: Allocator) !void {
             _ = ctx.barrier.wait();
 
             // Rapid operations
-            for (0..ctx.headers.len) |i| {
+            for (0..ctx.item_count) |i| {
                 const op = rng.bounded(3);
 
                 if (is_owner) {
-                    if (op == 0) {
-                        _ = ctx.queue.push(&ctx.headers[i % ctx.headers.len]);
-                    } else if (op == 1) {
-                        _ = ctx.queue.pop();
+                    if (op == 0 or op == 2) {
+                        ctx.deque.push(@intCast(i % 256));
                     } else {
-                        _ = ctx.queue.pushLifo(&ctx.headers[i % ctx.headers.len]);
+                        _ = ctx.deque.pop();
                     }
                 } else {
                     // Thief can only steal
-                    _ = ctx.queue.steal();
+                    _ = ctx.deque.steal();
                 }
 
                 _ = ctx.total_ops.increment();
@@ -431,17 +325,16 @@ fn testRapidOperations(config: Config, allocator: Allocator) !void {
         }
     };
 
-    var queue = LocalQueue.init();
-    const headers = try createHeaders(allocator, @min(config.task_count, 256));
-    defer allocator.free(headers);
+    var deque = try Deque(u32).init(allocator, 256);
+    defer deque.deinit();
 
     var barrier = Barrier.init(config.thread_count);
     var ctx = Context{
-        .queue = &queue,
-        .headers = headers,
+        .deque = &deque,
         .barrier = &barrier,
         .total_ops = ConcurrentCounter.init(0),
         .seed = config.getEffectiveSeed(),
+        .item_count = @min(config.task_count, 256),
     };
 
     try concurrency.runConcurrent(
@@ -453,7 +346,6 @@ fn testRapidOperations(config: Config, allocator: Allocator) !void {
     );
 
     // If we got here without crash/hang, test passed
-    // The total_ops counter validates that work was done
     const ops = ctx.total_ops.load();
     if (ops < config.task_count) {
         return error.TestFailed;
@@ -461,10 +353,47 @@ fn testRapidOperations(config: Config, allocator: Allocator) !void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Test 6: Batch Steal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Test batch stealing functionality.
+fn testBatchSteal(config: Config, allocator: Allocator) !void {
+    _ = config;
+
+    var deque = try Deque(u32).init(allocator, 64);
+    defer deque.deinit();
+
+    // Push items
+    for (0..20) |i| {
+        deque.push(@intCast(i));
+    }
+
+    // Batch steal
+    var stolen: [10]u32 = undefined;
+    const count = deque.stealBatch(&stolen);
+
+    // Should have stolen some items
+    if (count == 0) {
+        return error.TestFailed;
+    }
+
+    // Stolen items should be sequential from front
+    for (0..count) |i| {
+        if (stolen[i] != i) {
+            std.debug.print("Batch steal order wrong: expected {d}, got {d}\n", .{
+                i,
+                stolen[i],
+            });
+            return error.TestFailed;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Test Runner
 // ─────────────────────────────────────────────────────────────────────────────
 
-test "work stealing - pop vs steal race" {
+test "work stealing deque - pop vs steal race" {
     const configs = [_]Config{
         .{ .thread_count = 2, .task_count = 100 },
         .{ .thread_count = 2, .task_count = 200 },
@@ -474,7 +403,7 @@ test "work stealing - pop vs steal race" {
     }
 }
 
-test "work stealing - multiple thieves" {
+test "work stealing deque - multiple thieves" {
     const configs = [_]Config{
         .{ .thread_count = 4, .task_count = 100 },
         .{ .thread_count = 4, .task_count = 200 },
@@ -484,21 +413,15 @@ test "work stealing - multiple thieves" {
     }
 }
 
-test "work stealing - LIFO visibility" {
-    try testLifoVisibility(.{ .thread_count = 2, .task_count = 50 }, std.testing.allocator);
+test "work stealing deque - FIFO steal order" {
+    try testFifoStealOrder(.{}, std.testing.allocator);
 }
 
-test "work stealing - global queue concurrent" {
-    const configs = [_]Config{
-        .{ .thread_count = 4, .task_count = 400 },
-        .{ .thread_count = 4, .task_count = 1000 },
-    };
-    for (configs) |config| {
-        try testGlobalQueueConcurrent(config, std.testing.allocator);
-    }
+test "work stealing deque - LIFO pop order" {
+    try testLifoPopOrder(.{}, std.testing.allocator);
 }
 
-test "work stealing - rapid operations" {
+test "work stealing deque - rapid operations" {
     const configs = [_]Config{
         .{ .thread_count = 2, .task_count = 200, .contention_level = .high },
         .{ .thread_count = 4, .task_count = 200, .contention_level = .high },
@@ -506,4 +429,8 @@ test "work stealing - rapid operations" {
     for (configs) |config| {
         try testRapidOperations(config, std.testing.allocator);
     }
+}
+
+test "work stealing deque - batch steal" {
+    try testBatchSteal(.{}, std.testing.allocator);
 }

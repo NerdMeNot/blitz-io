@@ -9,16 +9,16 @@
 //! var channel = try Channel(u32).init(allocator, 16);  // capacity 16
 //! defer channel.deinit();
 //!
-//! // Sender side (can be multiple):
-//! if (!channel.trySend(42)) {
-//!     // Channel full, wait or drop
-//! }
+//! // Simple blocking API (recommended):
+//! try channel.sendBlocking(42);  // Blocks if full
+//! const value = channel.recvBlocking();  // Blocks if empty
 //!
-//! // Receiver side (single consumer):
+//! // Non-blocking API:
+//! if (!channel.trySend(42)) {
+//!     // Channel full, handle accordingly
+//! }
 //! if (channel.tryRecv()) |value| {
-//!     // Process value
-//! } else {
-//!     // Channel empty, wait
+//!     // Got value
 //! }
 //! ```
 //!
@@ -27,16 +27,21 @@
 //! - Ring buffer for storage
 //! - Mutex + waiters list for blocking operations
 //! - Separate sender/receiver waiters lists
+//! - Blocking APIs use unified Waiter for proper yielding/blocking
 //!
 //! Reference: tokio/src/sync/mpsc/
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const LinkedList = @import("../util/linked_list.zig").LinkedList;
 const Pointers = @import("../util/linked_list.zig").Pointers;
 const WakeList = @import("../util/wake_list.zig").WakeList;
+const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+
+// Unified waiter for the simple blocking API
+const unified_waiter = @import("waiter.zig");
+const UnifiedWaiter = unified_waiter.Waiter;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter Types
@@ -51,14 +56,17 @@ pub const SendWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
 
-    /// Whether send completed
-    complete: bool = false,
+    /// Whether send completed (atomic for cross-thread visibility)
+    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Whether channel was closed
-    closed: bool = false,
+    /// Whether channel was closed (atomic for cross-thread visibility)
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Intrusive list pointers
     pointers: Pointers(SendWaiter) = .{},
+
+    /// Debug-mode invocation tracking (detects use-after-free)
+    invocation: InvocationId = .{},
 
     const Self = @This();
 
@@ -80,15 +88,27 @@ pub const SendWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.complete or self.closed;
+        return self.complete.load(.seq_cst) or self.closed.load(.seq_cst);
     }
 
+    /// Get invocation token (for debug tracking)
+    pub fn token(self: *const Self) InvocationId.Id {
+        return self.invocation.get();
+    }
+
+    /// Verify invocation token matches (debug mode)
+    pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
+        self.invocation.verify(tok);
+    }
+
+    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.complete = false;
-        self.closed = false;
+        self.complete.store(false, .seq_cst);
+        self.closed.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
+        self.invocation.bump();
     }
 };
 
@@ -98,14 +118,17 @@ pub const RecvWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
 
-    /// Whether receive completed (value ready or closed)
-    complete: bool = false,
+    /// Whether receive completed (value ready or closed) - atomic for cross-thread visibility
+    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Whether channel was closed with no more values
-    closed: bool = false,
+    /// Whether channel was closed with no more values - atomic for cross-thread visibility
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Intrusive list pointers
     pointers: Pointers(RecvWaiter) = .{},
+
+    /// Debug-mode invocation tracking (detects use-after-free)
+    invocation: InvocationId = .{},
 
     const Self = @This();
 
@@ -127,15 +150,27 @@ pub const RecvWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.complete or self.closed;
+        return self.complete.load(.seq_cst) or self.closed.load(.seq_cst);
     }
 
+    /// Get invocation token (for debug tracking)
+    pub fn token(self: *const Self) InvocationId.Id {
+        return self.invocation.get();
+    }
+
+    /// Verify invocation token matches (debug mode)
+    pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
+        self.invocation.verify(tok);
+    }
+
+    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.complete = false;
-        self.closed = false;
+        self.complete.store(false, .seq_cst);
+        self.closed.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
+        self.invocation.bump();
     }
 };
 
@@ -261,7 +296,7 @@ pub fn Channel(comptime T: type) type {
             if (recv_waiter) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.complete = true;
+                w.complete.store(true, .seq_cst);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         wf(ctx);
@@ -279,11 +314,11 @@ pub fn Channel(comptime T: type) type {
             // Fast path
             const result = self.trySend(value);
             if (result == .ok) {
-                waiter.complete = true;
+                waiter.complete.store(true, .seq_cst);
                 return true;
             }
             if (result == .closed) {
-                waiter.closed = true;
+                waiter.closed.store(true, .seq_cst);
                 return true;
             }
 
@@ -293,7 +328,7 @@ pub fn Channel(comptime T: type) type {
             // Re-check under lock
             if (self.closed) {
                 self.mutex.unlock();
-                waiter.closed = true;
+                waiter.closed.store(true, .seq_cst);
                 return true;
             }
 
@@ -310,7 +345,7 @@ pub fn Channel(comptime T: type) type {
                 if (recv_waiter) |w| {
                     const waker_fn = w.waker;
                     const waker_ctx = w.waker_ctx;
-                    w.complete = true;
+                    w.complete.store(true, .seq_cst);
                     if (waker_fn) |wf| {
                         if (waker_ctx) |ctx| {
                             wf(ctx);
@@ -318,13 +353,13 @@ pub fn Channel(comptime T: type) type {
                     }
                 }
 
-                waiter.complete = true;
+                waiter.complete.store(true, .seq_cst);
                 return true;
             }
 
             // Still full - wait
-            waiter.complete = false;
-            waiter.closed = false;
+            waiter.complete.store(false, .seq_cst);
+            waiter.closed.store(false, .seq_cst);
             self.send_waiters.pushBack(waiter);
 
             self.mutex.unlock();
@@ -382,7 +417,7 @@ pub fn Channel(comptime T: type) type {
             if (send_waiter) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.complete = true;
+                w.complete.store(true, .seq_cst);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         wf(ctx);
@@ -401,11 +436,11 @@ pub fn Channel(comptime T: type) type {
             const result = self.tryRecv();
             switch (result) {
                 .value => |v| {
-                    waiter.complete = true;
+                    waiter.complete.store(true, .seq_cst);
                     return v;
                 },
                 .closed => {
-                    waiter.closed = true;
+                    waiter.closed.store(true, .seq_cst);
                     return null;
                 },
                 .empty => {},
@@ -427,7 +462,7 @@ pub fn Channel(comptime T: type) type {
                 if (send_waiter) |w| {
                     const waker_fn = w.waker;
                     const waker_ctx = w.waker_ctx;
-                    w.complete = true;
+                    w.complete.store(true, .seq_cst);
                     if (waker_fn) |wf| {
                         if (waker_ctx) |ctx| {
                             wf(ctx);
@@ -435,19 +470,19 @@ pub fn Channel(comptime T: type) type {
                     }
                 }
 
-                waiter.complete = true;
+                waiter.complete.store(true, .seq_cst);
                 return value;
             }
 
             if (self.closed) {
                 self.mutex.unlock();
-                waiter.closed = true;
+                waiter.closed.store(true, .seq_cst);
                 return null;
             }
 
             // Still empty - wait
-            waiter.complete = false;
-            waiter.closed = false;
+            waiter.complete.store(false, .seq_cst);
+            waiter.closed.store(false, .seq_cst);
             self.recv_waiters.pushBack(waiter);
 
             self.mutex.unlock();
@@ -475,6 +510,101 @@ pub fn Channel(comptime T: type) type {
         }
 
         // ═══════════════════════════════════════════════════════════════════
+        // Blocking API (using unified Waiter)
+        // ═══════════════════════════════════════════════════════════════════
+
+        /// Error returned when channel is closed
+        pub const SendError = error{Closed};
+
+        /// Blocking send - blocks until the value is sent or channel is closed.
+        /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
+        ///
+        /// Returns error.Closed if the channel is closed.
+        pub fn sendBlocking(self: *Self, value: T) SendError!void {
+            while (true) {
+                // Fast path
+                const fast_result = self.trySend(value);
+                switch (fast_result) {
+                    .ok => return,
+                    .closed => return error.Closed,
+                    .full => {},
+                }
+
+                // Slow path: use unified waiter
+                var waiter = SendWaiter.init();
+
+                var unified = UnifiedWaiter.init();
+                const WakerBridge = struct {
+                    fn wake(ctx: *anyopaque) void {
+                        const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
+                        uw.notify();
+                    }
+                };
+                waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+
+                // Try to send with waiter
+                const result = self.send(value, &waiter);
+                if (result) {
+                    return; // Success
+                }
+
+                // Wait until notified
+                unified.wait();
+
+                // Check result
+                if (waiter.closed.load(.seq_cst)) {
+                    return error.Closed;
+                }
+
+                // Loop back to try again (a slot should now be available)
+            }
+        }
+
+        /// Blocking receive - blocks until a value is available or channel is closed.
+        /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
+        ///
+        /// Returns null if the channel is closed and empty.
+        pub fn recvBlocking(self: *Self) ?T {
+            while (true) {
+                // Fast path
+                const fast_result = self.tryRecv();
+                switch (fast_result) {
+                    .value => |v| return v,
+                    .closed => return null,
+                    .empty => {},
+                }
+
+                // Slow path: use unified waiter
+                var waiter = RecvWaiter.init();
+
+                var unified = UnifiedWaiter.init();
+                const WakerBridge = struct {
+                    fn wake(ctx: *anyopaque) void {
+                        const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
+                        uw.notify();
+                    }
+                };
+                waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+
+                // Try to receive with waiter
+                if (self.recv(&waiter)) |v| {
+                    return v;
+                }
+
+                // Wait until notified
+                unified.wait();
+
+                // Check if closed
+                if (waiter.closed.load(.seq_cst)) {
+                    return null;
+                }
+
+                // Try again - a value should now be available
+                // (loop back to tryRecv)
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
         // Channel Control
         // ═══════════════════════════════════════════════════════════════════
 
@@ -499,7 +629,7 @@ pub fn Channel(comptime T: type) type {
             while (self.send_waiters.popFront()) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.closed = true;
+                w.closed.store(true, .seq_cst);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         send_wake_list.push(.{ .context = ctx, .wake_fn = wf });
@@ -512,7 +642,7 @@ pub fn Channel(comptime T: type) type {
             while (self.recv_waiters.popFront()) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.closed = true;
+                w.closed.store(true, .seq_cst);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         recv_wake_list.push(.{ .context = ctx, .wake_fn = wf });
@@ -620,7 +750,7 @@ test "Channel - close wakes waiters" {
     // Close should wake receiver
     ch.close();
     try std.testing.expect(recv_woken);
-    try std.testing.expect(recv_waiter.closed);
+    try std.testing.expect(recv_waiter.closed.load(.acquire));
 }
 
 test "Channel - closed channel rejects sends" {
@@ -781,4 +911,89 @@ test "Channel - rapid fill and drain cycles" {
         }
         try std.testing.expect(ch.isEmpty());
     }
+}
+
+test "Channel - sendBlocking and recvBlocking simple" {
+    var ch = try Channel(u32).init(std.testing.allocator, 2);
+    defer ch.deinit();
+
+    // Send blocking (should succeed immediately since channel has capacity)
+    try ch.sendBlocking(42);
+    try ch.sendBlocking(43);
+
+    // Receive blocking (should succeed immediately since channel has values)
+    const v1 = ch.recvBlocking();
+    try std.testing.expectEqual(@as(?u32, 42), v1);
+
+    const v2 = ch.recvBlocking();
+    try std.testing.expectEqual(@as(?u32, 43), v2);
+}
+
+test "Channel - sendBlocking with contention" {
+    var ch = try Channel(u32).init(std.testing.allocator, 1);
+    defer ch.deinit();
+
+    var done = std.atomic.Value(bool).init(false);
+
+    // Fill the channel
+    try ch.sendBlocking(1);
+
+    // Start a thread that will try to send (should block)
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Channel(u32), d: *std.atomic.Value(bool)) void {
+            c.sendBlocking(2) catch {}; // Should block until main thread receives
+            d.store(true, .release);
+        }
+    }.run, .{ &ch, &done });
+
+    // Give the thread time to start and block
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Thread should still be blocked
+    try std.testing.expect(!done.load(.acquire));
+
+    // Receive - this should wake the sender
+    const v1 = ch.recvBlocking();
+    try std.testing.expectEqual(@as(?u32, 1), v1);
+
+    // Wait for the sender thread
+    thread.join();
+
+    // Now the sender should have completed
+    try std.testing.expect(done.load(.acquire));
+
+    // The second value should be in the channel
+    const v2 = ch.recvBlocking();
+    try std.testing.expectEqual(@as(?u32, 2), v2);
+}
+
+test "Channel - recvBlocking with contention" {
+    var ch = try Channel(u32).init(std.testing.allocator, 2);
+    defer ch.deinit();
+
+    var received = std.atomic.Value(u32).init(0);
+
+    // Start a thread that will try to receive (should block initially)
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Channel(u32), r: *std.atomic.Value(u32)) void {
+            if (c.recvBlocking()) |v| {
+                r.store(v, .release);
+            }
+        }
+    }.run, .{ &ch, &received });
+
+    // Give the thread time to start and block
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Thread should still be blocked (received == 0)
+    try std.testing.expectEqual(@as(u32, 0), received.load(.acquire));
+
+    // Send a value - this should wake the receiver
+    try ch.sendBlocking(42);
+
+    // Wait for the receiver thread
+    thread.join();
+
+    // Receiver should have gotten the value
+    try std.testing.expectEqual(@as(u32, 42), received.load(.acquire));
 }

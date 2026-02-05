@@ -1,21 +1,30 @@
 //! Stress tests for blitz_io.Watch
 //!
 //! Tests the watch channel (single value with change notification) under load.
+//! Uses changedBlocking() for proper blocking without spin-waiting where applicable.
+//!
+//! ## Test Categories
+//!
+//! - **Multiple receivers**: All receivers see updates
+//! - **Rapid updates**: High-frequency value changes
+//! - **Concurrent subscribers**: Dynamic subscription
+//! - **Value integrity**: Checksum verification
+//! - **Close propagation**: All receivers detect close
 
 const std = @import("std");
-const builtin = @import("builtin");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 const Watch = blitz_io.sync.Watch;
 
-// Use smaller iteration counts in debug mode
-const is_debug = builtin.mode == .Debug;
-const NUM_RECEIVERS: usize = if (is_debug) 5 else 10;
-const NUM_UPDATES: usize = if (is_debug) 50 else 100;
+const config = @import("test_config");
 
 test "Watch stress - multiple receivers see updates" {
     const allocator = testing.allocator;
+
+    // Use config values for receiver and update counts
+    const num_receivers = config.stress.receivers;
+    const num_updates = config.stress.ops_per_task;
 
     var watch = Watch(u64).init(0);
     defer watch.deinit();
@@ -23,12 +32,13 @@ test "Watch stress - multiple receivers see updates" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var receivers: [NUM_RECEIVERS]Watch(u64).Receiver = undefined;
-    for (&receivers) |*rx| {
+    // Fixed array size to accommodate max receivers (20 in release)
+    var receivers: [20]Watch(u64).Receiver = undefined;
+    for (receivers[0..num_receivers]) |*rx| {
         rx.* = watch.subscribe();
     }
 
-    var final_values: [NUM_RECEIVERS]std.atomic.Value(u64) = undefined;
+    var final_values: [20]std.atomic.Value(u64) = undefined;
     for (&final_values) |*v| {
         v.* = std.atomic.Value(u64).init(0);
     }
@@ -36,33 +46,31 @@ test "Watch stress - multiple receivers see updates" {
     var receivers_ready = std.atomic.Value(usize).init(0);
 
     // Receivers first - they signal when ready
-    for (0..NUM_RECEIVERS) |i| {
+    for (0..num_receivers) |i| {
         try scope.spawn(watchReceiver, .{ &receivers[i], &final_values[i], &receivers_ready });
     }
 
     // Sender waits for receivers, then sends
-    try scope.spawn(watchSender, .{ &watch, NUM_UPDATES, &receivers_ready, NUM_RECEIVERS });
+    try scope.spawn(watchSender, .{ &watch, num_updates, &receivers_ready, num_receivers });
 
     try scope.wait();
 
     // All receivers should see the final value
-    for (final_values) |v| {
-        try testing.expectEqual(@as(u64, NUM_UPDATES), v.load(.acquire));
+    for (final_values[0..num_receivers]) |v| {
+        try testing.expectEqual(@as(u64, num_updates), v.load(.acquire));
     }
 }
 
 fn watchSender(watch: *Watch(u64), count: usize, receivers_ready: *std.atomic.Value(usize), expected_receivers: usize) void {
-    // Wait for all receivers to be ready
+    // Wait for all receivers to be ready - yield instead of spin
     while (receivers_ready.load(.acquire) < expected_receivers) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     for (0..count) |i| {
         watch.send(@intCast(i + 1));
-        // Small delay to let receivers keep up
-        for (0..10) |_| {
-            std.atomic.spinLoopHint();
-        }
+        // Small delay to let receivers keep up - yield instead of spin
+        std.Thread.yield() catch {};
     }
     watch.close();
 }
@@ -71,12 +79,15 @@ fn watchReceiver(rx: *Watch(u64).Receiver, final_value: *std.atomic.Value(u64), 
     // Signal that we're ready
     _ = ready.fetchAdd(1, .acq_rel);
 
-    while (!rx.isClosed()) {
-        if (rx.hasChanged()) {
-            _ = rx.get();
-            rx.markSeen();
+    // Use proper blocking instead of spin-waiting
+    while (true) {
+        switch (rx.changedBlocking()) {
+            .changed => {
+                _ = rx.get();
+                rx.markSeen();
+            },
+            .closed => break,
         }
-        std.atomic.spinLoopHint();
     }
 
     // After close, always read the final value directly
@@ -97,7 +108,8 @@ test "Watch stress - rapid updates" {
     var updates_seen = std.atomic.Value(usize).init(0);
     var receiver_ready = std.atomic.Value(bool).init(false);
 
-    const num_updates = if (is_debug) 1000 else 10000;
+    // Use high_throughput for rapid update test
+    const num_updates = config.stress.high_throughput;
 
     // Receiver first
     try scope.spawn(rapidWatchReceiver, .{ &rx, &updates_seen, &receiver_ready });
@@ -112,9 +124,9 @@ test "Watch stress - rapid updates" {
 }
 
 fn rapidWatchSender(watch: *Watch(u64), count: usize, receiver_ready: *std.atomic.Value(bool)) void {
-    // Wait for receiver
+    // Wait for receiver - yield instead of spin
     while (!receiver_ready.load(.acquire)) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     for (0..count) |i| {
@@ -126,15 +138,16 @@ fn rapidWatchSender(watch: *Watch(u64), count: usize, receiver_ready: *std.atomi
 fn rapidWatchReceiver(rx: *Watch(u64).Receiver, seen: *std.atomic.Value(usize), ready: *std.atomic.Value(bool)) void {
     ready.store(true, .release);
 
+    // Use proper blocking instead of spin-waiting
     while (true) {
-        if (rx.hasChanged()) {
-            _ = rx.get();
-            rx.markSeen();
-            _ = seen.fetchAdd(1, .acq_rel);
+        switch (rx.changedBlocking()) {
+            .changed => {
+                _ = rx.get();
+                rx.markSeen();
+                _ = seen.fetchAdd(1, .acq_rel);
+            },
+            .closed => break,
         }
-
-        if (rx.isClosed()) break;
-        std.atomic.spinLoopHint();
     }
 }
 
@@ -150,7 +163,8 @@ test "Watch stress - concurrent subscribers" {
     var subscribers_done = std.atomic.Value(usize).init(0);
     var subscribers_ready = std.atomic.Value(usize).init(0);
 
-    const num_subscribers = if (is_debug) 10 else 50;
+    // Use tasks_low for subscriber count
+    const num_subscribers = config.stress.tasks_low;
 
     // Dynamic subscribers first
     for (0..num_subscribers) |_| {
@@ -160,18 +174,17 @@ test "Watch stress - concurrent subscribers" {
     // Sender waits for some subscribers
     try scope.spawn(struct {
         fn send(w: *Watch(u64), ready: *std.atomic.Value(usize), expected: usize) void {
-            // Wait for at least half the subscribers to be ready
+            // Wait for at least half the subscribers to be ready - yield instead of spin
             while (ready.load(.acquire) < expected / 2) {
-                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
             }
 
-            const count = if (is_debug) 50 else 100;
+            // Use ops_per_task for update count (accessed via comptime)
+            const count = config.stress.ops_per_task;
             for (0..count) |i| {
                 w.send(@intCast(i));
-                // Small delay
-                for (0..100) |_| {
-                    std.atomic.spinLoopHint();
-                }
+                // Small delay - yield instead of spin
+                std.Thread.yield() catch {};
             }
             w.close();
         }
@@ -186,14 +199,15 @@ fn dynamicWatchSubscriber(watch: *Watch(u64), done: *std.atomic.Value(usize), re
     var rx = watch.subscribe();
     _ = ready.fetchAdd(1, .acq_rel);
 
+    // Use proper blocking instead of spin-waiting
     while (true) {
-        if (rx.hasChanged()) {
-            _ = rx.get();
-            rx.markSeen();
+        switch (rx.changedBlocking()) {
+            .changed => {
+                _ = rx.get();
+                rx.markSeen();
+            },
+            .closed => break,
         }
-
-        if (rx.isClosed()) break;
-        std.atomic.spinLoopHint();
     }
 
     _ = done.fetchAdd(1, .acq_rel);
@@ -224,19 +238,21 @@ test "Watch stress - value integrity" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_receivers = if (is_debug) 3 else 5;
-    var receivers: [5]Watch(Config).Receiver = undefined;
+    // Use config values
+    const num_receivers = config.stress.receivers;
+    // Fixed array size to accommodate max receivers (20 in release)
+    var receivers: [20]Watch(Config).Receiver = undefined;
     for (receivers[0..num_receivers]) |*rx| {
         rx.* = watch.subscribe();
     }
 
-    var integrity_ok: [5]std.atomic.Value(bool) = undefined;
+    var integrity_ok: [20]std.atomic.Value(bool) = undefined;
     for (&integrity_ok) |*ok| {
         ok.* = std.atomic.Value(bool).init(true);
     }
 
     var receivers_ready = std.atomic.Value(usize).init(0);
-    const num_updates = if (is_debug) 100 else 1000;
+    const num_updates = config.stress.iterations;
 
     // Receivers first
     for (0..num_receivers) |i| {
@@ -255,9 +271,9 @@ test "Watch stress - value integrity" {
 }
 
 fn configSender(watch: anytype, comptime Config: type, count: usize, ready: *std.atomic.Value(usize), expected: usize) void {
-    // Wait for receivers
+    // Wait for receivers - yield instead of spin
     while (ready.load(.acquire) < expected) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     for (0..count) |i| {
@@ -269,18 +285,19 @@ fn configSender(watch: anytype, comptime Config: type, count: usize, ready: *std
 fn configReceiver(rx: anytype, comptime Config: type, ok: *std.atomic.Value(bool), ready: *std.atomic.Value(usize)) void {
     _ = ready.fetchAdd(1, .acq_rel);
 
+    // Use proper blocking instead of spin-waiting
     while (true) {
-        if (rx.hasChanged()) {
-            // Use get() which is properly synchronized
-            const config: Config = rx.get();
-            if (!config.isValid()) {
-                ok.store(false, .release);
-            }
-            rx.markSeen();
+        switch (rx.changedBlocking()) {
+            .changed => {
+                // Use get() which is properly synchronized
+                const cfg: Config = rx.get();
+                if (!cfg.isValid()) {
+                    ok.store(false, .release);
+                }
+                rx.markSeen();
+            },
+            .closed => break,
         }
-
-        if (rx.isClosed()) break;
-        std.atomic.spinLoopHint();
     }
 }
 
@@ -293,7 +310,9 @@ test "Watch stress - close propagation" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_receivers = if (is_debug) 10 else 20;
+    // Use config receivers for close propagation test
+    const num_receivers = config.stress.receivers;
+    // Fixed array size to accommodate max receivers (20 in release)
     var receivers: [20]Watch(u64).Receiver = undefined;
     for (receivers[0..num_receivers]) |*rx| {
         rx.* = watch.subscribe();
@@ -314,8 +333,9 @@ test "Watch stress - close propagation" {
     // Wait for all receivers to be ready, then close
     try scope.spawn(struct {
         fn doClose(w: *Watch(u64), ready: *std.atomic.Value(usize), expected: usize) void {
+            // Yield instead of spin
             while (ready.load(.acquire) < expected) {
-                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
             }
             w.close();
         }
@@ -332,8 +352,15 @@ test "Watch stress - close propagation" {
 fn closeDetector(rx: *Watch(u64).Receiver, detected: *std.atomic.Value(bool), ready: *std.atomic.Value(usize)) void {
     _ = ready.fetchAdd(1, .acq_rel);
 
-    while (!rx.isClosed()) {
-        std.atomic.spinLoopHint();
+    // Use changedBlocking which will return .closed when sender closes
+    while (true) {
+        switch (rx.changedBlocking()) {
+            .changed => {
+                // Consume updates until closed
+                rx.markSeen();
+            },
+            .closed => break,
+        }
     }
     detected.store(true, .release);
 }
@@ -347,19 +374,21 @@ test "Watch stress - mixed read/update patterns" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_readers = if (is_debug) 5 else 10;
-    var readers: [10]Watch(u64).Receiver = undefined;
+    // Use config values for reader count
+    const num_readers = config.stress.receivers;
+    // Fixed array size to accommodate max readers (20 in release)
+    var readers: [20]Watch(u64).Receiver = undefined;
     for (readers[0..num_readers]) |*rx| {
         rx.* = watch.subscribe();
     }
 
-    var read_counts: [10]std.atomic.Value(usize) = undefined;
+    var read_counts: [20]std.atomic.Value(usize) = undefined;
     for (&read_counts) |*c| {
         c.* = std.atomic.Value(usize).init(0);
     }
 
     var readers_ready = std.atomic.Value(usize).init(0);
-    const num_updates = if (is_debug) 100 else 500;
+    const num_updates = config.stress.iterations;
 
     // Readers first
     for (0..num_readers) |i| {
@@ -369,16 +398,15 @@ test "Watch stress - mixed read/update patterns" {
     // Updater waits for readers
     try scope.spawn(struct {
         fn update(w: *Watch(u64), count: usize, ready: *std.atomic.Value(usize), expected: usize) void {
+            // Yield instead of spin
             while (ready.load(.acquire) < expected) {
-                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
             }
 
             for (0..count) |i| {
                 w.send(@intCast(i));
-                // Small delay to let readers observe
-                for (0..10) |_| {
-                    std.atomic.spinLoopHint();
-                }
+                // Small delay to let readers observe - yield instead of spin
+                std.Thread.yield() catch {};
             }
             w.close();
         }
@@ -395,21 +423,19 @@ test "Watch stress - mixed read/update patterns" {
 fn mixedPatternReader(rx: *Watch(u64).Receiver, reads: *std.atomic.Value(usize), ready: *std.atomic.Value(usize)) void {
     _ = ready.fetchAdd(1, .acq_rel);
 
+    // Use changedBlocking instead of spin-waiting
     while (true) {
-        // Sometimes check hasChanged, sometimes just get
-        const count = reads.load(.acquire);
-        if (count % 3 == 0) {
-            if (rx.hasChanged()) {
+        switch (rx.changedBlocking()) {
+            .changed => {
+                // Sometimes just get, sometimes mark seen (mixed patterns)
+                const count = reads.load(.acquire);
                 _ = rx.get();
-                rx.markSeen();
+                if (count % 3 == 0) {
+                    rx.markSeen();
+                }
                 _ = reads.fetchAdd(1, .acq_rel);
-            }
-        } else {
-            _ = rx.get();
-            _ = reads.fetchAdd(1, .acq_rel);
+            },
+            .closed => break,
         }
-
-        if (rx.isClosed()) break;
-        std.atomic.spinLoopHint();
     }
 }

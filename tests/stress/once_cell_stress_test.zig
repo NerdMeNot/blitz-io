@@ -1,13 +1,23 @@
 //! Stress tests for blitz_io.OnceCell
 //!
 //! Tests the lazy one-time initialization under concurrent access.
+//!
+//! ## Test Categories
+//!
+//! - **Race to initialize**: Many threads competing to set value
+//! - **Slow initialization**: Waiters blocking during init
+//! - **Fast path**: Get after already initialized
+//! - **Large values**: Data integrity with larger payloads
+//! - **Async initialization**: Waiter-based init pattern
 
 const std = @import("std");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 const OnceCell = blitz_io.sync.OnceCell;
 const OnceCellWaiter = blitz_io.sync.OnceCellWaiter;
+
+const config = @import("test_config");
 
 /// Large value type for stress testing
 const LargeValue = struct {
@@ -38,11 +48,13 @@ test "OnceCell stress - many threads race to initialize" {
 
     var cell = OnceCell(u64).init();
     var init_count = std.atomic.Value(usize).init(0);
+    // Fixed array size for tracking individual values
     var values_seen: [100]std.atomic.Value(u64) = undefined;
     for (&values_seen) |*v| {
         v.* = std.atomic.Value(u64).init(0);
     }
 
+    // Fixed at 100 to match array size
     const num_accessors = 100;
 
     for (0..num_accessors) |i| {
@@ -87,7 +99,8 @@ test "OnceCell stress - slow initialization with waiters" {
     var init_count = std.atomic.Value(usize).init(0);
     var access_count = std.atomic.Value(usize).init(0);
 
-    const num_accessors = 50;
+    // Use tasks_low for debug/release scaling
+    const num_accessors = config.stress.tasks_low;
 
     for (0..num_accessors) |_| {
         try scope.spawn(slowInitAccess, .{ &cell, &init_count, &access_count });
@@ -143,7 +156,8 @@ test "OnceCell stress - get after initialized" {
 
     var access_count = std.atomic.Value(usize).init(0);
 
-    const num_accessors = 100;
+    // Use tasks_medium for fast-path stress test
+    const num_accessors = config.stress.tasks_medium;
 
     // Many concurrent accesses to already-initialized cell
     for (0..num_accessors) |_| {
@@ -172,11 +186,13 @@ test "OnceCell stress - large value initialization" {
     defer scope.deinit();
 
     var cell = OnceCell(LargeValue).init();
+    // Fixed array size for checksum tracking
     var checksums: [50]std.atomic.Value(u64) = undefined;
     for (&checksums) |*c| {
         c.* = std.atomic.Value(u64).init(0);
     }
 
+    // Fixed at 50 to match array size (LargeValue is 256*8=2KB)
     const num_accessors = 50;
 
     for (0..num_accessors) |i| {
@@ -215,8 +231,9 @@ test "OnceCell stress - repeated getOrInit calls" {
     var total_accesses = std.atomic.Value(usize).init(0);
     var init_count = std.atomic.Value(usize).init(0);
 
-    const num_tasks = 20;
-    const accesses_per_task = 100;
+    // Use config values for repeated access stress
+    const num_tasks = config.stress.tasks_low;
+    const accesses_per_task = config.stress.ops_per_task;
 
     for (0..num_tasks) |_| {
         try scope.spawn(repeatedAccess, .{ &cell, &total_accesses, &init_count, accesses_per_task });
@@ -261,7 +278,8 @@ test "OnceCell stress - async initialization" {
     var cell = OnceCell(u64).init();
     var completed = std.atomic.Value(usize).init(0);
 
-    const num_tasks = 30;
+    // Use tasks_low for async init test
+    const num_tasks = config.stress.tasks_low;
 
     for (0..num_tasks) |_| {
         try scope.spawn(asyncInit, .{ &cell, &completed });
@@ -280,7 +298,7 @@ fn asyncInit(cell: *OnceCell(u64), completed: *std.atomic.Value(usize)) void {
         fn init() u64 {
             // Simulate slow init
             for (0..100) |_| {
-                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
             }
             return 555;
         }
@@ -294,7 +312,7 @@ fn asyncInit(cell: *OnceCell(u64), completed: *std.atomic.Value(usize)) void {
     } else {
         // Wait for completion
         while (!waiter.isComplete()) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
         // Now get the value
         if (cell.get()) |value_ptr| {
@@ -315,8 +333,9 @@ test "OnceCell stress - with set" {
     var set_successes = std.atomic.Value(usize).init(0);
     var get_successes = std.atomic.Value(usize).init(0);
 
-    const num_setters = 20;
-    const num_getters = 30;
+    // Use tasks_low for setters, more getters to test contention
+    const num_setters = config.stress.tasks_low;
+    const num_getters = config.stress.tasks_low + 10;
 
     // Setters race to set
     for (0..num_setters) |i| {
@@ -346,7 +365,7 @@ fn racingSetter(cell: *OnceCell(u64), value: u64, successes: *std.atomic.Value(u
 fn waitingGetter(cell: *OnceCell(u64), successes: *std.atomic.Value(usize)) void {
     // Spin until value is available
     while (cell.get() == null) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     if (cell.get()) |_| {

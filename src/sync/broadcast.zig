@@ -31,12 +31,16 @@
 //! Reference: tokio/src/sync/broadcast.rs
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const LinkedList = @import("../util/linked_list.zig").LinkedList;
 const Pointers = @import("../util/linked_list.zig").Pointers;
 const WakeList = @import("../util/wake_list.zig").WakeList;
+const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+
+// Unified waiter for the simple blocking API
+const unified_waiter = @import("waiter.zig");
+const UnifiedWaiter = unified_waiter.Waiter;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
@@ -49,9 +53,13 @@ pub const WakerFn = *const fn (*anyopaque) void;
 pub const RecvWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
-    complete: bool = false,
-    closed: bool = false,
+    /// Whether receive completed (atomic for cross-thread visibility)
+    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Whether channel was closed (atomic for cross-thread visibility)
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(RecvWaiter) = .{},
+    /// Debug-mode invocation tracking (detects use-after-free)
+    invocation: InvocationId = .{},
 
     const Self = @This();
 
@@ -73,15 +81,27 @@ pub const RecvWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.complete or self.closed;
+        return self.complete.load(.seq_cst) or self.closed.load(.seq_cst);
     }
 
+    /// Get invocation token (for debug tracking)
+    pub fn token(self: *const Self) InvocationId.Id {
+        return self.invocation.get();
+    }
+
+    /// Verify invocation token matches (debug mode)
+    pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
+        self.invocation.verify(tok);
+    }
+
+    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.complete = false;
-        self.closed = false;
+        self.complete.store(false, .seq_cst);
+        self.closed.store(false, .seq_cst);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
+        self.invocation.bump();
     }
 };
 
@@ -199,7 +219,7 @@ pub fn BroadcastChannel(comptime T: type) type {
                     const missed = oldest_seq - self.read_seq;
                     self.read_seq = oldest_seq;
                     self.channel.mutex.unlock();
-                    waiter.complete = true;
+                    waiter.complete.store(true, .seq_cst);
                     return .{ .lagged = missed };
                 }
 
@@ -207,13 +227,13 @@ pub fn BroadcastChannel(comptime T: type) type {
                 if (self.read_seq >= self.channel.write_seq) {
                     if (self.channel.closed) {
                         self.channel.mutex.unlock();
-                        waiter.closed = true;
+                        waiter.closed.store(true, .seq_cst);
                         return .closed;
                     }
 
                     // Wait for sender
-                    waiter.complete = false;
-                    waiter.closed = false;
+                    waiter.complete.store(false, .seq_cst);
+                    waiter.closed.store(false, .seq_cst);
                     self.channel.recv_waiters.pushBack(waiter);
                     self.channel.mutex.unlock();
                     return null;
@@ -227,14 +247,14 @@ pub fn BroadcastChannel(comptime T: type) type {
                     const missed = self.channel.write_seq - self.read_seq;
                     self.read_seq = self.channel.write_seq;
                     self.channel.mutex.unlock();
-                    waiter.complete = true;
+                    waiter.complete.store(true, .seq_cst);
                     return .{ .lagged = missed };
                 }
 
                 const value = slot.value;
                 self.read_seq += 1;
                 self.channel.mutex.unlock();
-                waiter.complete = true;
+                waiter.complete.store(true, .seq_cst);
                 return .{ .value = value };
             }
 
@@ -264,6 +284,94 @@ pub fn BroadcastChannel(comptime T: type) type {
                 else
                     0;
                 return self.read_seq < oldest_seq;
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // Blocking API (using unified Waiter)
+            // ═══════════════════════════════════════════════════════════════
+
+            /// Blocking receive - blocks until a value is available or channel is closed.
+            /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
+            ///
+            /// Returns .value, .lagged, or .closed.
+            pub fn recvBlocking(self: *Receiver) RecvResult {
+                while (true) {
+                    // Fast path
+                    const fast_result = self.tryRecv();
+                    switch (fast_result) {
+                        .value => |v| return .{ .value = v },
+                        .lagged => |n| return .{ .lagged = n },
+                        .closed => return .closed,
+                        .empty => {},
+                    }
+
+                    // Slow path: use unified waiter
+                    var waiter = RecvWaiter.init();
+
+                    var unified = UnifiedWaiter.init();
+                    const WakerBridge = struct {
+                        fn wake(ctx: *anyopaque) void {
+                            const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
+                            uw.notify();
+                        }
+                    };
+                    waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+
+                    self.channel.mutex.lock();
+
+                    // Re-check under lock
+                    const oldest_seq = if (self.channel.write_seq > self.channel.capacity)
+                        self.channel.write_seq - self.channel.capacity
+                    else
+                        0;
+
+                    if (self.read_seq < oldest_seq) {
+                        const missed = oldest_seq - self.read_seq;
+                        self.read_seq = oldest_seq;
+                        self.channel.mutex.unlock();
+                        return .{ .lagged = missed };
+                    }
+
+                    if (self.read_seq >= self.channel.write_seq) {
+                        if (self.channel.closed) {
+                            self.channel.mutex.unlock();
+                            return .closed;
+                        }
+
+                        // Wait for sender
+                        waiter.complete.store(false, .seq_cst);
+                        waiter.closed.store(false, .seq_cst);
+                        self.channel.recv_waiters.pushBack(&waiter);
+                        self.channel.mutex.unlock();
+
+                        // Wait until notified
+                        unified.wait();
+
+                        // Check if closed
+                        if (waiter.closed.load(.seq_cst)) {
+                            return .closed;
+                        }
+
+                        // Loop back to try again
+                        continue;
+                    }
+
+                    // Read from buffer
+                    const idx = self.read_seq % self.channel.capacity;
+                    const slot = &self.channel.buffer[idx];
+
+                    if (slot.seq != self.read_seq) {
+                        const missed = self.channel.write_seq - self.read_seq;
+                        self.read_seq = self.channel.write_seq;
+                        self.channel.mutex.unlock();
+                        return .{ .lagged = missed };
+                    }
+
+                    const value = slot.value;
+                    self.read_seq += 1;
+                    self.channel.mutex.unlock();
+                    return .{ .value = value };
+                }
             }
         };
 
@@ -333,10 +441,13 @@ pub fn BroadcastChannel(comptime T: type) type {
             const receivers = self.receiver_count;
 
             // Wake all waiting receivers
+            // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
             while (self.recv_waiters.popFront()) |w| {
-                w.complete = true;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.complete.store(true, .seq_cst);
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }
@@ -362,10 +473,13 @@ pub fn BroadcastChannel(comptime T: type) type {
 
             self.closed = true;
 
+            // CRITICAL: Copy waker info BEFORE setting closed flag to avoid use-after-free
             while (self.recv_waiters.popFront()) |w| {
-                w.closed = true;
-                if (w.waker) |wf| {
-                    if (w.waker_ctx) |ctx| {
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.closed.store(true, .seq_cst);
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
                 }
@@ -481,7 +595,7 @@ test "BroadcastChannel - close wakes waiters" {
     ch.close();
 
     try std.testing.expect(woken);
-    try std.testing.expect(waiter.closed);
+    try std.testing.expect(waiter.closed.load(.acquire));
 }
 
 test "BroadcastChannel - send returns receiver count" {

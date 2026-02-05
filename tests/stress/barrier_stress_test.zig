@@ -1,13 +1,23 @@
 //! Stress tests for blitz_io.Barrier
 //!
 //! Tests the N-way synchronization barrier under high contention scenarios.
+//! Uses waitBlocking() for proper blocking without spin-waiting.
+//!
+//! ## Test Categories
+//!
+//! - **Basic N-way**: Verify all tasks reach barrier before any proceed
+//! - **Multiple generations**: Barrier reuse across multiple synchronization points
+//! - **Large groups**: Scalability with many concurrent tasks
+//! - **Staggered arrivals**: Tasks arriving at different times
+//! - **Leader election**: Exactly one leader per generation
 
 const std = @import("std");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 const Barrier = blitz_io.sync.Barrier;
-const BarrierWaiter = blitz_io.sync.BarrierWaiter;
+
+const config = @import("test_config");
 
 test "Barrier stress - basic N-way synchronization" {
     const allocator = testing.allocator;
@@ -15,6 +25,7 @@ test "Barrier stress - basic N-way synchronization" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
+    // 10 tasks chosen as moderate size for basic synchronization test
     const num_tasks = 10;
     var barrier = Barrier.init(num_tasks);
     var arrivals = std.atomic.Value(usize).init(0);
@@ -40,14 +51,10 @@ fn barrierTask(
 ) void {
     _ = arrivals.fetchAdd(1, .acq_rel);
 
-    var waiter = BarrierWaiter.init();
-    if (!barrier.wait(&waiter)) {
-        while (!waiter.isReleased()) {
-            std.atomic.spinLoopHint();
-        }
-    }
+    // Use proper blocking instead of spin-waiting
+    const result = barrier.waitBlocking();
 
-    if (waiter.is_leader) {
+    if (result.is_leader) {
         _ = leaders.fetchAdd(1, .acq_rel);
     }
 
@@ -60,6 +67,7 @@ test "Barrier stress - multiple generations" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
+    // 8 tasks × 5 generations tests barrier reuse without being too expensive
     const num_tasks = 8;
     const generations = 5;
 
@@ -87,17 +95,8 @@ fn multiGenTask(
     generations: usize,
 ) void {
     for (0..generations) |gen| {
-        var waiter = BarrierWaiter.init();
-
-        if (!barrier.wait(&waiter)) {
-            while (!waiter.isReleased()) {
-                std.atomic.spinLoopHint();
-            }
-        }
-
+        _ = barrier.waitBlocking();
         _ = counters[gen].fetchAdd(1, .acq_rel);
-
-        waiter.reset();
     }
 }
 
@@ -107,7 +106,8 @@ test "Barrier stress - large group synchronization" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_tasks = 100;
+    // Large group tests scalability - use tasks_medium for debug/release scaling
+    const num_tasks = config.stress.tasks_medium;
     var barrier = Barrier.init(num_tasks);
     var completed = std.atomic.Value(usize).init(0);
 
@@ -121,14 +121,7 @@ test "Barrier stress - large group synchronization" {
 }
 
 fn largeGroupTask(barrier: *Barrier, completed: *std.atomic.Value(usize)) void {
-    var waiter = BarrierWaiter.init();
-
-    if (!barrier.wait(&waiter)) {
-        while (!waiter.isReleased()) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
+    _ = barrier.waitBlocking();
     _ = completed.fetchAdd(1, .acq_rel);
 }
 
@@ -138,6 +131,7 @@ test "Barrier stress - staggered arrivals" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
+    // 10 tasks with staggered delays (0-9ms) - tests barrier with varied arrival times
     const num_tasks = 10;
     var barrier = Barrier.init(num_tasks);
     var completed = std.atomic.Value(usize).init(0);
@@ -156,13 +150,7 @@ fn staggeredTask(barrier: *Barrier, completed: *std.atomic.Value(usize), delay_f
     // Stagger arrivals
     std.Thread.sleep(delay_factor * std.time.ns_per_ms);
 
-    var waiter = BarrierWaiter.init();
-
-    if (!barrier.wait(&waiter)) {
-        while (!waiter.isReleased()) {
-            std.atomic.spinLoopHint();
-        }
-    }
+    _ = barrier.waitBlocking();
 
     _ = completed.fetchAdd(1, .acq_rel);
 }
@@ -173,6 +161,7 @@ test "Barrier stress - leader does work" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
+    // Fixed at 20 tasks to match the array size in leaderWorkTask
     const num_tasks = 20;
     var barrier = Barrier.init(num_tasks);
 
@@ -211,15 +200,9 @@ fn leaderWorkTask(
     // Each task contributes its ID + 1
     contributions[task_id].store(@as(u64, @intCast(task_id + 1)), .release);
 
-    var waiter = BarrierWaiter.init();
+    const wait_result = barrier.waitBlocking();
 
-    if (!barrier.wait(&waiter)) {
-        while (!waiter.isReleased()) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    if (waiter.is_leader) {
+    if (wait_result.is_leader) {
         // Leader combines all contributions
         var sum: u64 = 0;
         for (contributions) |c| {
@@ -235,11 +218,13 @@ test "Barrier stress - two-task barrier rapid cycles" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
+    // Two-task barrier is simplest case for rapid cycling
     var barrier = Barrier.init(2);
     var cycles_a = std.atomic.Value(usize).init(0);
     var cycles_b = std.atomic.Value(usize).init(0);
 
-    const target_cycles = 100;
+    // Use config iterations for debug/release scaling
+    const target_cycles = config.stress.iterations;
 
     try scope.spawn(rapidCycleTask, .{ &barrier, &cycles_a, target_cycles });
     try scope.spawn(rapidCycleTask, .{ &barrier, &cycles_b, target_cycles });
@@ -256,16 +241,7 @@ fn rapidCycleTask(
     target: usize,
 ) void {
     for (0..target) |_| {
-        var waiter = BarrierWaiter.init();
-
-        if (!barrier.wait(&waiter)) {
-            while (!waiter.isReleased()) {
-                std.atomic.spinLoopHint();
-            }
-        }
-
+        _ = barrier.waitBlocking();
         _ = cycles.fetchAdd(1, .acq_rel);
-
-        waiter.reset();
     }
 }

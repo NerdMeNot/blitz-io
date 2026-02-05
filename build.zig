@@ -44,19 +44,14 @@ pub fn build(b: *std.Build) void {
     const run_backend_tests = b.addRunArtifact(backend_tests);
     test_step.dependOn(&run_backend_tests.step);
 
-    // Executor stress tests (legacy, now part of test-stress)
-    const executor_stress_mod = b.createModule(.{
-        .root_source_file = b.path("src/executor/stress_test.zig"),
+    // ========================================================================
+    // Test Configuration (shared between test suites)
+    // ========================================================================
+    const test_config_mod = b.addModule("test_config", .{
+        .root_source_file = b.path("tests/test_config.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    const executor_stress_tests = b.addTest(.{
-        .root_module = executor_stress_mod,
-    });
-
-    const run_executor_stress = b.addRunArtifact(executor_stress_tests);
-    test_step.dependOn(&run_executor_stress.step);
 
     // ========================================================================
     // Integration Tests (tests/ directory)
@@ -75,6 +70,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         mod.addImport("blitz-io", blitz_io_mod);
+        mod.addImport("test_config", test_config_mod);
 
         const t = b.addTest(.{ .root_module = mod });
         integration_step.dependOn(&b.addRunArtifact(t).step);
@@ -95,10 +91,10 @@ pub fn build(b: *std.Build) void {
         "tests/stress/broadcast_stress_test.zig",
         "tests/stress/notify_stress_test.zig",
         "tests/stress/oneshot_stress_test.zig",
-        "tests/stress/unbounded_stress_test.zig",
         "tests/stress/watch_stress_test.zig",
         "tests/stress/once_cell_stress_test.zig",
         "tests/stress/io_stress_test.zig",
+        "tests/stress/concurrent_patterns_stress_test.zig",
     }) |test_file| {
         const mod = b.createModule(.{
             .root_source_file = b.path(test_file),
@@ -106,13 +102,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         mod.addImport("blitz-io", blitz_io_mod);
+        mod.addImport("test_config", test_config_mod);
 
         const t = b.addTest(.{ .root_module = mod });
         stress_step.dependOn(&b.addRunArtifact(t).step);
     }
-
-    // Also include executor stress test
-    stress_step.dependOn(&run_executor_stress.step);
 
     // ========================================================================
     // Robustness Tests
@@ -129,6 +123,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         mod.addImport("blitz-io", blitz_io_mod);
+        mod.addImport("test_config", test_config_mod);
 
         const t = b.addTest(.{ .root_module = mod });
         robustness_step.dependOn(&b.addRunArtifact(t).step);
@@ -229,25 +224,6 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(concurrency_step);
 
     // ========================================================================
-    // Stress Test Executable (standalone runner)
-    // ========================================================================
-    const stress_exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/executor/stress_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const stress_exe = b.addExecutable(.{
-        .name = "stress-test",
-        .root_module = stress_exe_mod,
-    });
-
-    b.installArtifact(stress_exe);
-
-    const run_stress_exe = b.addRunArtifact(stress_exe);
-    const stress_run_step = b.step("stress", "Run scheduler stress tests (executable)");
-    stress_run_step.dependOn(&run_stress_exe.step);
-
     // ========================================================================
     // Examples
     // ========================================================================
@@ -344,6 +320,25 @@ pub fn build(b: *std.Build) void {
     const run_combinators = b.addRunArtifact(combinators_exe);
     const combinators_step = b.step("example-combinators", "Run async combinators demo");
     combinators_step.dependOn(&run_combinators.step);
+
+    // Scope Demo Example
+    const scope_demo_mod = b.createModule(.{
+        .root_source_file = b.path("examples/scope_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scope_demo_mod.addImport("blitz-io", blitz_io_mod);
+
+    const scope_demo_exe = b.addExecutable(.{
+        .name = "scope-demo",
+        .root_module = scope_demo_mod,
+    });
+
+    b.installArtifact(scope_demo_exe);
+
+    const run_scope_demo = b.addRunArtifact(scope_demo_exe);
+    const scope_demo_step = b.step("example-scope", "Run scope API demo");
+    scope_demo_step.dependOn(&run_scope_demo.step);
 
     // ========================================================================
     // Benchmarks

@@ -1,11 +1,13 @@
 //! Robustness tests for Scope
 //!
 //! Tests edge cases, error conditions, and recovery scenarios.
+//! Uses ThreadScope for thread-based testing outside async runtime.
 
 const std = @import("std");
 const testing = std.testing;
-const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+
+const config = @import("test_config");
+const Scope = config.ThreadScope;
 
 test "Scope robustness - empty scope wait" {
     const allocator = testing.allocator;

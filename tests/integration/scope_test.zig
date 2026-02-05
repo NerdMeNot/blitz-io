@@ -1,13 +1,13 @@
 //! Integration tests for Scope structured concurrency
 //!
 //! Tests Scope working with other primitives and real workloads.
+//! Uses ThreadScope for thread-based testing outside async runtime.
 
 const std = @import("std");
 const testing = std.testing;
 
-// Import blitz-io
-const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const config = @import("test_config");
+const Scope = config.ThreadScope;
 
 test "Scope - parallel counter with atomic" {
     const allocator = testing.allocator;

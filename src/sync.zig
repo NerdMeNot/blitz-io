@@ -14,7 +14,6 @@
 //! | `RwLock` | Many readers, one writer |
 //! | `Oneshot` | Single-value delivery |
 //! | `Channel` | Bounded MPSC queue |
-//! | `UnboundedChannel` | Unbounded MPSC queue |
 //! | `BroadcastChannel` | Multi-consumer pub/sub |
 //! | `Watch` | Single value with change notification |
 //! | `Barrier` | Wait for N tasks |
@@ -273,16 +272,6 @@ pub const BarrierWaiter = barrier.Waiter;
 pub const BarrierWaitResult = barrier.BarrierWaitResult;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// UnboundedChannel - Unbounded MPSC Queue
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Unbounded MPSC channel. Never blocks sender. Use when backpressure isn't needed.
-/// WARNING: Can grow unbounded if consumer is slower than producers.
-pub const unbounded = @import("sync/unbounded.zig");
-pub const UnboundedChannel = unbounded.UnboundedChannel;
-pub const UnboundedRecvWaiter = unbounded.RecvWaiter;
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // BroadcastChannel - Multi-Consumer Pub/Sub
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -317,22 +306,43 @@ pub const OnceCellWaiter = once_cell.InitWaiter;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Structured concurrency scope. Spawn tasks and wait for all to complete.
-/// No manual counting - just spawn and wait. Tasks cannot outlive the scope.
+/// All spawned work is guaranteed to complete before the scope exits.
 ///
 /// ```zig
-/// var scope = io.Scope.init(allocator);
-/// defer scope.deinit();
+/// var scope = Scope{};
+/// defer scope.cancel();  // Clean up on any exit
 ///
-/// try scope.spawn(task1, .{arg1});
-/// try scope.spawn(task2, .{arg2});
-/// try scope.spawnWithResult(task3, .{}, &result);
+/// // Spawn async tasks (I/O workers)
+/// const user_task = try scope.spawn(fetchUser, .{id});
+/// const posts_task = try scope.spawn(fetchPosts, .{id});
+///
+/// // Spawn blocking tasks (thread pool)
+/// const hash_task = try scope.spawnBlocking(computeHash, .{data});
 ///
 /// try scope.wait();  // Blocks until all complete
+///
+/// // Get typed results
+/// const user = user_task.await();
+/// const posts = posts_task.await();
+/// const hash = hash_task.await();
 /// ```
 pub const scope_mod = @import("sync/scope.zig");
 pub const Scope = scope_mod.Scope;
+pub const Task = scope_mod.Task;
+pub const BlockingTask = scope_mod.BlockingTask;
 pub const scoped = scope_mod.scoped;
 pub const ScopeError = scope_mod.ScopeError;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Unified Waiter
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Unified waiter type that works in both async task context and blocking thread context.
+/// New sync primitives should use this instead of defining their own waiter types.
+pub const waiter = @import("sync/waiter.zig");
+pub const Waiter = waiter.Waiter;
+pub const WaiterList = waiter.WaiterList;
+pub const WaiterState = waiter.State;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Common Types
@@ -340,6 +350,7 @@ pub const ScopeError = scope_mod.ScopeError;
 
 /// Function pointer type for waking tasks.
 /// Used by all synchronization primitives.
+/// @deprecated Use the unified Waiter type instead.
 pub const WakerFn = *const fn (*anyopaque) void;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -348,6 +359,7 @@ pub const WakerFn = *const fn (*anyopaque) void;
 
 test {
     // Run all sub-module tests
+    _ = @import("sync/waiter.zig");
     _ = @import("sync/notify.zig");
     _ = @import("sync/semaphore.zig");
     _ = @import("sync/mutex.zig");
@@ -355,7 +367,6 @@ test {
     _ = @import("sync/channel.zig");
     _ = @import("sync/rwlock.zig");
     _ = @import("sync/barrier.zig");
-    _ = @import("sync/unbounded.zig");
     _ = @import("sync/broadcast.zig");
     _ = @import("sync/watch.zig");
     _ = @import("sync/once_cell.zig");

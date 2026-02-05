@@ -1,13 +1,22 @@
 //! Stress tests for Scope structured concurrency
 //!
 //! High-volume concurrent task spawning to verify correctness under load.
+//!
+//! ## Test Categories
+//!
+//! - **High volume**: Many concurrent tasks completing successfully
+//! - **Rapid cycles**: Frequent scope creation/destruction
+//! - **Cancellation**: Graceful shutdown under load
+//! - **Mixed results**: Handling both success and failure
 
 const std = @import("std");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 
-test "Scope stress - 1000 concurrent tasks" {
+const config = @import("test_config");
+
+test "Scope stress - many concurrent tasks" {
     const allocator = testing.allocator;
 
     var scope = Scope.init(allocator);
@@ -15,7 +24,8 @@ test "Scope stress - 1000 concurrent tasks" {
 
     var counter = std.atomic.Value(usize).init(0);
 
-    const num_tasks = 1000;
+    // Use iterations for task spawning (1000 in release)
+    const num_tasks = config.stress.iterations;
     for (0..num_tasks) |_| {
         try scope.spawn(atomicIncrement, .{&counter});
     }
@@ -32,7 +42,8 @@ fn atomicIncrement(counter: *std.atomic.Value(usize)) void {
 test "Scope stress - rapid spawn/wait cycles" {
     const allocator = testing.allocator;
 
-    const cycles = 100;
+    // Use config iterations for debug/release scaling
+    const cycles = config.stress.iterations;
     const tasks_per_cycle = 10;
 
     for (0..cycles) |_| {
@@ -59,8 +70,8 @@ test "Scope stress - cancellation under load" {
 
     var started = std.atomic.Value(usize).init(0);
 
-    // Spawn many long-running tasks
-    for (0..100) |_| {
+    // Spawn many long-running tasks - use tasks_medium for load
+    for (0..config.stress.tasks_medium) |_| {
         try scope.spawn(longRunningTask, .{ &scope, &started });
     }
 
@@ -96,8 +107,8 @@ test "Scope stress - mixed success and failure" {
 
     var successes = std.atomic.Value(usize).init(0);
 
-    // Spawn mix of succeeding and failing tasks
-    for (0..100) |i| {
+    // Spawn mix of succeeding and failing tasks (every 10th fails)
+    for (0..config.stress.tasks_medium) |i| {
         if (i % 10 == 0) {
             try scope.spawn(failingTask, .{});
         } else {

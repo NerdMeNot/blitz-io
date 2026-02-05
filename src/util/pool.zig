@@ -7,13 +7,13 @@
 //! - O(1) allocation and deallocation
 //! - Zero fragmentation (fixed-size slots)
 //! - Cache-friendly allocation (reuse recently freed slots)
-//! - Lock-free fast path via atomic freelist
+//! - Lock-free fast path via atomic Treiber stack
 //!
 //! Usage:
 //!   var pool = try ObjectPool(MyStruct).init(allocator, 1024);
 //!   defer pool.deinit();
 //!
-//!   const obj = try pool.create();
+//!   const obj = pool.create() orelse return error.PoolExhausted;
 //!   defer pool.destroy(obj);
 
 const std = @import("std");
@@ -42,7 +42,7 @@ pub fn ObjectPool(comptime T: type) type {
         /// Slab of pre-allocated objects
         slab: []align(@alignOf(T)) u8,
 
-        /// Atomic freelist head for lock-free alloc/free
+        /// Atomic freelist head for lock-free alloc/free (Treiber stack)
         freelist: std.atomic.Value(?*FreeNode),
 
         /// Number of objects in the pool
@@ -55,7 +55,6 @@ pub fn ObjectPool(comptime T: type) type {
         /// Initialize a new object pool with the given capacity
         pub fn init(allocator: Allocator, capacity: usize) !Self {
             const slab_size = capacity * @sizeOf(T);
-            // Zig 0.15: alignedAlloc requires Alignment enum, not comptime_int
             const alignment: std.mem.Alignment = @enumFromInt(@ctz(@as(usize, @alignOf(T))));
             const slab = try allocator.alignedAlloc(u8, alignment, slab_size);
 
@@ -68,7 +67,7 @@ pub fn ObjectPool(comptime T: type) type {
                 .deallocations = std.atomic.Value(u64).init(0),
             };
 
-            // Initialize freelist with all slots
+            // Initialize freelist with all slots (in reverse for cache locality)
             var i: usize = capacity;
             while (i > 0) {
                 i -= 1;
@@ -94,6 +93,7 @@ pub fn ObjectPool(comptime T: type) type {
         }
 
         /// Allocate an object from the pool (lock-free)
+        /// Returns null if pool is exhausted
         pub fn create(self: *Self) ?*T {
             // Pop from freelist (lock-free Treiber stack pop)
             var head = self.freelist.load(.acquire);
@@ -161,6 +161,12 @@ pub fn ObjectPool(comptime T: type) type {
             return self.freelist.load(.acquire) == null;
         }
 
+        /// Get approximate number of free slots
+        pub fn freeCount(self: *const Self) u64 {
+            const stats = self.getStats();
+            return self.capacity - stats.inUse();
+        }
+
         pub const Stats = struct {
             capacity: usize,
             allocations: u64,
@@ -217,9 +223,11 @@ test "ObjectPool - exhaustion" {
     const c = pool.create(); // Should fail
 
     try std.testing.expect(c == null);
+    try std.testing.expect(pool.isEmpty());
 
     pool.destroy(a);
     pool.destroy(b);
+    try std.testing.expect(!pool.isEmpty());
 }
 
 test "ObjectPool - reuse" {
@@ -240,7 +248,7 @@ test "ObjectPool - reuse" {
     pool.destroy(items[1]);
     pool.destroy(items[3]);
 
-    // Reallocate - should reuse freed slots
+    // Reallocate - should reuse freed slots (LIFO order)
     const new1 = pool.create().?;
     const new2 = pool.create().?;
 
@@ -252,4 +260,32 @@ test "ObjectPool - reuse" {
     pool.destroy(items[2]);
     pool.destroy(new1);
     pool.destroy(new2);
+}
+
+test "ObjectPool - statistics" {
+    const Data = struct { value: usize };
+
+    var pool = try ObjectPool(Data).init(std.testing.allocator, 10);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(usize, 10), pool.capacity);
+
+    var objs: [5]*Data = undefined;
+    for (&objs) |*p| {
+        p.* = pool.create().?;
+    }
+
+    var stats = pool.getStats();
+    try std.testing.expectEqual(@as(u64, 5), stats.allocations);
+    try std.testing.expectEqual(@as(u64, 0), stats.deallocations);
+    try std.testing.expectEqual(@as(u64, 5), stats.inUse());
+
+    for (objs) |obj| {
+        pool.destroy(obj);
+    }
+
+    stats = pool.getStats();
+    try std.testing.expectEqual(@as(u64, 5), stats.allocations);
+    try std.testing.expectEqual(@as(u64, 5), stats.deallocations);
+    try std.testing.expectEqual(@as(u64, 0), stats.inUse());
 }

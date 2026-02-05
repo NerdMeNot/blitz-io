@@ -1,61 +1,69 @@
 //! Stress tests for blitz_io.BroadcastChannel
 //!
 //! Tests the broadcast channel with multiple receivers under high throughput.
+//! Uses recvBlocking() for proper blocking without spin-waiting.
+//!
+//! ## Test Categories
+//!
+//! - **All receivers**: Every receiver gets every message
+//! - **Concurrent subscribe**: Dynamic subscription during sends
+//! - **Slow receiver lagging**: Handling of lag in small buffers
+//! - **Many receivers**: Scalability with large receiver counts
+//! - **Data integrity**: Checksum verification
 
 const std = @import("std");
-const builtin = @import("builtin");
 const testing = std.testing;
 const blitz_io = @import("blitz-io");
-const Scope = blitz_io.Scope;
+const Scope = config.ThreadScope;
 const BroadcastChannel = blitz_io.sync.BroadcastChannel;
 
-// Use smaller iteration counts in debug mode for faster test runs
-const is_debug = builtin.mode == .Debug;
-const NUM_MESSAGES: usize = if (is_debug) 100 else 1000;
-const NUM_MESSAGES_LARGE: usize = if (is_debug) 200 else 2000;
-const NUM_RECEIVERS: usize = if (is_debug) 3 else 5;
-const NUM_RECEIVERS_LARGE: usize = if (is_debug) 5 else 20;
+const config = @import("test_config");
 
 test "BroadcastChannel stress - all receivers get all messages" {
     const allocator = testing.allocator;
 
+    // Use config values for message and receiver counts
+    const num_messages = config.stress.iterations;
+    const num_receivers = config.stress.receivers;
+
     // Buffer must hold all messages to guarantee no lag
-    var channel = try BroadcastChannel(u64).init(allocator, NUM_MESSAGES + 64);
+    var channel = try BroadcastChannel(u64).init(allocator, num_messages + 64);
     defer channel.deinit();
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
     // Create receivers BEFORE spawning sender to ensure they don't miss messages
-    var receivers: [NUM_RECEIVERS]BroadcastChannel(u64).Receiver = undefined;
-    for (&receivers) |*rx| {
+    // Fixed array size to accommodate max receivers (20 in release)
+    var receivers: [20]BroadcastChannel(u64).Receiver = undefined;
+    for (receivers[0..num_receivers]) |*rx| {
         rx.* = channel.subscribe();
     }
 
-    var receiver_sums: [NUM_RECEIVERS]u64 = undefined;
+    var receiver_sums: [20]u64 = undefined;
     var sender_sum: u64 = 0;
     var receivers_ready = std.atomic.Value(usize).init(0);
 
     // Spawn receivers first - they signal when in their loop
-    for (0..NUM_RECEIVERS) |i| {
+    for (0..num_receivers) |i| {
         try scope.spawnWithResult(broadcastReceiverWithReady, .{ &receivers[i], &receivers_ready }, &receiver_sums[i]);
     }
 
     // Spawn sender - it waits for all receivers to be ready
-    try scope.spawnWithResult(broadcastSenderWithReady, .{ &channel, NUM_MESSAGES, &receivers_ready, NUM_RECEIVERS }, &sender_sum);
+    try scope.spawnWithResult(broadcastSenderWithReady, .{ &channel, num_messages, &receivers_ready, num_receivers }, &sender_sum);
 
     try scope.wait();
 
     // All receivers should have the same sum as sender
-    for (receiver_sums) |sum| {
+    for (receiver_sums[0..num_receivers]) |sum| {
         try testing.expectEqual(sender_sum, sum);
     }
 }
 
 fn broadcastSenderWithReady(channel: *BroadcastChannel(u64), count: usize, ready: *std.atomic.Value(usize), expected: usize) u64 {
-    // Wait for all receivers to be in their polling loop
+    // Wait for all receivers to be in their polling loop - yield instead of spin
     while (ready.load(.acquire) < expected) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     var sum: u64 = 0;
@@ -74,17 +82,16 @@ fn broadcastReceiverWithReady(receiver: *BroadcastChannel(u64).Receiver, ready: 
 
     var sum: u64 = 0;
     while (true) {
-        switch (receiver.tryRecv()) {
+        // Use proper blocking instead of spin-waiting
+        switch (receiver.recvBlocking()) {
             .value => |v| {
                 sum += v;
-            },
-            .empty => {
-                std.atomic.spinLoopHint();
             },
             .lagged => |_| {
                 // Shouldn't happen with large buffer
             },
             .closed => break,
+            .empty => unreachable, // recvBlocking never returns empty
         }
     }
 
@@ -103,8 +110,9 @@ test "BroadcastChannel stress - concurrent subscribe/receive" {
     var messages_received = std.atomic.Value(usize).init(0);
     var receivers_ready = std.atomic.Value(usize).init(0);
 
-    const num_receivers = NUM_RECEIVERS;
-    const num_messages = NUM_MESSAGES;
+    // Use config values
+    const num_receivers = config.stress.receivers;
+    const num_messages = config.stress.iterations;
 
     // Spawn receivers first so they can subscribe
     for (0..num_receivers) |_| {
@@ -121,16 +129,16 @@ test "BroadcastChannel stress - concurrent subscribe/receive" {
 }
 
 fn concurrentBroadcastSender(channel: *BroadcastChannel(u64), count: usize, receivers_ready: *std.atomic.Value(usize), expected_receivers: usize) void {
-    // Wait for all receivers to subscribe
+    // Wait for all receivers to subscribe - yield instead of spin
     while (receivers_ready.load(.acquire) < expected_receivers) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     for (0..count) |i| {
         _ = channel.send(@intCast(i));
-        // Small delay to let receivers catch up
+        // Small delay to let receivers catch up - yield instead of spin
         if (i % 50 == 0) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
     }
     channel.close();
@@ -141,17 +149,16 @@ fn dynamicSubscriber(channel: *BroadcastChannel(u64), received: *std.atomic.Valu
     _ = ready.fetchAdd(1, .acq_rel); // Signal that we're ready
 
     while (true) {
-        switch (rx.tryRecv()) {
+        // Use proper blocking instead of spin-waiting
+        switch (rx.recvBlocking()) {
             .value => |_| {
                 _ = received.fetchAdd(1, .acq_rel);
-            },
-            .empty => {
-                std.atomic.spinLoopHint();
             },
             .lagged => |_| {
                 // Expected under contention
             },
             .closed => break,
+            .empty => unreachable, // recvBlocking never returns empty
         }
     }
 }
@@ -159,7 +166,7 @@ fn dynamicSubscriber(channel: *BroadcastChannel(u64), received: *std.atomic.Valu
 test "BroadcastChannel stress - slow receiver lagging" {
     const allocator = testing.allocator;
 
-    // Small buffer to cause lagging
+    // Small buffer (8 slots) to cause lagging
     var channel = try BroadcastChannel(u64).init(allocator, 8);
     defer channel.deinit();
 
@@ -170,7 +177,8 @@ test "BroadcastChannel stress - slow receiver lagging" {
     var lagged_count = std.atomic.Value(usize).init(0);
     var received_count = std.atomic.Value(usize).init(0);
 
-    const num_messages = NUM_MESSAGES;
+    // Use config iterations for message count
+    const num_messages = config.stress.iterations;
 
     // Fast sender
     try scope.spawn(fastBroadcastSender, .{ &channel, num_messages });
@@ -199,21 +207,18 @@ fn slowBroadcastReceiver(
     lagged: *std.atomic.Value(usize),
 ) void {
     while (true) {
-        switch (rx.tryRecv()) {
+        // Use proper blocking instead of spin-waiting
+        switch (rx.recvBlocking()) {
             .value => |_| {
                 _ = received.fetchAdd(1, .acq_rel);
-                // Simulate slow processing
-                for (0..10) |_| {
-                    std.atomic.spinLoopHint();
-                }
-            },
-            .empty => {
-                std.atomic.spinLoopHint();
+                // Simulate slow processing - yield to create timing variation
+                std.Thread.yield() catch {};
             },
             .lagged => |missed| {
                 _ = lagged.fetchAdd(missed, .acq_rel);
             },
             .closed => break,
+            .empty => unreachable, // recvBlocking never returns empty
         }
     }
 }
@@ -221,7 +226,9 @@ fn slowBroadcastReceiver(
 test "BroadcastChannel stress - many receivers same speed" {
     const allocator = testing.allocator;
 
-    const num_messages = NUM_MESSAGES;
+    // Use config values - higher receiver count tests scalability
+    const num_messages = config.stress.iterations;
+    const num_receivers_large = config.stress.receivers;
 
     // Buffer must be large enough to hold all messages to guarantee no lag
     var channel = try BroadcastChannel(u64).init(allocator, num_messages + 64);
@@ -230,12 +237,13 @@ test "BroadcastChannel stress - many receivers same speed" {
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    var receivers: [NUM_RECEIVERS_LARGE]BroadcastChannel(u64).Receiver = undefined;
-    for (&receivers) |*rx| {
+    // Fixed array size to accommodate max receivers (20 in release)
+    var receivers: [20]BroadcastChannel(u64).Receiver = undefined;
+    for (receivers[0..num_receivers_large]) |*rx| {
         rx.* = channel.subscribe();
     }
 
-    var counts: [NUM_RECEIVERS_LARGE]std.atomic.Value(usize) = undefined;
+    var counts: [20]std.atomic.Value(usize) = undefined;
     for (&counts) |*c| {
         c.* = std.atomic.Value(usize).init(0);
     }
@@ -243,28 +251,28 @@ test "BroadcastChannel stress - many receivers same speed" {
     var receivers_ready = std.atomic.Value(usize).init(0);
 
     // Spawn receivers first to ensure they're ready
-    for (0..NUM_RECEIVERS_LARGE) |i| {
+    for (0..num_receivers_large) |i| {
         try scope.spawn(countingBroadcastReceiverWithReady, .{ &receivers[i], &counts[i], &receivers_ready });
     }
 
     // Sender waits for receivers
     try scope.spawn(struct {
         fn send(ch: *BroadcastChannel(u64), n: usize, ready: *std.atomic.Value(usize), expected: usize) void {
-            // Wait for all receivers to be ready
+            // Wait for all receivers to be ready - yield instead of spin
             while (ready.load(.acquire) < expected) {
-                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
             }
             for (0..n) |i| {
                 _ = ch.send(@intCast(i));
             }
             ch.close();
         }
-    }.send, .{ &channel, num_messages, &receivers_ready, NUM_RECEIVERS_LARGE });
+    }.send, .{ &channel, num_messages, &receivers_ready, num_receivers_large });
 
     try scope.wait();
 
     // All receivers should get all messages (no lag with sufficient buffer)
-    for (counts) |c| {
+    for (counts[0..num_receivers_large]) |c| {
         try testing.expectEqual(@as(usize, num_messages), c.load(.acquire));
     }
 }
@@ -277,15 +285,14 @@ fn countingBroadcastReceiverWithReady(
     _ = ready.fetchAdd(1, .acq_rel);
 
     while (true) {
-        switch (rx.tryRecv()) {
+        // Use proper blocking instead of spin-waiting
+        switch (rx.recvBlocking()) {
             .value => |_| {
                 _ = count.fetchAdd(1, .acq_rel);
             },
-            .empty => {
-                std.atomic.spinLoopHint();
-            },
             .lagged => |_| {},
             .closed => break,
+            .empty => unreachable, // recvBlocking never returns empty
         }
     }
 }
@@ -295,15 +302,14 @@ fn countingBroadcastReceiver(
     count: *std.atomic.Value(usize),
 ) void {
     while (true) {
-        switch (rx.tryRecv()) {
+        // Use proper blocking instead of spin-waiting
+        switch (rx.recvBlocking()) {
             .value => |_| {
                 _ = count.fetchAdd(1, .acq_rel);
             },
-            .empty => {
-                std.atomic.spinLoopHint();
-            },
             .lagged => |_| {},
             .closed => break,
+            .empty => unreachable, // recvBlocking never returns empty
         }
     }
 }
@@ -311,21 +317,24 @@ fn countingBroadcastReceiver(
 test "BroadcastChannel stress - data integrity" {
     const allocator = testing.allocator;
 
+    // Use high_throughput for data integrity test
+    const num_messages_large = config.stress.high_throughput;
+    const num_receivers = config.stress.receivers;
+
     // Buffer must be large enough to hold all messages to guarantee no lag
-    var channel = try BroadcastChannel(u64).init(allocator, NUM_MESSAGES_LARGE + 64);
+    var channel = try BroadcastChannel(u64).init(allocator, num_messages_large + 64);
     defer channel.deinit();
 
     var scope = Scope.init(allocator);
     defer scope.deinit();
 
-    const num_receivers = NUM_RECEIVERS;
-
-    var receivers: [NUM_RECEIVERS]BroadcastChannel(u64).Receiver = undefined;
-    for (&receivers) |*rx| {
+    // Fixed array size to accommodate max receivers (20 in release)
+    var receivers: [20]BroadcastChannel(u64).Receiver = undefined;
+    for (receivers[0..num_receivers]) |*rx| {
         rx.* = channel.subscribe();
     }
 
-    var checksums: [NUM_RECEIVERS]u64 = undefined;
+    var checksums: [20]u64 = undefined;
     var sender_checksum: u64 = 0;
     var receivers_ready = std.atomic.Value(usize).init(0);
 
@@ -335,12 +344,12 @@ test "BroadcastChannel stress - data integrity" {
     }
 
     // Sender waits for receivers
-    try scope.spawnWithResult(checksumBroadcastSenderWithReady, .{ &channel, NUM_MESSAGES_LARGE, &receivers_ready, num_receivers }, &sender_checksum);
+    try scope.spawnWithResult(checksumBroadcastSenderWithReady, .{ &channel, num_messages_large, &receivers_ready, num_receivers }, &sender_checksum);
 
     try scope.wait();
 
     // All checksums should match
-    for (checksums) |cs| {
+    for (checksums[0..num_receivers]) |cs| {
         try testing.expectEqual(sender_checksum, cs);
     }
 }
@@ -364,17 +373,16 @@ fn checksumBroadcastReceiver(rx: *BroadcastChannel(u64).Receiver) u64 {
     var checksum: u64 = 0;
 
     while (true) {
-        switch (rx.tryRecv()) {
+        // Use proper blocking instead of spin-waiting
+        switch (rx.recvBlocking()) {
             .value => |v| {
                 checksum ^= v;
-            },
-            .empty => {
-                std.atomic.spinLoopHint();
             },
             .lagged => |_| {
                 // This shouldn't happen with large enough buffer
             },
             .closed => break,
+            .empty => unreachable, // recvBlocking never returns empty
         }
     }
 
@@ -382,9 +390,9 @@ fn checksumBroadcastReceiver(rx: *BroadcastChannel(u64).Receiver) u64 {
 }
 
 fn checksumBroadcastSenderWithReady(channel: *BroadcastChannel(u64), count: usize, ready: *std.atomic.Value(usize), expected: usize) u64 {
-    // Wait for all receivers to be ready
+    // Wait for all receivers to be ready - yield instead of spin
     while (ready.load(.acquire) < expected) {
-        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
     }
 
     var checksum: u64 = 0;
@@ -407,17 +415,16 @@ fn checksumBroadcastReceiverWithReady(rx: *BroadcastChannel(u64).Receiver, ready
     var checksum: u64 = 0;
 
     while (true) {
-        switch (rx.tryRecv()) {
+        // Use proper blocking instead of spin-waiting
+        switch (rx.recvBlocking()) {
             .value => |v| {
                 checksum ^= v;
-            },
-            .empty => {
-                std.atomic.spinLoopHint();
             },
             .lagged => |_| {
                 // This shouldn't happen with large enough buffer
             },
             .closed => break,
+            .empty => unreachable, // recvBlocking never returns empty
         }
     }
 

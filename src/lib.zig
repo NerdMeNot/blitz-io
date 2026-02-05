@@ -856,11 +856,75 @@ pub const backend = @import("backend.zig");
 /// Task executor (scheduler, workers, queues)
 pub const executor = @import("executor.zig");
 
-/// Utility data structures (slab, linked list, etc.)
+/// Coroutine foundation (stackful coroutines, scheduler, tasks)
+/// This is the new async execution foundation with:
+/// - Platform-specific context switching (x86_64, aarch64)
+/// - Stack pooling with guard pages
+/// - Work-stealing scheduler with Tokio-grade optimizations
+/// - Hierarchical timer wheel (O(1) insert/expiration)
+/// - Shield-based cancellation for graceful shutdown
+/// - Intrusive task queues
+/// - Integrated I/O backend (io_uring, kqueue, epoll, IOCP)
+pub const coroutine = struct {
+    pub const Context = @import("coroutine/context.zig").Context;
+    pub const StackInfo = @import("coroutine/context.zig").StackInfo;
+    pub const Coroutine = @import("coroutine/coroutine.zig").Coroutine;
+    pub const StackPool = @import("coroutine/stack_pool.zig").StackPool;
+    pub const Task = @import("coroutine/task.zig").Task;
+    pub const Header = @import("coroutine/task.zig").Header;
+    pub const State = @import("coroutine/task.zig").State;
+    pub const Lifecycle = @import("coroutine/task.zig").Lifecycle;
+    pub const TaskQueue = @import("coroutine/task.zig").TaskQueue;
+    pub const GlobalTaskQueue = @import("coroutine/task.zig").GlobalTaskQueue;
+    pub const Scheduler = @import("coroutine/scheduler.zig").Scheduler;
+    pub const Worker = @import("coroutine/scheduler.zig").Worker;
+    pub const CoroutineRuntime = @import("coroutine/runtime.zig").Runtime;
+    pub const JoinHandle = @import("coroutine/runtime.zig").JoinHandle;
+
+    /// Lock-free work-stealing deque (Chase-Lev)
+    pub const Deque = @import("coroutine/deque.zig").Deque;
+    pub const StealResult = @import("coroutine/deque.zig").StealResult;
+
+    /// Hierarchical timer wheel for efficient timeout handling
+    pub const timer = @import("coroutine/timer.zig");
+    pub const TimerWheel = timer.TimerWheel;
+    pub const TimerEntry = timer.TimerEntry;
+
+    /// I/O backend integration (re-exported from runtime)
+    const coro_runtime = @import("coroutine/runtime.zig");
+    pub const Backend = coro_runtime.Backend;
+    pub const BackendType = coro_runtime.BackendType;
+    pub const BackendConfig = coro_runtime.BackendConfig;
+    pub const Operation = coro_runtime.Operation;
+    pub const Completion = coro_runtime.Completion;
+};
+
+/// Utility data structures (slab, linked list, object pool, etc.)
 pub const util = struct {
     pub const Slab = @import("util/slab.zig").Slab;
     pub const LinkedList = @import("util/linked_list.zig").LinkedList;
     pub const Pointers = @import("util/linked_list.zig").Pointers;
+    pub const WakeList = @import("util/wake_list.zig").WakeList;
+    pub const CacheLine = @import("util/cacheline.zig");
+    pub const ObjectPool = @import("util/pool.zig").ObjectPool;
+
+    /// Safety utilities for debugging
+    pub const safety = struct {
+        /// Stack overflow detection via magic number sentinel.
+        /// Useful for fibers, coroutines, or custom stack allocations.
+        pub const StackGuard = @import("util/stack_guard.zig").StackGuard;
+
+        /// Debug-mode use-after-free detection via invocation IDs.
+        /// Helps catch stale references in concurrent code.
+        pub const InvocationId = @import("util/invocation_id.zig").InvocationId;
+        pub const WaiterInvocation = @import("util/invocation_id.zig").WaiterInvocation;
+    };
+
+    /// Completion callback utilities for async operations.
+    pub const completion = @import("util/completion.zig");
+    pub const Completion = completion.Completion;
+    pub const WakerFn = completion.WakerFn;
+    pub const WakerInfo = completion.WakerInfo;
 };
 
 /// Testing utilities (concurrency framework, atomic logging)
@@ -913,6 +977,19 @@ test {
     _ = @import("process.zig");
     _ = @import("async.zig");
     _ = @import("shutdown.zig");
+
+    // Coroutine foundation tests
+    _ = @import("coroutine/context.zig");
+    _ = @import("coroutine/stack.zig");
+    _ = @import("coroutine/stack_pool.zig");
+    _ = @import("coroutine/coroutine.zig");
+    _ = @import("coroutine/task.zig");
+    _ = @import("coroutine/scheduler.zig");
+    _ = @import("coroutine/runtime.zig");
+    _ = @import("coroutine/timer.zig");
+
+    // Utility tests
+    _ = @import("util/pool.zig");
 }
 
 test "version" {
