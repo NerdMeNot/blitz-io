@@ -19,7 +19,7 @@
 //! const a5 = Address.fromPort(8080); // 0.0.0.0:8080
 //! ```
 //!
-//! Reference: Tokio's SocketAddr and Rust's std::net::SocketAddr
+//! Modeled after standard socket address types with full parsing support.
 
 const std = @import("std");
 const posix = std.posix;

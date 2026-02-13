@@ -14,8 +14,6 @@
 //! try buf_writer.writeAll("World!\n");
 //! try buf_writer.flush(); // Don't forget to flush!
 //! ```
-//!
-//! Reference: tokio/src/io/util/buf_writer.rs
 
 const std = @import("std");
 

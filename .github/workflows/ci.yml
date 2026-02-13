@@ -11,214 +11,312 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
-  # Platform Tests - Run on all supported platforms
+  # Quick Check - Formatting (fails fast)
   # ═══════════════════════════════════════════════════════════════════════════
 
-  test-linux:
-    name: Linux (io_uring + epoll)
+  format:
+    name: Format Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-
-      - name: Check kernel version
-        run: |
-          echo "Kernel: $(uname -r)"
-          # ubuntu-latest has kernel 5.15+ which supports io_uring
-          # io_uring requires 5.1+, full features need 5.11+
 
       - name: Check formatting
-        run: zig fmt --check src/*.zig src/**/*.zig tests/**/*.zig build.zig
+        run: zig fmt --check src/ tests/ bench/
 
-      - name: Run unit tests (includes io_uring + epoll backend tests)
-        run: zig build test --summary all
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Unit Tests - All Platforms and Architectures
+  # ═══════════════════════════════════════════════════════════════════════════
 
-      - name: Run integration tests
-        run: zig build test-integration --summary all
+  unit-tests:
+    name: Unit Tests (${{ matrix.name }})
+    needs: format
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (io_uring + epoll)
+          - os: ubuntu-latest
+            name: linux-x86_64
+          # Linux ARM64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          # macOS ARM64 (Apple Silicon, kqueue)
+          - os: macos-latest
+            name: macos-arm64
+          # macOS x86_64 (Intel, kqueue)
+          - os: macos-13
+            name: macos-x86_64
+          # Windows x86_64 (IOCP)
+          - os: windows-latest
+            name: windows-x86_64
 
-      - name: Run stress tests
-        run: zig build test-stress --summary all
-
-      - name: Build library
-        run: zig build
-
-  test-macos:
-    name: macOS (kqueue)
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Run unit tests (includes kqueue backend tests)
-        run: zig build test --summary all
-        # Note: io_uring tests skip on macOS (Linux-only)
-        # Note: IOCP tests skip on macOS (Windows-only)
+      - name: System info
+        shell: bash
+        run: |
+          echo "Platform: ${{ matrix.name }}"
+          echo "Runner: ${{ matrix.os }}"
+          uname -a || ver
 
-      - name: Run integration tests
-        run: zig build test-integration --summary all
+      - name: Run unit tests
+        run: zig build test
 
-      - name: Run stress tests
-        run: zig build test-stress --summary all
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Concurrency Tests (Loom-style) - All Platforms
+  # Memory ordering bugs often manifest differently on ARM vs x86
+  # ═══════════════════════════════════════════════════════════════════════════
 
-      - name: Build library
-        run: zig build
+  concurrency-tests:
+    name: Concurrency (${{ matrix.name }})
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-13
+            name: macos-x86_64
+          - os: windows-latest
+            name: windows-x86_64
 
-  test-windows:
-    name: Windows (IOCP)
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Run unit tests (includes IOCP backend tests)
-        run: zig build test --summary all
-        # Note: This is the ONLY platform where IOCP tests actually run
-        # The 8 Windows-specific IOCP tests skip on Linux/macOS
-
-      - name: Run integration tests
-        run: zig build test-integration --summary all
-
-      - name: Build library
-        run: zig build
+      - name: Run concurrency tests
+        run: zig build test-concurrency
+        env:
+          BLITZ_TEST_INTENSITY: standard
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Backend-Specific Tests
+  # Stress Tests - Linux and macOS (need more resources)
   # ═══════════════════════════════════════════════════════════════════════════
 
-  # Note: io_uring is Linux-only (kernel 5.1+)
-  # The test-linux job already runs io_uring tests on Ubuntu
-  # GitHub's ubuntu-latest has kernel 5.15+ which supports io_uring
+  stress-tests:
+    name: Stress (${{ matrix.name }})
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: macos-latest
+            name: macos-arm64
 
-  # Note: kqueue is macOS/BSD-only
-  # The test-macos job runs kqueue tests
-
-  # Note: IOCP is Windows-only
-  # The test-windows job runs IOCP tests (the 8 Windows-specific tests)
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Robustness & Edge Cases
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  test-robustness:
-    name: Robustness Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run stress tests
+        run: zig build test-stress
+        env:
+          BLITZ_TEST_INTENSITY: stress
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Robustness Tests - Edge cases and boundary conditions
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  robustness-tests:
+    name: Robustness (${{ matrix.name }})
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Run robustness tests
-        run: zig build test-robustness --summary all
-
-      - name: Run fuzz tests
-        run: zig build test-fuzz --summary all
+        run: zig build test-robustness
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Code Coverage (Linux only, best-effort)
+  # Release Build Verification
   # ═══════════════════════════════════════════════════════════════════════════
 
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-22.04  # kcov works better on 22.04
-    continue-on-error: true
+  release-build:
+    name: Release (${{ matrix.name }})
+    needs: [concurrency-tests, stress-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Install kcov
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y kcov
+      - name: Build release
+        run: zig build -Doptimize=ReleaseFast
 
-      - name: Build and run tests with coverage
-        run: |
-          # Build the test executable
-          zig build test 2>&1 || true
-          # Find test binary and run with kcov
-          TEST_BIN=$(find .zig-cache -name "test" -type f -executable 2>/dev/null | head -1)
-          if [ -n "$TEST_BIN" ]; then
-            kcov --include-path=src coverage "$TEST_BIN" || true
-          else
-            echo "Test binary not found, skipping coverage"
-          fi
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          directory: coverage
-          fail_ci_if_error: false
+      - name: Test in release mode
+        run: zig build test -Doptimize=ReleaseFast
         env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          BLITZ_TEST_INTENSITY: smoke
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Benchmarks (main branch only)
+  # Benchmarks
   # ═══════════════════════════════════════════════════════════════════════════
 
-  bench:
-    name: Benchmarks
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  benchmarks:
+    name: Benchmarks (${{ matrix.name }})
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Run benchmarks
-        run: |
-          if zig build bench -Doptimize=ReleaseFast 2>/dev/null; then
-            echo "Benchmarks completed"
-          else
-            echo "No benchmark target configured yet"
-          fi
+        run: zig build bench-internal
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Summary Job - Ensures all platform tests pass
+  # Exhaustive Tests (main branch only, after PRs merge)
+  # These run longer and explore more interleavings
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  exhaustive-tests:
+    name: Exhaustive (${{ matrix.name }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [concurrency-tests, stress-tests, robustness-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: macos-latest
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run exhaustive concurrency tests
+        run: zig build test-concurrency
+        env:
+          BLITZ_TEST_INTENSITY: exhaustive
+
+      - name: Run exhaustive stress tests
+        run: zig build test-stress
+        env:
+          BLITZ_TEST_INTENSITY: exhaustive
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CI Success Gate
   # ═══════════════════════════════════════════════════════════════════════════
 
   ci-success:
     name: CI Success
-    needs: [test-linux, test-macos, test-windows, test-robustness]
+    needs:
+      - unit-tests
+      - concurrency-tests
+      - stress-tests
+      - robustness-tests
+      - release-build
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: Check all jobs passed
+      - name: Check all required jobs passed
         run: |
-          if [[ "${{ needs.test-linux.result }}" != "success" ]]; then
-            echo "Linux tests failed"
+          echo "Unit tests: ${{ needs.unit-tests.result }}"
+          echo "Concurrency tests: ${{ needs.concurrency-tests.result }}"
+          echo "Stress tests: ${{ needs.stress-tests.result }}"
+          echo "Robustness tests: ${{ needs.robustness-tests.result }}"
+          echo "Release build: ${{ needs.release-build.result }}"
+
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "❌ Unit tests failed"
             exit 1
           fi
-          if [[ "${{ needs.test-macos.result }}" != "success" ]]; then
-            echo "macOS tests failed"
+          if [[ "${{ needs.concurrency-tests.result }}" != "success" ]]; then
+            echo "❌ Concurrency tests failed"
             exit 1
           fi
-          if [[ "${{ needs.test-windows.result }}" != "success" ]]; then
-            echo "Windows tests failed"
+          if [[ "${{ needs.stress-tests.result }}" != "success" ]]; then
+            echo "❌ Stress tests failed"
             exit 1
           fi
-          if [[ "${{ needs.test-robustness.result }}" != "success" ]]; then
-            echo "Robustness tests failed"
+          if [[ "${{ needs.robustness-tests.result }}" != "success" ]]; then
+            echo "❌ Robustness tests failed"
             exit 1
           fi
-          echo "All CI checks passed!"
+          if [[ "${{ needs.release-build.result }}" != "success" ]]; then
+            echo "❌ Release build failed"
+            exit 1
+          fi
+
+          echo "✅ All CI checks passed!"

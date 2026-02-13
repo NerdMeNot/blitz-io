@@ -1,809 +1,1055 @@
-//! Tokio Benchmark Suite for comparison with blitz-io
+//! Tokio Benchmark Suite — Canonical reference for blitz-io comparison
 //!
-//! This benchmark measures Tokio's async runtime performance for direct
-//! comparison with blitz-io's Zig implementation.
+//! Methodology:
+//!
+//! TIER 1 — SYNC FAST PATH (1M ops):
+//!   Single-thread, no runtime. Both sides use try_* synchronous APIs.
+//!   Measures raw data structure cost: CAS, atomics, memory barriers.
+//!
+//! TIER 2 — CHANNEL FAST PATH (100K ops):
+//!   Single-thread, no runtime. Both sides use try_send/try_recv.
+//!   Measures channel buffer operations without scheduling overhead.
+//!
+//! TIER 3 — ASYNC MULTI-TASK (10K ops):
+//!   Both sides use their async runtimes (Tokio / blitz-io).
+//!   Measures real-world contention: scheduling, waking, backpressure.
+//!   NO spin-wait loops — proper async .await throughout.
+//!
+//! Statistics: median of 10 iterations (5 warmup discarded).
+//! ns/op = median_ns / ops_per_iter (single division, no double-counting).
+//!
+//! Run:     cargo run --release
+//! JSON:    cargo run --release -- --json
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, Barrier, Mutex, Notify, RwLock, Semaphore};
+use std::time::Instant;
+
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Barrier, Mutex, Notify, OnceCell, RwLock, Semaphore};
 
 // ============================================================================
-// Configuration
+// Allocation Tracking — global allocator wrapper
 // ============================================================================
 
+struct TrackingAllocator;
+
+static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+    }
+}
+
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator;
+
+fn reset_alloc_counters() {
+    ALLOC_BYTES.store(0, Ordering::Relaxed);
+    ALLOC_COUNT.store(0, Ordering::Relaxed);
+}
+
+fn get_alloc_bytes() -> usize {
+    ALLOC_BYTES.load(Ordering::Relaxed)
+}
+
+fn get_alloc_count() -> usize {
+    ALLOC_COUNT.load(Ordering::Relaxed)
+}
+
+// ============================================================================
+// Configuration — MUST MATCH blitz_bench.zig EXACTLY
+// ============================================================================
+
+// Tier 1: Sync fast path (very fast ops, need high count for measurable time)
+const SYNC_OPS: usize = 1_000_000;
+
+// Tier 2: Channel fast path (moderate cost, buffer operations)
+const CHANNEL_OPS: usize = 100_000;
+
+// Tier 3: Async multi-task (expensive, involves scheduling + contention)
+const ASYNC_OPS: usize = 10_000;
+
+// Shared config
 const ITERATIONS: usize = 10;
-const WARMUP_ITERATIONS: usize = 3;
-const BENCHMARK_SIZE: usize = 100_000;
-const CHANNEL_SIZE: usize = 1000;
+const WARMUP: usize = 5;
 const NUM_WORKERS: usize = 4;
 
+// MPMC config
+const MPMC_PRODUCERS: usize = 4;
+const MPMC_CONSUMERS: usize = 4;
+const MPMC_BUFFER: usize = 1_000; // << ASYNC_OPS to force backpressure
+
+// Contended config
+const CONTENDED_MUTEX_TASKS: usize = 4;
+const CONTENDED_RWLOCK_READERS: usize = 4;
+const CONTENDED_RWLOCK_WRITERS: usize = 2;
+const CONTENDED_SEM_TASKS: usize = 8;
+const CONTENDED_SEM_PERMITS: usize = 2;
+
 // ============================================================================
-// Statistics
+// Statistics — median-based (robust against outliers)
 // ============================================================================
 
 struct Stats {
-    min_ns: u64,
-    max_ns: u64,
-    total_ns: u64,
-    count: usize,
+    samples: Vec<u64>,
 }
 
 impl Stats {
     fn new() -> Self {
         Stats {
-            min_ns: u64::MAX,
-            max_ns: 0,
-            total_ns: 0,
-            count: 0,
+            samples: Vec::with_capacity(ITERATIONS),
         }
     }
 
     fn add(&mut self, ns: u64) {
-        self.min_ns = self.min_ns.min(ns);
-        self.max_ns = self.max_ns.max(ns);
-        self.total_ns += ns;
-        self.count += 1;
+        self.samples.push(ns);
     }
 
-    fn avg_ns(&self) -> u64 {
-        if self.count > 0 {
-            self.total_ns / self.count as u64
+    fn median_ns(&self) -> u64 {
+        if self.samples.is_empty() {
+            return 0;
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2]
+    }
+
+    fn min_ns(&self) -> u64 {
+        self.samples.iter().copied().min().unwrap_or(0)
+    }
+}
+
+struct BenchResult {
+    stats: Stats,
+    ops_per_iter: usize, // ops done in ONE iteration — ns/op = median_ns / this
+    total_bytes: usize,  // bytes allocated in last timed iteration
+    total_allocs: usize, // allocation calls in last timed iteration
+}
+
+impl BenchResult {
+    fn ns_per_op(&self) -> f64 {
+        let med = self.stats.median_ns() as f64;
+        let ops = self.ops_per_iter as f64;
+        if ops > 0.0 {
+            med / ops
         } else {
-            0
+            0.0
         }
     }
 
-    fn ns_per_op(&self, ops: usize) -> f64 {
-        self.avg_ns() as f64 / ops as f64
+    fn ops_per_sec(&self) -> f64 {
+        let ns = self.ns_per_op();
+        if ns > 0.0 {
+            1_000_000_000.0 / ns
+        } else {
+            0.0
+        }
     }
 
-    fn ops_per_sec(&self, ops: usize) -> f64 {
-        let avg_ns = self.avg_ns();
-        if avg_ns == 0 {
+    fn bytes_per_op(&self) -> f64 {
+        if self.ops_per_iter == 0 {
             return 0.0;
         }
-        ops as f64 * 1_000_000_000.0 / avg_ns as f64
+        self.total_bytes as f64 / self.ops_per_iter as f64
+    }
+
+    fn allocs_per_op(&self) -> f64 {
+        if self.ops_per_iter == 0 {
+            return 0.0;
+        }
+        self.total_allocs as f64 / self.ops_per_iter as f64
     }
 }
 
 // ============================================================================
-// JSON Output
+// TIER 1: SYNC FAST PATH (1M ops, single-thread, try_* APIs)
 // ============================================================================
 
-#[derive(Default, serde::Serialize)]
-struct JsonOutput {
-    // Task spawning
-    spawn_ns: f64,
-    spawn_batch_ns: f64,
-    spawn_ops_per_sec: f64,
+fn bench_mutex() -> BenchResult {
+    let mut stats = Stats::new();
 
-    // Channel operations
-    channel_send_ns: f64,
-    channel_recv_ns: f64,
-    channel_roundtrip_ns: f64,
-    channel_mpmc_ns: f64,
-    oneshot_ns: f64,
-    mpmc_lockfree_ns: f64,
+    for _ in 0..WARMUP {
+        let mutex = Mutex::new(());
+        for _ in 0..SYNC_OPS {
+            let _guard = mutex.try_lock().unwrap();
+        }
+    }
 
-    // Synchronization
-    mutex_ns: f64,
-    mutex_contention_ns: f64,
-    rwlock_read_ns: f64,
-    rwlock_write_ns: f64,
-    rwlock_contention_ns: f64,
-    semaphore_ns: f64,
-    semaphore_contention_ns: f64,
-    barrier_ns: f64,
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let mutex = Mutex::new(());
+        let start = Instant::now();
+        for _ in 0..SYNC_OPS {
+            let _guard = mutex.try_lock().unwrap();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
 
-    // Parking primitives
-    parker_ns: f64,
-    notify_ns: f64,
+    BenchResult {
+        stats,
+        ops_per_iter: SYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
 
-    // Timers
-    timer_precision_ns: f64,
+fn bench_rwlock_read() -> BenchResult {
+    let mut stats = Stats::new();
 
-    // Throughput
-    task_throughput: f64,
-    message_throughput: f64,
+    for _ in 0..WARMUP {
+        let lock = RwLock::new(());
+        for _ in 0..SYNC_OPS {
+            let _guard = lock.try_read().unwrap();
+        }
+    }
 
-    // Memory (placeholder - Rust doesn't easily expose this)
-    peak_memory_kb: u64,
-    total_allocations: u64,
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let lock = RwLock::new(());
+        let start = Instant::now();
+        for _ in 0..SYNC_OPS {
+            let _guard = lock.try_read().unwrap();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
 
-    // Metadata
-    benchmark_size: u64,
-    iterations: u64,
-    warmup_iterations: u64,
-    num_workers: u64,
+    BenchResult {
+        stats,
+        ops_per_iter: SYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_rwlock_write() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        let lock = RwLock::new(());
+        for _ in 0..SYNC_OPS {
+            let _guard = lock.try_write().unwrap();
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let lock = RwLock::new(());
+        let start = Instant::now();
+        for _ in 0..SYNC_OPS {
+            let _guard = lock.try_write().unwrap();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: SYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_semaphore() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        let sem = Semaphore::new(10);
+        for _ in 0..SYNC_OPS {
+            let _permit = sem.try_acquire().unwrap();
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let sem = Semaphore::new(10);
+        let start = Instant::now();
+        for _ in 0..SYNC_OPS {
+            let _permit = sem.try_acquire().unwrap();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: SYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_oncecell_get() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        let cell = OnceCell::new();
+        cell.set(42u64).unwrap();
+        for _ in 0..SYNC_OPS {
+            std::hint::black_box(cell.get());
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        let cell = OnceCell::new();
+        cell.set(42u64).unwrap();
+        reset_alloc_counters();
+        let start = Instant::now();
+        for _ in 0..SYNC_OPS {
+            std::hint::black_box(cell.get());
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: SYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_oncecell_set() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        for i in 0..SYNC_OPS {
+            let cell = OnceCell::new();
+            let _ = cell.set(i as u64);
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let start = Instant::now();
+        for i in 0..SYNC_OPS {
+            let cell = OnceCell::new();
+            let _ = cell.set(i as u64);
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: SYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+// Notify: Tokio has no sync consume API — .notified().await is the only way.
+// The permit is pre-stored, so the .await completes on first poll.
+async fn bench_notify() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        for _ in 0..SYNC_OPS {
+            let notify = Notify::new();
+            notify.notify_one();
+            notify.notified().await;
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let start = Instant::now();
+        for _ in 0..SYNC_OPS {
+            let notify = Notify::new();
+            notify.notify_one();
+            notify.notified().await;
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: SYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+// Barrier: Tokio has no sync wait — .wait().await is the only way.
+// With 1 participant, the .await completes on first poll.
+async fn bench_barrier() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        for _ in 0..SYNC_OPS {
+            let barrier = Barrier::new(1);
+            barrier.wait().await;
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let start = Instant::now();
+        for _ in 0..SYNC_OPS {
+            let barrier = Barrier::new(1);
+            barrier.wait().await;
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: SYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
 }
 
 // ============================================================================
-// Main
+// TIER 2: CHANNEL FAST PATH (100K ops, single-thread, try_send/try_recv)
+// ============================================================================
+
+fn bench_channel_send() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_OPS);
+        for i in 0..CHANNEL_OPS {
+            tx.try_send(i as u64).unwrap();
+        }
+        for _ in 0..CHANNEL_OPS {
+            let _ = rx.try_recv();
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_OPS);
+        let start = Instant::now();
+        for i in 0..CHANNEL_OPS {
+            tx.try_send(i as u64).unwrap();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+        // Drain to avoid leak
+        for _ in 0..CHANNEL_OPS {
+            let _ = rx.try_recv();
+        }
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: CHANNEL_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_channel_recv() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_OPS);
+        for i in 0..CHANNEL_OPS {
+            tx.try_send(i as u64).unwrap();
+        }
+        for _ in 0..CHANNEL_OPS {
+            let _ = rx.try_recv();
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_OPS);
+        // Pre-fill channel
+        for i in 0..CHANNEL_OPS {
+            tx.try_send(i as u64).unwrap();
+        }
+        let start = Instant::now();
+        for _ in 0..CHANNEL_OPS {
+            let _ = rx.try_recv();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: CHANNEL_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_channel_roundtrip() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        let (tx, mut rx) = mpsc::channel(1);
+        for i in 0..CHANNEL_OPS {
+            tx.try_send(i as u64).unwrap();
+            let _ = rx.try_recv();
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let (tx, mut rx) = mpsc::channel(1);
+        let start = Instant::now();
+        for i in 0..CHANNEL_OPS {
+            tx.try_send(i as u64).unwrap();
+            let _ = rx.try_recv();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: CHANNEL_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_oneshot() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        for i in 0..CHANNEL_OPS {
+            let (tx, mut rx) = oneshot::channel::<u64>();
+            tx.send(i as u64).unwrap();
+            std::hint::black_box(rx.try_recv().unwrap());
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let start = Instant::now();
+        for i in 0..CHANNEL_OPS {
+            let (tx, mut rx) = oneshot::channel::<u64>();
+            tx.send(i as u64).unwrap();
+            std::hint::black_box(rx.try_recv().unwrap());
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: CHANNEL_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_broadcast() -> BenchResult {
+    let mut stats = Stats::new();
+    let num_receivers: usize = 4;
+
+    for _ in 0..WARMUP {
+        let (tx, _) = broadcast::channel(CHANNEL_OPS);
+        let mut receivers: Vec<_> = (0..num_receivers).map(|_| tx.subscribe()).collect();
+        for i in 0..CHANNEL_OPS {
+            let _ = tx.send(i as u64);
+        }
+        for rx in &mut receivers {
+            for _ in 0..CHANNEL_OPS {
+                let _ = rx.try_recv();
+            }
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let (tx, _) = broadcast::channel(CHANNEL_OPS);
+        let mut receivers: Vec<_> = (0..num_receivers).map(|_| tx.subscribe()).collect();
+        let start = Instant::now();
+        for i in 0..CHANNEL_OPS {
+            let _ = tx.send(i as u64);
+        }
+        for rx in &mut receivers {
+            for _ in 0..CHANNEL_OPS {
+                let _ = rx.try_recv();
+            }
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: CHANNEL_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+fn bench_watch() -> BenchResult {
+    let mut stats = Stats::new();
+
+    for _ in 0..WARMUP {
+        let (tx, rx) = watch::channel(0u64);
+        for i in 0..CHANNEL_OPS {
+            tx.send(i as u64).unwrap();
+            std::hint::black_box(*rx.borrow());
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let (tx, rx) = watch::channel(0u64);
+        let start = Instant::now();
+        for i in 0..CHANNEL_OPS {
+            tx.send(i as u64).unwrap();
+            std::hint::black_box(*rx.borrow());
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: CHANNEL_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+// ============================================================================
+// TIER 3: ASYNC MULTI-TASK (10K ops, runtime required, NO spin-wait)
+// ============================================================================
+
+// MPMC: 4 producers + 4 consumers on async runtime.
+// Channel capacity (1K) << total messages (10K) to force real backpressure.
+// Uses .send().await / .recv().await — no busy-spinning.
+async fn bench_channel_mpmc() -> BenchResult {
+    let mut stats = Stats::new();
+    let msgs_per_producer = ASYNC_OPS / MPMC_PRODUCERS;
+
+    for _ in 0..WARMUP {
+        run_mpmc_async(msgs_per_producer).await;
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        let start = Instant::now();
+        run_mpmc_async(msgs_per_producer).await;
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: ASYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+async fn run_mpmc_async(msgs_per_producer: usize) {
+    let (tx, rx) = async_channel::bounded(MPMC_BUFFER);
+    let mut handles = Vec::new();
+
+    // Spawn producers — each sends msgs_per_producer values via .await
+    for p in 0..MPMC_PRODUCERS {
+        let tx = tx.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..msgs_per_producer {
+                tx.send((p * msgs_per_producer + i) as u64)
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    drop(tx); // Channel closes when all producer clones are dropped
+
+    // Spawn consumers — each receives via .await until channel closes
+    for _ in 0..MPMC_CONSUMERS {
+        let rx = rx.clone();
+        handles.push(tokio::spawn(async move {
+            while rx.recv().await.is_ok() {}
+        }));
+    }
+    drop(rx);
+
+    // Wait for all tasks to complete
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
+// Contended Mutex: N tasks all lock().await the same mutex
+async fn bench_mutex_contended() -> BenchResult {
+    let mut stats = Stats::new();
+    let ops_per_task = ASYNC_OPS / CONTENDED_MUTEX_TASKS;
+
+    let mutex = Arc::new(Mutex::new(()));
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..WARMUP {
+        counter.store(0, Ordering::SeqCst);
+        let mut handles = Vec::new();
+        for _ in 0..CONTENDED_MUTEX_TASKS {
+            let mutex = mutex.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _guard = mutex.lock().await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        counter.store(0, Ordering::SeqCst);
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..CONTENDED_MUTEX_TASKS {
+            let mutex = mutex.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _guard = mutex.lock().await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: ASYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+// Contended RwLock: readers + writers contending via .await
+async fn bench_rwlock_contended() -> BenchResult {
+    let mut stats = Stats::new();
+    let total_tasks = CONTENDED_RWLOCK_READERS + CONTENDED_RWLOCK_WRITERS;
+    let ops_per_task = ASYNC_OPS / total_tasks;
+
+    let rwlock = Arc::new(RwLock::new(()));
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..WARMUP {
+        counter.store(0, Ordering::SeqCst);
+        let mut handles = Vec::new();
+        for _ in 0..CONTENDED_RWLOCK_READERS {
+            let rwlock = rwlock.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _guard = rwlock.read().await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for _ in 0..CONTENDED_RWLOCK_WRITERS {
+            let rwlock = rwlock.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _guard = rwlock.write().await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        counter.store(0, Ordering::SeqCst);
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..CONTENDED_RWLOCK_READERS {
+            let rwlock = rwlock.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _guard = rwlock.read().await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for _ in 0..CONTENDED_RWLOCK_WRITERS {
+            let rwlock = rwlock.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _guard = rwlock.write().await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: ASYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+// Contended Semaphore: many tasks, few permits, via .await
+async fn bench_semaphore_contended() -> BenchResult {
+    let mut stats = Stats::new();
+    let ops_per_task = ASYNC_OPS / CONTENDED_SEM_TASKS;
+
+    let sem = Arc::new(Semaphore::new(CONTENDED_SEM_PERMITS));
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..WARMUP {
+        counter.store(0, Ordering::SeqCst);
+        let mut handles = Vec::new();
+        for _ in 0..CONTENDED_SEM_TASKS {
+            let sem = sem.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _permit = sem.acquire().await.unwrap();
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    for _ in 0..ITERATIONS {
+        reset_alloc_counters();
+        counter.store(0, Ordering::SeqCst);
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..CONTENDED_SEM_TASKS {
+            let sem = sem.clone();
+            let counter = counter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _permit = sem.acquire().await.unwrap();
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        stats.add(start.elapsed().as_nanos() as u64);
+    }
+
+    BenchResult {
+        stats,
+        ops_per_iter: ASYNC_OPS,
+        total_bytes: get_alloc_bytes(),
+        total_allocs: get_alloc_count(),
+    }
+}
+
+// ============================================================================
+// OUTPUT
+// ============================================================================
+
+fn print_json_entry(name: &str, result: &BenchResult, is_last: bool) {
+    println!("    \"{}\": {{", name);
+    println!("      \"ns_per_op\": {:.2},", result.ns_per_op());
+    println!("      \"ops_per_sec\": {:.0},", result.ops_per_sec());
+    println!("      \"median_ns\": {},", result.stats.median_ns());
+    println!("      \"min_ns\": {},", result.stats.min_ns());
+    println!("      \"ops_per_iter\": {},", result.ops_per_iter);
+    println!("      \"bytes_per_op\": {:.2},", result.bytes_per_op());
+    println!("      \"allocs_per_op\": {:.4}", result.allocs_per_op());
+    if is_last {
+        println!("    }}");
+    } else {
+        println!("    }},");
+    }
+}
+
+fn print_row(name: &str, result: &BenchResult) {
+    println!(
+        "  {:<36} {:>8.1} ns/op  {:>16.0} ops/sec",
+        name,
+        result.ns_per_op(),
+        result.ops_per_sec()
+    );
+}
+
+// ============================================================================
+// MAIN
 // ============================================================================
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let json_mode = args.iter().any(|a| a == "--json");
+
+    // ── Tier 1: Sync fast path (no runtime) ──
+    let mutex = bench_mutex();
+    let rwlock_read = bench_rwlock_read();
+    let rwlock_write = bench_rwlock_write();
+    let semaphore = bench_semaphore();
+    let oncecell_get = bench_oncecell_get();
+    let oncecell_set = bench_oncecell_set();
+
+    // ── Tier 2: Channel fast path (no runtime) ──
+    let channel_send = bench_channel_send();
+    let channel_recv = bench_channel_recv();
+    let channel_roundtrip = bench_channel_roundtrip();
+    let oneshot_result = bench_oneshot();
+    let broadcast_result = bench_broadcast();
+    let watch_result = bench_watch();
+
+    // ── Tier 1 + 3: Needs Tokio runtime ──
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(NUM_WORKERS)
         .enable_all()
         .build()
         .unwrap();
 
-    rt.block_on(async {
-        run_benchmarks().await;
-    });
-}
+    // Tier 1 (need async context but complete immediately)
+    let notify = rt.block_on(bench_notify());
+    let barrier = rt.block_on(bench_barrier());
 
-async fn run_benchmarks() {
-    let mut output = JsonOutput::default();
-    output.benchmark_size = BENCHMARK_SIZE as u64;
-    output.iterations = ITERATIONS as u64;
-    output.warmup_iterations = WARMUP_ITERATIONS as u64;
-    output.num_workers = NUM_WORKERS as u64;
+    // Tier 3: Async multi-task
+    let channel_mpmc = rt.block_on(bench_channel_mpmc());
+    let mutex_contended = rt.block_on(bench_mutex_contended());
+    let rwlock_contended = rt.block_on(bench_rwlock_contended());
+    let semaphore_contended = rt.block_on(bench_semaphore_contended());
 
-    // Task spawn benchmark
-    output.spawn_ns = bench_task_spawn().await;
-    output.spawn_ops_per_sec = BENCHMARK_SIZE as f64 * 1_000_000_000.0 /
-        (output.spawn_ns * BENCHMARK_SIZE as f64);
+    if json_mode {
+        println!("{{");
+        println!("  \"metadata\": {{");
+        println!("    \"runtime\": \"tokio\",");
+        println!("    \"sync_ops\": {},", SYNC_OPS);
+        println!("    \"channel_ops\": {},", CHANNEL_OPS);
+        println!("    \"async_ops\": {},", ASYNC_OPS);
+        println!("    \"iterations\": {},", ITERATIONS);
+        println!("    \"warmup\": {},", WARMUP);
+        println!("    \"workers\": {},", NUM_WORKERS);
+        println!("    \"mpmc_buffer\": {},", MPMC_BUFFER);
+        println!(
+            "    \"methodology\": \"sync: try_*, channels: try_send/try_recv, async: tokio::spawn + .await\""
+        );
+        println!("  }},");
+        println!("  \"benchmarks\": {{");
 
-    // Batch spawn benchmark
-    output.spawn_batch_ns = bench_task_spawn_batch().await;
+        print_json_entry("mutex", &mutex, false);
+        print_json_entry("rwlock_read", &rwlock_read, false);
+        print_json_entry("rwlock_write", &rwlock_write, false);
+        print_json_entry("semaphore", &semaphore, false);
+        print_json_entry("oncecell_get", &oncecell_get, false);
+        print_json_entry("oncecell_set", &oncecell_set, false);
+        print_json_entry("notify", &notify, false);
+        print_json_entry("barrier", &barrier, false);
+        print_json_entry("channel_send", &channel_send, false);
+        print_json_entry("channel_recv", &channel_recv, false);
+        print_json_entry("channel_roundtrip", &channel_roundtrip, false);
+        print_json_entry("oneshot", &oneshot_result, false);
+        print_json_entry("broadcast", &broadcast_result, false);
+        print_json_entry("watch", &watch_result, false);
+        print_json_entry("channel_mpmc", &channel_mpmc, false);
+        print_json_entry("mutex_contended", &mutex_contended, false);
+        print_json_entry("rwlock_contended", &rwlock_contended, false);
+        print_json_entry("semaphore_contended", &semaphore_contended, true);
 
-    // Channel benchmarks
-    let (send_ns, recv_ns) = bench_channel_throughput().await;
-    output.channel_send_ns = send_ns;
-    output.channel_recv_ns = recv_ns;
-    output.channel_roundtrip_ns = bench_channel_roundtrip().await;
-    output.channel_mpmc_ns = bench_channel_mpmc().await;
-    output.oneshot_ns = bench_oneshot().await;
-    output.mpmc_lockfree_ns = bench_mpmc_lockfree().await;
-    output.message_throughput = CHANNEL_SIZE as f64 * 2.0 * 1_000_000_000.0 /
-        ((send_ns + recv_ns) * CHANNEL_SIZE as f64);
+        println!("  }}");
+        println!("}}");
+    } else {
+        println!();
+        println!("{}", "=".repeat(74));
+        println!("  Tokio Benchmark Suite");
+        println!("{}", "=".repeat(74));
+        println!(
+            "  Tiers: sync={}  channels={}  async={}",
+            SYNC_OPS, CHANNEL_OPS, ASYNC_OPS
+        );
+        println!(
+            "  Config: {} iters, {} warmup, {} workers",
+            ITERATIONS, WARMUP, NUM_WORKERS
+        );
+        println!(
+            "  Methodology: try_* (sync), try_send/recv (channels), spawn+await (async)"
+        );
+        println!();
 
-    // Synchronization benchmarks
-    output.mutex_ns = bench_mutex_uncontended().await;
-    output.mutex_contention_ns = bench_mutex_contention().await;
-    output.rwlock_read_ns = bench_rwlock_read().await;
-    output.rwlock_write_ns = bench_rwlock_write().await;
-    output.rwlock_contention_ns = bench_rwlock_contention().await;
-    output.semaphore_ns = bench_semaphore().await;
-    output.semaphore_contention_ns = bench_semaphore_contention().await;
-    output.barrier_ns = bench_barrier().await;
-    output.parker_ns = bench_parker().await;
-    output.notify_ns = bench_notify().await;
+        println!(
+            "  TIER 1: SYNC FAST PATH ({} ops, single-thread, try_*)",
+            SYNC_OPS
+        );
+        println!("  {}", "-".repeat(72));
+        print_row("Mutex try_lock/drop", &mutex);
+        print_row("RwLock try_read/drop", &rwlock_read);
+        print_row("RwLock try_write/drop", &rwlock_write);
+        print_row("Semaphore try_acquire/drop", &semaphore);
+        print_row("OnceCell get (initialized)", &oncecell_get);
+        print_row("OnceCell set (new each time)", &oncecell_set);
+        print_row("Notify signal+consume*", &notify);
+        print_row("Barrier wait (1 participant)*", &barrier);
+        println!("  * Tokio requires async for Notify/Barrier (no sync API)");
+        println!();
 
-    // Timer precision
-    output.timer_precision_ns = bench_timer_precision().await;
+        println!(
+            "  TIER 2: CHANNELS ({} ops, single-thread, try_send/try_recv)",
+            CHANNEL_OPS
+        );
+        println!("  {}", "-".repeat(72));
+        print_row("Channel send (fill buffer)", &channel_send);
+        print_row("Channel recv (drain buffer)", &channel_recv);
+        print_row("Channel roundtrip (cap=1)", &channel_roundtrip);
+        print_row("Oneshot create+send+recv", &oneshot_result);
+        print_row("Broadcast 1tx+4rx", &broadcast_result);
+        print_row("Watch send+borrow", &watch_result);
+        println!();
 
-    // Task throughput
-    output.task_throughput = bench_task_throughput().await;
+        println!(
+            "  TIER 3: ASYNC ({} ops, {} workers, spawn+await)",
+            ASYNC_OPS, NUM_WORKERS
+        );
+        println!("  {}", "-".repeat(72));
+        print_row(
+            &format!("MPMC {}P+{}C (buf={})", MPMC_PRODUCERS, MPMC_CONSUMERS, MPMC_BUFFER),
+            &channel_mpmc,
+        );
+        print_row(
+            &format!("Mutex contended ({} tasks)", CONTENDED_MUTEX_TASKS),
+            &mutex_contended,
+        );
+        print_row(
+            &format!(
+                "RwLock contended ({}R+{}W)",
+                CONTENDED_RWLOCK_READERS, CONTENDED_RWLOCK_WRITERS
+            ),
+            &rwlock_contended,
+        );
+        print_row(
+            &format!(
+                "Semaphore contended ({}T, {} permits)",
+                CONTENDED_SEM_TASKS, CONTENDED_SEM_PERMITS
+            ),
+            &semaphore_contended,
+        );
+        println!();
 
-    // Print JSON output
-    println!("{}", serde_json::to_string_pretty(&output).unwrap());
-}
-
-// ============================================================================
-// Task Spawn Benchmarks
-// ============================================================================
-
-async fn bench_task_spawn() -> f64 {
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-
-        // Spawn many tasks and await them
-        let mut handles = Vec::with_capacity(BENCHMARK_SIZE);
-        for i in 0..BENCHMARK_SIZE {
-            let handle = tokio::spawn(async move {
-                std::hint::black_box(i);
-            });
-            handles.push(handle);
-        }
-
-        // Wait for all to complete
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
+        println!("{}", "=".repeat(74));
+        println!("  Use --json for machine-readable output.");
+        println!("{}", "=".repeat(74));
+        println!();
     }
-
-    stats.ns_per_op(BENCHMARK_SIZE)
-}
-
-async fn bench_task_spawn_batch() -> f64 {
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-
-        // Spawn tasks in batches
-        let batch_size = 1000;
-        for _ in 0..(BENCHMARK_SIZE / batch_size) {
-            let mut handles = Vec::with_capacity(batch_size);
-            for i in 0..batch_size {
-                let handle = tokio::spawn(async move {
-                    std::hint::black_box(i);
-                });
-                handles.push(handle);
-            }
-            for handle in handles {
-                let _ = handle.await;
-            }
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(BENCHMARK_SIZE)
-}
-
-// ============================================================================
-// Channel Benchmarks
-// ============================================================================
-
-async fn bench_channel_throughput() -> (f64, f64) {
-    // Send benchmark
-    let send_ns = {
-        let mut stats = Stats::new();
-
-        for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-            let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
-
-            let start = Instant::now();
-
-            // Send all
-            for i in 0..CHANNEL_SIZE {
-                tx.send(i).await.unwrap();
-            }
-
-            let send_elapsed = start.elapsed().as_nanos() as u64;
-
-            // Drain
-            for _ in 0..CHANNEL_SIZE {
-                rx.recv().await;
-            }
-
-            if iter >= WARMUP_ITERATIONS {
-                stats.add(send_elapsed);
-            }
-        }
-
-        stats.ns_per_op(CHANNEL_SIZE)
-    };
-
-    // Recv benchmark
-    let recv_ns = {
-        let mut stats = Stats::new();
-
-        for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-            let (tx, mut rx) = mpsc::channel(CHANNEL_SIZE);
-
-            // Fill first
-            for i in 0..CHANNEL_SIZE {
-                tx.send(i).await.unwrap();
-            }
-
-            let start = Instant::now();
-
-            // Receive all
-            for _ in 0..CHANNEL_SIZE {
-                rx.recv().await;
-            }
-
-            let elapsed = start.elapsed().as_nanos() as u64;
-            if iter >= WARMUP_ITERATIONS {
-                stats.add(elapsed);
-            }
-        }
-
-        stats.ns_per_op(CHANNEL_SIZE)
-    };
-
-    (send_ns, recv_ns)
-}
-
-async fn bench_channel_roundtrip() -> f64 {
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let (tx, mut rx) = mpsc::channel(1);
-
-        let start = Instant::now();
-
-        for i in 0..CHANNEL_SIZE {
-            tx.send(i).await.unwrap();
-            rx.recv().await;
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(CHANNEL_SIZE)
-}
-
-async fn bench_channel_mpmc() -> f64 {
-    let mut stats = Stats::new();
-    let num_producers = 4;
-    let num_consumers = 4;
-    let messages_per_producer = CHANNEL_SIZE / num_producers;
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let (tx, rx) = async_channel::bounded(CHANNEL_SIZE);
-
-        let start = Instant::now();
-
-        // Spawn producers
-        let mut producer_handles = Vec::new();
-        for p in 0..num_producers {
-            let tx = tx.clone();
-            let handle = tokio::spawn(async move {
-                for i in 0..messages_per_producer {
-                    tx.send(p * messages_per_producer + i).await.unwrap();
-                }
-            });
-            producer_handles.push(handle);
-        }
-
-        // Spawn consumers
-        let counter = Arc::new(AtomicUsize::new(0));
-        let mut consumer_handles = Vec::new();
-        for _ in 0..num_consumers {
-            let rx = rx.clone();
-            let counter = counter.clone();
-            let handle = tokio::spawn(async move {
-                while let Ok(_msg) = rx.recv().await {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-            consumer_handles.push(handle);
-        }
-
-        // Wait for producers
-        for handle in producer_handles {
-            handle.await.unwrap();
-        }
-
-        // Close channel
-        drop(tx);
-
-        // Wait for consumers
-        for handle in consumer_handles {
-            handle.await.unwrap();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(CHANNEL_SIZE)
-}
-
-// ============================================================================
-// Synchronization Benchmarks
-// ============================================================================
-
-async fn bench_semaphore() -> f64 {
-    let sem = Arc::new(Semaphore::new(100));
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-
-        for _ in 0..BENCHMARK_SIZE {
-            let permit = sem.acquire().await.unwrap();
-            drop(permit);
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(BENCHMARK_SIZE)
-}
-
-async fn bench_mutex_uncontended() -> f64 {
-    let mutex = Arc::new(Mutex::new(0u64));
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-
-        for _ in 0..BENCHMARK_SIZE {
-            let mut guard = mutex.lock().await;
-            *guard += 1;
-            drop(guard);
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(BENCHMARK_SIZE)
-}
-
-async fn bench_mutex_contention() -> f64 {
-    let num_threads = 4;
-    let ops_per_thread = CHANNEL_SIZE / num_threads;  // Use smaller N for contention
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let mutex = Arc::new(Mutex::new(0u64));
-        let start = Instant::now();
-
-        let mut handles = Vec::new();
-        for _ in 0..num_threads {
-            let mutex = mutex.clone();
-            let handle = tokio::spawn(async move {
-                for _ in 0..ops_per_thread {
-                    let mut guard = mutex.lock().await;
-                    *guard += 1;
-                    drop(guard);
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(num_threads * ops_per_thread)
-}
-
-async fn bench_rwlock_read() -> f64 {
-    let lock = Arc::new(RwLock::new(0u64));
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-
-        for _ in 0..BENCHMARK_SIZE {
-            let guard = lock.read().await;
-            std::hint::black_box(*guard);
-            drop(guard);
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(BENCHMARK_SIZE)
-}
-
-async fn bench_rwlock_write() -> f64 {
-    let lock = Arc::new(RwLock::new(0u64));
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-
-        for _ in 0..BENCHMARK_SIZE {
-            let mut guard = lock.write().await;
-            *guard += 1;
-            drop(guard);
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(BENCHMARK_SIZE)
-}
-
-async fn bench_rwlock_contention() -> f64 {
-    // Mix of readers and writers contending
-    let num_readers = 4;
-    let num_writers = 2;
-    let ops_per_thread = CHANNEL_SIZE / (num_readers + num_writers);
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let lock = Arc::new(RwLock::new(0u64));
-        let start = Instant::now();
-
-        let mut handles = Vec::new();
-
-        // Spawn readers
-        for _ in 0..num_readers {
-            let lock = lock.clone();
-            let handle = tokio::spawn(async move {
-                for _ in 0..ops_per_thread {
-                    let guard = lock.read().await;
-                    std::hint::black_box(*guard);
-                    drop(guard);
-                }
-            });
-            handles.push(handle);
-        }
-
-        // Spawn writers
-        for _ in 0..num_writers {
-            let lock = lock.clone();
-            let handle = tokio::spawn(async move {
-                for _ in 0..ops_per_thread {
-                    let mut guard = lock.write().await;
-                    *guard += 1;
-                    drop(guard);
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op((num_readers + num_writers) * ops_per_thread)
-}
-
-async fn bench_semaphore_contention() -> f64 {
-    let num_threads = 8;
-    let permits = 2;
-    let ops_per_thread = CHANNEL_SIZE / num_threads;
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let sem = Arc::new(Semaphore::new(permits));
-        let start = Instant::now();
-
-        let mut handles = Vec::new();
-        for _ in 0..num_threads {
-            let sem = sem.clone();
-            let handle = tokio::spawn(async move {
-                for _ in 0..ops_per_thread {
-                    let permit = sem.acquire().await.unwrap();
-                    std::hint::black_box(&permit);
-                    drop(permit);
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(num_threads * ops_per_thread)
-}
-
-async fn bench_barrier() -> f64 {
-    let num_threads = 4;
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let barrier = Arc::new(Barrier::new(num_threads));
-        let start = Instant::now();
-
-        let mut handles = Vec::new();
-        for _ in 0..num_threads {
-            let barrier = barrier.clone();
-            let handle = tokio::spawn(async move {
-                barrier.wait().await;
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    // Total time for one barrier synchronization
-    stats.avg_ns() as f64
-}
-
-async fn bench_parker() -> f64 {
-    // Use thread::park/unpark for comparison (std parking)
-    // Tokio doesn't have a direct equivalent, so we use Notify for single-thread wake
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-
-        for _ in 0..BENCHMARK_SIZE {
-            let notify = Notify::new();
-            // Immediately notify (no waiter) - measures notify overhead
-            notify.notify_one();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(BENCHMARK_SIZE)
-}
-
-async fn bench_notify() -> f64 {
-    let num_threads = 4;
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let notify = Arc::new(Notify::new());
-        let woken = Arc::new(AtomicUsize::new(0));
-        let start = Instant::now();
-
-        let mut handles = Vec::new();
-        for _ in 0..num_threads {
-            let notify = notify.clone();
-            let woken = woken.clone();
-            let handle = tokio::spawn(async move {
-                notify.notified().await;
-                woken.fetch_add(1, Ordering::Relaxed);
-            });
-            handles.push(handle);
-        }
-
-        // Give threads time to enter wait
-        tokio::time::sleep(Duration::from_micros(100)).await;
-
-        // Wake all
-        notify.notify_waiters();
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    // Total time for notify_waiters
-    stats.avg_ns() as f64
-}
-
-async fn bench_oneshot() -> f64 {
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-
-        for i in 0..BENCHMARK_SIZE {
-            let (tx, rx) = oneshot::channel();
-            tx.send(i).unwrap();
-            let _ = rx.await.unwrap();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(BENCHMARK_SIZE)
-}
-
-async fn bench_mpmc_lockfree() -> f64 {
-    // async_channel is already lock-free MPMC
-    // This is same as channel_mpmc but single-threaded
-    let mut stats = Stats::new();
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let (tx, rx) = async_channel::bounded(CHANNEL_SIZE);
-        let start = Instant::now();
-
-        for i in 0..CHANNEL_SIZE {
-            tx.send(i).await.unwrap();
-        }
-
-        for _ in 0..CHANNEL_SIZE {
-            let _ = rx.recv().await.unwrap();
-        }
-
-        let elapsed = start.elapsed().as_nanos() as u64;
-        if iter >= WARMUP_ITERATIONS {
-            stats.add(elapsed);
-        }
-    }
-
-    stats.ns_per_op(CHANNEL_SIZE)
-}
-
-// ============================================================================
-// Timer Benchmarks
-// ============================================================================
-
-async fn bench_timer_precision() -> f64 {
-    let mut stats = Stats::new();
-    let target = Duration::from_millis(1);
-
-    for iter in 0..(WARMUP_ITERATIONS + ITERATIONS) {
-        let start = Instant::now();
-        tokio::time::sleep(target).await;
-        let elapsed = start.elapsed();
-
-        if iter >= WARMUP_ITERATIONS {
-            let drift = if elapsed > target {
-                (elapsed - target).as_nanos() as u64
-            } else {
-                (target - elapsed).as_nanos() as u64
-            };
-            stats.add(drift);
-        }
-    }
-
-    stats.avg_ns() as f64
-}
-
-// ============================================================================
-// Throughput Benchmarks
-// ============================================================================
-
-async fn bench_task_throughput() -> f64 {
-    let counter = Arc::new(AtomicUsize::new(0));
-    let duration = Duration::from_millis(100);
-
-    let start = Instant::now();
-    let mut handles = Vec::new();
-
-    // Spawn tasks that increment counter
-    while start.elapsed() < duration {
-        let counter = counter.clone();
-        let handle = tokio::spawn(async move {
-            counter.fetch_add(1, Ordering::Relaxed);
-        });
-        handles.push(handle);
-
-        // Yield occasionally to not overwhelm
-        if handles.len() % 1000 == 0 {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    // Wait for all tasks
-    for handle in handles {
-        let _ = handle.await;
-    }
-
-    let total_tasks = counter.load(Ordering::Relaxed);
-    let elapsed_secs = start.elapsed().as_secs_f64();
-
-    total_tasks as f64 / elapsed_secs
 }

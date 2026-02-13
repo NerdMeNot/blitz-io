@@ -1,303 +1,166 @@
 //! Mutex - Async Mutual Exclusion
 //!
 //! An async-aware mutex that allows tasks to wait for exclusive access.
-//! Unlike std.Thread.Mutex, this mutex yields to the scheduler when contended
-//! rather than blocking the thread.
+//! For blocking mutex, use `std.Thread.Mutex` from the standard library.
 //!
 //! ## Usage
 //!
 //! ```zig
 //! var mutex = Mutex.init();
 //!
-//! // Simple blocking lock (uses unified Waiter, works in both task and thread context)
-//! mutex.lockBlocking();
-//! defer mutex.unlock();
-//! // Critical section
-//!
-//! // Try to lock without waiting
+//! // Try to lock without waiting (non-blocking)
 //! if (mutex.tryLock()) {
 //!     defer mutex.unlock();
 //!     // Critical section
 //! }
 //!
-//! // Async lock (with waiter) - for custom wait handling
+//! // Async lock with waiter (for use with runtime)
 //! var waiter = Mutex.Waiter.init();
-//! if (!mutex.lock(&waiter)) {
-//!     // Yield task, wait for notification
+//! if (!mutex.lockWait(&waiter)) {
+//!     // Waiter added to queue - yield to scheduler
+//!     // When woken, waiter.isAcquired() will be true
 //! }
 //! defer mutex.unlock();
-//! // Critical section
 //! ```
 //!
 //! ## Design
 //!
-//! - Built on top of a binary semaphore (1 permit)
-//! - FIFO ordering for fairness
-//! - Batch waking after releasing lock
-//! - `lockBlocking()` uses the unified Waiter for proper yielding/blocking
+//! Built on Semaphore(1). All correctness flows through the Semaphore's
+//! proven algorithm (permits go directly to waiters, no starvation).
 //!
-//! Reference: tokio/src/sync/mutex.rs
 
 const std = @import("std");
 
-const LinkedList = @import("../util/linked_list.zig").LinkedList;
-const Pointers = @import("../util/linked_list.zig").Pointers;
-const WakeList = @import("../util/wake_list.zig").WakeList;
-const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+const semaphore_mod = @import("Semaphore.zig");
+const Semaphore = semaphore_mod.Semaphore;
+const SemaphoreWaiter = semaphore_mod.Waiter;
+const InvocationId = @import("../internal/util/invocation_id.zig").InvocationId;
 
-// Unified waiter for the simple blocking API
-const unified_waiter = @import("waiter.zig");
-const UnifiedWaiter = unified_waiter.Waiter;
+// Future system imports
+const future_mod = @import("../future.zig");
+const Waker = future_mod.Waker;
+const Context = future_mod.Context;
+const PollResult = future_mod.PollResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A waiter for mutex lock acquisition.
+/// Thin wrapper around Semaphore.Waiter with 1 permit.
 pub const Waiter = struct {
-    /// Waker to invoke when lock is granted
-    waker: ?WakerFn = null,
-    waker_ctx: ?*anyopaque = null,
-
-    /// Whether lock has been acquired (atomic for cross-thread visibility)
-    acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Intrusive list pointers
-    pointers: Pointers(Waiter) = .{},
-
-    /// Debug-mode invocation tracking (detects use-after-free)
-    invocation: InvocationId = .{},
+    inner: SemaphoreWaiter,
 
     const Self = @This();
 
     pub fn init() Self {
-        return .{};
+        return .{ .inner = SemaphoreWaiter.init(1) };
+    }
+
+    /// Create a waiter with waker already configured.
+    pub fn initWithWaker(ctx: *anyopaque, wake_fn: WakerFn) Self {
+        return .{ .inner = SemaphoreWaiter.initWithWaker(1, ctx, wake_fn) };
     }
 
     /// Set the waker for this waiter
     pub fn setWaker(self: *Self, ctx: *anyopaque, wake_fn: WakerFn) void {
-        self.waker_ctx = ctx;
-        self.waker = wake_fn;
+        self.inner.setWaker(ctx, wake_fn);
     }
 
-    /// Wake this waiter
-    pub fn wake(self: *Self) void {
-        if (self.waker) |wf| {
-            if (self.waker_ctx) |ctx| {
-                wf(ctx);
-            }
-        }
+    /// Check if the waiter is ready (lock was acquired).
+    pub fn isReady(self: *const Self) bool {
+        return self.inner.isReady();
     }
 
-    /// Check if lock was acquired (uses seq_cst for cross-thread visibility)
-    pub fn isAcquired(self: *const Self) bool {
-        return self.acquired.load(.seq_cst);
-    }
+    /// Check if lock was acquired (alias for isReady).
+    pub const isAcquired = isReady;
 
     /// Get invocation token (for debug tracking)
     pub fn token(self: *const Self) InvocationId.Id {
-        return self.invocation.get();
+        return self.inner.token();
     }
 
     /// Verify invocation token matches (debug mode)
     pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
-        self.invocation.verify(tok);
+        self.inner.verifyToken(tok);
     }
 
     /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.acquired.store(false, .seq_cst);
-        self.waker = null;
-        self.waker_ctx = null;
-        self.pointers.reset();
-        self.invocation.bump();
+        self.inner.reset();
     }
 };
 
 /// Function pointer type for waking
 pub const WakerFn = *const fn (*anyopaque) void;
 
-/// Intrusive list of waiters
-const WaiterList = LinkedList(Waiter, "pointers");
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Mutex
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// An async-aware mutex.
+/// An async-aware mutex. Built on Semaphore(1).
 pub const Mutex = struct {
-    /// Whether the mutex is currently locked
-    locked: std.atomic.Value(bool),
-
-    /// Mutex protecting the waiters list
-    wait_lock: std.Thread.Mutex,
-
-    /// Waiters list (FIFO for fairness)
-    waiters: WaiterList,
+    sem: Semaphore,
 
     const Self = @This();
 
     /// Create a new unlocked mutex.
     pub fn init() Self {
-        return .{
-            .locked = std.atomic.Value(bool).init(false),
-            .wait_lock = .{},
-            .waiters = .{},
-        };
+        return .{ .sem = Semaphore.init(1) };
     }
 
     /// Try to acquire the lock without waiting.
     /// Returns true if lock was acquired, false otherwise.
     pub fn tryLock(self: *Self) bool {
-        return self.locked.cmpxchgStrong(false, true, .seq_cst, .seq_cst) == null;
+        return self.sem.tryAcquire(1);
     }
 
-    /// Acquire the lock, potentially waiting.
+    /// Low-level: Acquire the lock with explicit waiter.
     /// Returns true if lock was acquired immediately.
     /// Returns false if the waiter was added to the queue (task should yield).
-    ///
-    /// The waiter must be kept alive until acquired or cancelled.
-    pub fn lock(self: *Self, waiter: *Waiter) bool {
-        // Fast path: try to acquire without lock
-        if (self.tryLock()) {
-            waiter.acquired.store(true, .seq_cst);
-            return true;
-        }
-
-        // Slow path: add to waiters list
-        self.wait_lock.lock();
-
-        // Re-check under lock
-        if (self.locked.cmpxchgStrong(false, true, .seq_cst, .seq_cst) == null) {
-            self.wait_lock.unlock();
-            waiter.acquired.store(true, .seq_cst);
-            return true;
-        }
-
-        // Add to waiters list
-        waiter.acquired.store(false, .seq_cst);
-        self.waiters.pushBack(waiter);
-
-        self.wait_lock.unlock();
-
-        return false;
+    pub fn lockWait(self: *Self, waiter: *Waiter) bool {
+        return self.sem.acquireWait(&waiter.inner);
     }
 
     /// Release the lock.
-    /// If there are waiters, grants the lock to the first one.
     pub fn unlock(self: *Self) void {
-        // Copy waker info before setting acquired, because once acquired is set,
-        // the waiting thread may destroy the waiter (use-after-free race).
-        var waker_fn: ?WakerFn = null;
-        var waker_ctx: ?*anyopaque = null;
-
-        self.wait_lock.lock();
-
-        // Check for waiters
-        if (self.waiters.popFront()) |waiter| {
-            // Copy waker BEFORE setting acquired
-            waker_fn = waiter.waker;
-            waker_ctx = waiter.waker_ctx;
-
-            // Grant lock to waiter (don't change locked state)
-            // WARNING: After this line, waiter may be freed by the waiting thread!
-            waiter.acquired.store(true, .seq_cst);
-        } else {
-            // No waiters - unlock
-            self.locked.store(false, .seq_cst);
-        }
-
-        self.wait_lock.unlock();
-
-        // Wake outside lock using copied function pointers (safe even if waiter is freed)
-        if (waker_fn) |wf| {
-            if (waker_ctx) |ctx| {
-                wf(ctx);
-            }
-        }
+        self.sem.release(1);
     }
 
     /// Cancel a lock acquisition.
     pub fn cancelLock(self: *Self, waiter: *Waiter) void {
-        // Quick check if already acquired
-        if (waiter.isAcquired()) {
-            return;
-        }
-
-        self.wait_lock.lock();
-
-        // Check again under lock
-        if (waiter.isAcquired()) {
-            self.wait_lock.unlock();
-            return;
-        }
-
-        // Remove from list if linked
-        if (WaiterList.isLinked(waiter) or self.waiters.front() == waiter) {
-            self.waiters.remove(waiter);
-            waiter.pointers.reset();
-        }
-
-        self.wait_lock.unlock();
-    }
-
-    /// Blocking lock acquisition.
-    /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
-    /// This is the simplest API for acquiring the lock - NO SPIN WAITING.
-    ///
-    /// Example:
-    /// ```zig
-    /// mutex.lockBlocking();
-    /// defer mutex.unlock();
-    /// // Critical section
-    /// ```
-    pub fn lockBlocking(self: *Self) void {
-        // Fast path: try to acquire without waiting
-        if (self.tryLock()) {
-            return;
-        }
-
-        // Slow path: use unified waiter
-        var waiter = Waiter.init();
-
-        // Set up waker bridge to unified waiter
-        var unified = UnifiedWaiter.init();
-        const WakerBridge = struct {
-            fn wake(ctx: *anyopaque) void {
-                const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
-                uw.notify();
-            }
-        };
-        waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
-
-        self.wait_lock.lock();
-
-        // Re-check under lock
-        if (self.locked.cmpxchgStrong(false, true, .seq_cst, .seq_cst) == null) {
-            self.wait_lock.unlock();
-            return;
-        }
-
-        // Add to waiters list
-        waiter.acquired.store(false, .seq_cst);
-        self.waiters.pushBack(&waiter);
-
-        self.wait_lock.unlock();
-
-        // Wait until notified - this yields in task context, blocks in thread context
-        unified.wait();
+        self.sem.cancelAcquire(&waiter.inner);
     }
 
     /// Check if locked (for debugging).
     pub fn isLocked(self: *const Self) bool {
-        return self.locked.load(.seq_cst);
+        return self.sem.availablePermits() == 0;
     }
 
     /// Get number of waiters (for debugging).
     pub fn waiterCount(self: *Self) usize {
-        self.wait_lock.lock();
-        defer self.wait_lock.unlock();
-        return self.waiters.count();
+        return self.sem.waiterCount();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Async API
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Acquire the lock. Returns a `LockFuture` that resolves when acquired.
+    pub fn lock(self: *Self) LockFuture {
+        return LockFuture.init(self);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Guard Convenience Methods
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Try to lock and return a guard if successful (non-blocking).
+    pub fn tryLockGuard(self: *Self) ?MutexGuard {
+        if (self.tryLock()) {
+            return MutexGuard.init(self);
+        }
+        return null;
     }
 };
 
@@ -334,6 +197,48 @@ pub const MutexGuard = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LockFuture - Async lock acquisition
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A future that resolves when the mutex lock is acquired.
+/// Wraps Semaphore's AcquireFuture for 1 permit.
+pub const LockFuture = struct {
+    const Self = @This();
+
+    /// Output type for Future trait
+    pub const Output = void;
+
+    /// The underlying acquire future
+    acquire_future: semaphore_mod.AcquireFuture,
+
+    /// Reference to the mutex (for cancel/diagnostics)
+    mutex: *Mutex,
+
+    /// Initialize a new lock future
+    pub fn init(mutex: *Mutex) Self {
+        return .{
+            .acquire_future = mutex.sem.acquire(1),
+            .mutex = mutex,
+        };
+    }
+
+    /// Poll the future - implements Future trait
+    pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
+        return self.acquire_future.poll(ctx);
+    }
+
+    /// Cancel the lock acquisition
+    pub fn cancel(self: *Self) void {
+        self.acquire_future.cancel();
+    }
+
+    /// Deinit the future
+    pub fn deinit(self: *Self) void {
+        self.acquire_future.deinit();
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -355,9 +260,10 @@ test "Mutex - tryLock fails when locked" {
 
     mutex.unlock();
     try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
 }
 
-test "Mutex - lock and unlock" {
+test "Mutex - lock and unlock with waiter" {
     var mutex = Mutex.init();
     var woken = false;
 
@@ -370,17 +276,17 @@ test "Mutex - lock and unlock" {
 
     // First lock succeeds immediately
     var waiter1 = Waiter.init();
-    try std.testing.expect(mutex.lock(&waiter1));
+    try std.testing.expect(mutex.lockWait(&waiter1));
     try std.testing.expect(waiter1.isAcquired());
 
     // Second lock should wait
     var waiter2 = Waiter.init();
     waiter2.setWaker(@ptrCast(&woken), TestWaker.wake);
-    try std.testing.expect(!mutex.lock(&waiter2));
+    try std.testing.expect(!mutex.lockWait(&waiter2));
     try std.testing.expect(!waiter2.isAcquired());
     try std.testing.expectEqual(@as(usize, 1), mutex.waiterCount());
 
-    // Unlock grants to waiter2
+    // Unlock grants to waiter2 and calls waker
     mutex.unlock();
     try std.testing.expect(waiter2.isAcquired());
     try std.testing.expect(woken);
@@ -401,7 +307,7 @@ test "Mutex - FIFO ordering" {
     var waiters: [3]Waiter = undefined;
     for (&waiters) |*w| {
         w.* = Waiter.init();
-        _ = mutex.lock(w);
+        _ = mutex.lockWait(w);
     }
 
     try std.testing.expectEqual(@as(usize, 3), mutex.waiterCount());
@@ -430,7 +336,7 @@ test "Mutex - cancel removes waiter" {
 
     // Add waiter
     var waiter = Waiter.init();
-    _ = mutex.lock(&waiter);
+    _ = mutex.lockWait(&waiter);
     try std.testing.expectEqual(@as(usize, 1), mutex.waiterCount());
 
     // Cancel
@@ -440,6 +346,32 @@ test "Mutex - cancel removes waiter" {
     // Unlock should succeed with no waiters
     mutex.unlock();
     try std.testing.expect(!mutex.isLocked());
+}
+
+test "Mutex - tryLockGuard success" {
+    var mutex = Mutex.init();
+
+    if (mutex.tryLockGuard()) |g| {
+        var guard = g;
+        defer guard.deinit();
+        try std.testing.expect(mutex.isLocked());
+    } else {
+        try std.testing.expect(false); // Should have succeeded
+    }
+
+    try std.testing.expect(!mutex.isLocked());
+}
+
+test "Mutex - tryLockGuard failure" {
+    var mutex = Mutex.init();
+
+    // Lock the mutex
+    try std.testing.expect(mutex.tryLock());
+
+    // tryLockGuard should fail
+    try std.testing.expect(mutex.tryLockGuard() == null);
+
+    mutex.unlock();
 }
 
 test "Mutex - guard RAII" {
@@ -456,55 +388,201 @@ test "Mutex - guard RAII" {
     try std.testing.expect(!mutex.isLocked());
 }
 
-test "Mutex - lockBlocking simple" {
+test "Mutex.Waiter - initWithWaker convenience" {
     var mutex = Mutex.init();
+    var woken = false;
 
-    // First lock should succeed immediately
-    mutex.lockBlocking();
-    try std.testing.expect(mutex.isLocked());
+    const TestWaker = struct {
+        fn wake(ctx: *anyopaque) void {
+            const w: *bool = @ptrCast(@alignCast(ctx));
+            w.* = true;
+        }
+    };
+
+    // Lock the mutex first
+    try std.testing.expect(mutex.tryLock());
+
+    // Create waiter with initWithWaker (fewer steps than init + setWaker)
+    var waiter = Waiter.initWithWaker(@ptrCast(&woken), TestWaker.wake);
+    try std.testing.expect(!mutex.lockWait(&waiter));
+    try std.testing.expect(!waiter.isReady()); // Using isReady (unified API)
+    try std.testing.expect(!waiter.isAcquired()); // Alias still works
+
+    // Unlock grants to waiter
+    mutex.unlock();
+    try std.testing.expect(waiter.isReady());
+    try std.testing.expect(woken);
 
     mutex.unlock();
-    try std.testing.expect(!mutex.isLocked());
+}
 
-    // Second lock should also work
-    mutex.lockBlocking();
+test "Mutex.Waiter - isReady is alias for isAcquired" {
+    var mutex = Mutex.init();
+    var waiter = Waiter.init();
+
+    // Both should return false initially
+    try std.testing.expect(!waiter.isReady());
+    try std.testing.expect(!waiter.isAcquired());
+
+    // Lock should set acquired
+    try std.testing.expect(mutex.lockWait(&waiter));
+
+    // Both should return true
+    try std.testing.expect(waiter.isReady());
+    try std.testing.expect(waiter.isAcquired());
+
+    mutex.unlock();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LockFuture Tests (Async API)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test "LockFuture - immediate acquisition" {
+    var mutex = Mutex.init();
+
+    // Create future and poll - should acquire immediately
+    var future = mutex.lock();
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isReady());
     try std.testing.expect(mutex.isLocked());
 
     mutex.unlock();
     try std.testing.expect(!mutex.isLocked());
 }
 
-test "Mutex - lockBlocking with contention" {
+test "LockFuture - waits when contended" {
     var mutex = Mutex.init();
-    var counter: u32 = 0;
-    var done = std.atomic.Value(bool).init(false);
+    var waker_called = false;
+
+    // Create a test waker that tracks calls
+    const TestWaker = struct {
+        called: *bool,
+
+        fn wake(data: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(data));
+            self.called.* = true;
+        }
+
+        fn clone(data: *anyopaque) future_mod.RawWaker {
+            return .{ .data = data, .vtable = &vtable };
+        }
+
+        fn drop(_: *anyopaque) void {}
+
+        const vtable = future_mod.RawWaker.VTable{
+            .wake = wake,
+            .wake_by_ref = wake,
+            .clone = clone,
+            .drop = drop,
+        };
+
+        fn toWaker(self: *@This()) Waker {
+            return .{ .raw = .{ .data = @ptrCast(self), .vtable = &vtable } };
+        }
+    };
+
+    var test_waker = TestWaker{ .called = &waker_called };
+    const waker = test_waker.toWaker();
+
+    // Lock the mutex first
+    try std.testing.expect(mutex.tryLock());
+
+    // Create future - first poll should return pending
+    var future = mutex.lock();
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &waker };
+    const result1 = future.poll(&ctx);
+
+    try std.testing.expect(result1.isPending());
+    try std.testing.expect(!waker_called);
+    try std.testing.expectEqual(@as(usize, 1), mutex.waiterCount());
+
+    // Unlock - should wake the future
+    mutex.unlock();
+    try std.testing.expect(waker_called);
+
+    // Second poll should return ready
+    const result2 = future.poll(&ctx);
+    try std.testing.expect(result2.isReady());
+    try std.testing.expect(mutex.isLocked()); // Still locked by future
+
+    mutex.unlock();
+}
+
+test "LockFuture - cancel removes from queue" {
+    var mutex = Mutex.init();
 
     // Lock the mutex
-    mutex.lockBlocking();
+    try std.testing.expect(mutex.tryLock());
 
-    // Start a thread that will try to lock
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(m: *Mutex, c: *u32, d: *std.atomic.Value(bool)) void {
-            m.lockBlocking(); // Should block until main thread unlocks
-            c.* += 1;
-            m.unlock();
-            d.store(true, .release);
-        }
-    }.run, .{ &mutex, &counter, &done });
+    // Create future and poll to add to queue
+    var future = mutex.lock();
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
 
-    // Give the thread time to start and block
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    try std.testing.expect(result.isPending());
+    try std.testing.expectEqual(@as(usize, 1), mutex.waiterCount());
 
-    // Counter should still be 0 (thread is blocked)
-    try std.testing.expectEqual(@as(u32, 0), counter);
+    // Cancel
+    future.cancel();
+    try std.testing.expectEqual(@as(usize, 0), mutex.waiterCount());
 
-    // Unlock - this should wake the other thread
+    // Clean up
+    future.deinit();
     mutex.unlock();
+}
 
-    // Wait for the thread to finish
-    thread.join();
+test "LockFuture - multiple waiters FIFO" {
+    var mutex = Mutex.init();
 
-    // Now counter should be 1
-    try std.testing.expectEqual(@as(u32, 1), counter);
-    try std.testing.expect(done.load(.acquire));
+    // Lock the mutex
+    try std.testing.expect(mutex.tryLock());
+
+    // Create multiple futures
+    var future1 = mutex.lock();
+    var future2 = mutex.lock();
+    var future3 = mutex.lock();
+
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+
+    // All should return pending
+    try std.testing.expect(future1.poll(&ctx).isPending());
+    try std.testing.expect(future2.poll(&ctx).isPending());
+    try std.testing.expect(future3.poll(&ctx).isPending());
+
+    try std.testing.expectEqual(@as(usize, 3), mutex.waiterCount());
+
+    // Unlock - future1 should be ready
+    mutex.unlock();
+    try std.testing.expect(future1.poll(&ctx).isReady());
+    try std.testing.expect(future2.poll(&ctx).isPending());
+    try std.testing.expect(future3.poll(&ctx).isPending());
+
+    // Unlock - future2 should be ready
+    mutex.unlock();
+    try std.testing.expect(future2.poll(&ctx).isReady());
+    try std.testing.expect(future3.poll(&ctx).isPending());
+
+    // Unlock - future3 should be ready
+    mutex.unlock();
+    try std.testing.expect(future3.poll(&ctx).isReady());
+
+    // Final unlock
+    mutex.unlock();
+    try std.testing.expect(!mutex.isLocked());
+
+    future1.deinit();
+    future2.deinit();
+    future3.deinit();
+}
+
+test "LockFuture - is valid Future type" {
+    try std.testing.expect(future_mod.isFuture(LockFuture));
+    try std.testing.expect(LockFuture.Output == void);
 }

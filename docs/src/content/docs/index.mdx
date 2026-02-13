@@ -1,0 +1,242 @@
+---
+title: Introduction
+description: blitz-io is a high-performance async I/O runtime for Zig, inspired by Tokio. Lightweight tasks, serious throughput.
+template: splash
+hero:
+  tagline: Tokio-style async I/O for Zig. Lightweight tasks, serious throughput.
+  actions:
+    - text: Get Started
+      link: /getting-started/installation/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/NerdMeNot/blitz-io
+      icon: external
+---
+
+import { Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## What is blitz-io?
+
+blitz-io is a **production-grade async I/O runtime** for Zig. It provides a work-stealing scheduler, zero-allocation synchronization primitives, structured channels, networking, and timers -- everything needed to build high-concurrency servers and services.
+
+It is the I/O counterpart to [Blitz](https://github.com/NerdMeNot/blitz) (CPU parallelism), analogous to how Tokio complements Rayon in the Rust ecosystem.
+
+```zig
+const io = @import("blitz-io");
+
+pub fn main() !void {
+    try io.run(serve);
+}
+
+fn serve() void {
+    var listener = io.net.listen("0.0.0.0:8080") catch return;
+    defer listener.close();
+    while (listener.tryAccept() catch null) |conn| {
+        _ = io.task.spawn(echo, .{conn.stream}) catch continue;
+    }
+}
+
+fn echo(stream: io.net.TcpStream) void {
+    var s = stream;
+    defer s.close();
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = s.tryRead(&buf) catch return orelse continue;
+        if (n == 0) return;
+        s.writeAll(buf[0..n]) catch return;
+    }
+}
+```
+
+---
+
+## Key Features
+
+<CardGrid stagger>
+  <Card title="Work-Stealing Scheduler" icon="rocket">
+    Lock-free 256-slot ring buffer with LIFO slot, cooperative budgeting (128 polls/tick), and O(1) bitmap worker waking via `@ctz`. Adapts scheduling frequency to actual task duration with EWMA tracking.
+  </Card>
+
+  <Card title="Zero-Allocation Sync" icon="puzzle">
+    Mutex, RwLock, Semaphore, Barrier, Notify, OnceCell -- all with intrusive waiters embedded directly in futures. No heap allocation per contended wait. Every primitive offers both `tryX()` (non-blocking) and `x()` (Future-based) APIs.
+  </Card>
+
+  <Card title="Structured Channels" icon="list-format">
+    MPSC/MPMC (Vyukov lock-free), Oneshot, Broadcast, Watch, and Select. Bounded channels provide backpressure. 50 B/op average vs 1348 B/op in Tokio.
+  </Card>
+
+  <Card title="Platform-Optimized I/O" icon="laptop">
+    io_uring on Linux, kqueue on macOS, IOCP on Windows, epoll as fallback -- auto-detected at startup. TCP, UDP, and Unix domain sockets with convenience APIs.
+  </Card>
+
+  <Card title="Timers & Timeouts" icon="seti:clock">
+    Nanosecond-precision Duration and Instant types. Hierarchical timer wheel, async Sleep, recurring Interval, and Deadline/Timeout combinators.
+  </Card>
+
+  <Card title="Stackless Futures" icon="seti:zig">
+    Each task is a state machine at ~256-512 bytes, not a full coroutine stack at 16-64KB. This enables millions of concurrent tasks with predictable memory usage.
+  </Card>
+</CardGrid>
+
+---
+
+## Why blitz-io?
+
+### Compared to Other Zig Async Options
+
+| Feature | blitz-io | [zio](https://github.com/lalinsky/zio) | Raw std.posix | Zig async (future) |
+|---------|----------|-----|---------------|---------------------|
+| Work-stealing scheduler | Yes (Tokio-style) | Multi-threaded scheduler | No | TBD |
+| Sync primitives | 6 types, zero-alloc | Yes, incl. channels | None | TBD |
+| Channels | 4 types + Select | Yes | None | TBD |
+| Platform backends | io_uring, kqueue, IOCP, epoll | io_uring, kqueue, IOCP, epoll | Manual | TBD |
+| Cooperative budgeting | Yes (128 polls/tick) | No | N/A | TBD |
+| Blocking pool | Yes (auto-scaling, 512 threads) | No | Manual | TBD |
+| Graceful shutdown | Built-in signal handling | Cancellation support | Manual | TBD |
+| Coroutine model | Stackless (~256-512 B/task) | Stackful (growable stacks) | N/A | TBD |
+
+### Battle-Tested Design
+
+blitz-io's architecture is ported from Tokio, the Rust async runtime with years of production edge-case fixes. Every scheduler optimization, every synchronization primitive, every platform-specific workaround has been studied and adapted for Zig's semantics.
+
+### Two-Tier API
+
+Every async primitive provides two access patterns:
+
+```zig
+// Non-blocking: returns immediately
+if (mutex.tryLock()) {
+    defer mutex.unlock();
+    // critical section
+}
+
+// Async: returns a Future for the scheduler
+var lock_future = mutex.lock();
+const handle = try io.task.spawnFuture(lock_future);
+```
+
+This lets you choose the right tool: `tryX()` for hot paths where blocking is unacceptable, and the Future-based API when you can yield to the scheduler.
+
+---
+
+## Module Overview
+
+| Module | Description |
+|--------|-------------|
+| `io.task` | Task spawning: `spawn`, `spawnFuture`, `spawnBlocking`, `joinAll`, `race`, `select` |
+| `io.sync` | Synchronization: Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell |
+| `io.channel` | Message passing: Channel, Oneshot, Broadcast, Watch, Selector |
+| `io.net` | Networking: TCP, UDP, Unix sockets, DNS resolution |
+| `io.fs` | Filesystem operations |
+| `io.stream` | I/O streams: Reader, Writer, buffered I/O |
+| `io.time` | Duration, Instant, Sleep, Interval, Deadline |
+| `io.signal` | Signal handling (SIGINT, SIGTERM) |
+| `io.process` | Process spawning and piped I/O |
+| `io.shutdown` | Graceful shutdown coordination |
+| `io.async_ops` | Future combinators: Timeout, Select2, Join2, Race |
+| `io.future` | Low-level future types: Poll, Waker, Context, Compose |
+
+---
+
+## Benchmark Highlights
+
+All measurements on Apple M3, nanoseconds per operation.
+
+### blitz-io vs Tokio (Rust)
+
+<Tabs>
+  <TabItem label="Channels">
+    | Benchmark | blitz-io | Tokio | Speedup |
+    |-----------|----------|-------|---------|
+    | Channel send | 2.7 ns | 5.8 ns | 2.2x |
+    | Channel recv | 6.1 ns | 9.7 ns | 1.6x |
+    | Channel roundtrip | 6.3 ns | 12.5 ns | 2.0x |
+    | Oneshot | 3.9 ns | 15.4 ns | 3.9x |
+    | Broadcast (4 recv) | 22.2 ns | 48.7 ns | 2.2x |
+    | Watch | 13.1 ns | 43.7 ns | 3.3x |
+  </TabItem>
+  <TabItem label="Coordination">
+    | Benchmark | blitz-io | Tokio | Speedup |
+    |-----------|----------|-------|---------|
+    | OnceCell get | 0.4 ns | 0.5 ns | 1.1x |
+    | OnceCell set | 9.5 ns | 30.4 ns | 3.2x |
+    | Barrier (8 tasks) | 15.4 ns | 368.6 ns | 23.9x |
+    | Notify | 9.7 ns | 9.4 ns | Tie |
+  </TabItem>
+  <TabItem label="Synchronization">
+    | Benchmark | blitz-io | Tokio | Speedup |
+    |-----------|----------|-------|---------|
+    | Mutex (uncontended) | 6.6 ns | 7.8 ns | 1.2x |
+    | RwLock read | 6.8 ns | 7.9 ns | 1.2x |
+    | RwLock write | 6.6 ns | 8.0 ns | 1.2x |
+    | Semaphore | 6.5 ns | 7.5 ns | 1.2x |
+    | Semaphore contended (8T) | 77.5 ns | 127.7 ns | 1.6x |
+  </TabItem>
+</Tabs>
+
+**Overall: blitz-io wins 14/18 benchmarks.** Memory efficiency: 50 B/op average vs Tokio's 1348 B/op -- **27x less memory** per operation.
+
+---
+
+## Architecture at a Glance
+
+```
++------------------------------------------------------------------+
+|                       User Application                           |
+|             io.run(fn) / Runtime.init() + rt.run()               |
++------------------------------------------------------------------+
+                              |
++------------------------------------------------------------------+
+|                        Public API                                |
+|  io.task    io.sync    io.channel    io.net    io.fs    io.time  |
+|  io.signal  io.process io.shutdown   io.stream io.async_ops     |
++------------------------------------------------------------------+
+                              |
++------------------------------------------------------------------+
+|                     Runtime Core                                 |
+|  +------------------+  +---------------+  +------------------+   |
+|  |    Scheduler     |  |   I/O Driver  |  |   Timer Wheel    |   |
+|  | - LIFO slot      |  | - Submit ops  |  | - Hierarchical   |   |
+|  | - Local queue    |  | - Poll events |  | - Tick-based     |   |
+|  |   (256-slot ring)|  | - Complete    |  | - Cancel support |   |
+|  | - Global inject  |  +---------------+  +------------------+   |
+|  | - Work stealing  |                                            |
+|  | - Coop budget    |  +--------------------------------------+  |
+|  |   (128 polls)    |  |          Blocking Pool               |  |
+|  +------------------+  |  Auto-scaling up to 512 threads      |  |
+|                        +--------------------------------------+  |
++------------------------------------------------------------------+
+                              |
++------------------------------------------------------------------+
+|                    Platform Backend                               |
+|  +----------+  +----------+  +----------+  +----------+         |
+|  | io_uring |  |  kqueue  |  |   IOCP   |  |  epoll   |         |
+|  | (Linux)  |  | (macOS)  |  | (Windows)|  |(fallback)|         |
+|  +----------+  +----------+  +----------+  +----------+         |
++------------------------------------------------------------------+
+```
+
+---
+
+## Next Steps
+
+<CardGrid>
+  <Card title="Installation" icon="setting">
+    Add blitz-io to your project in under a minute.
+
+    [Install now](/getting-started/installation/)
+  </Card>
+
+  <Card title="Quick Start" icon="rocket">
+    Build a TCP echo server in 30 lines.
+
+    [Get started](/getting-started/quick-start/)
+  </Card>
+
+  <Card title="Basic Concepts" icon="open-book">
+    Understand futures, the runtime, and cooperative scheduling.
+
+    [Learn the model](/getting-started/basic-concepts/)
+  </Card>
+</CardGrid>

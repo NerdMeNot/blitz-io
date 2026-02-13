@@ -21,7 +21,7 @@ pub fn main() !void {
     std.debug.print("If the inner future doesn't complete in time, .timeout is returned.\n\n", .{});
 
     std.debug.print("Example pattern:\n", .{});
-    std.debug.print("  var timeout = io.Timeout(AcceptFuture).init(\n", .{});
+    std.debug.print("  var timeout = io.async_ops.Timeout(AcceptFuture).init(\n", .{});
     std.debug.print("      listener.accept(),\n", .{});
     std.debug.print("      io.Duration.fromSecs(30),\n", .{});
     std.debug.print("  );\n", .{});
@@ -39,7 +39,7 @@ pub fn main() !void {
     std.debug.print("Great for graceful shutdown patterns.\n\n", .{});
 
     std.debug.print("Example pattern:\n", .{});
-    std.debug.print("  var select = io.Select2(AcceptFuture, ShutdownFuture).init(\n", .{});
+    std.debug.print("  var select = io.async_ops.Select2(AcceptFuture, ShutdownFuture).init(\n", .{});
     std.debug.print("      listener.accept(),\n", .{});
     std.debug.print("      shutdown.future(),\n", .{});
     std.debug.print("  );\n", .{});
@@ -57,7 +57,7 @@ pub fn main() !void {
     std.debug.print("Perfect for parallel data fetching.\n\n", .{});
 
     std.debug.print("Example pattern:\n", .{});
-    std.debug.print("  var join = io.Join2(UserFuture, PostsFuture).init(\n", .{});
+    std.debug.print("  var join = io.async_ops.Join2(UserFuture, PostsFuture).init(\n", .{});
     std.debug.print("      fetchUser(id),\n", .{});
     std.debug.print("      fetchPosts(id),\n", .{});
     std.debug.print("  );\n", .{});
@@ -78,20 +78,20 @@ pub fn main() !void {
 
     std.debug.print("Example: Parallel fetch with timeout\n", .{});
     std.debug.print("  // Join two fetches\n", .{});
-    std.debug.print("  var join = io.Join2(UserFuture, PostsFuture).init(...);\n", .{});
+    std.debug.print("  var join = io.async_ops.Join2(UserFuture, PostsFuture).init(...);\n", .{});
     std.debug.print("  \n", .{});
     std.debug.print("  // Wrap with timeout\n", .{});
-    std.debug.print("  var timeout = io.Timeout(@TypeOf(join)).init(\n", .{});
+    std.debug.print("  var timeout = io.async_ops.Timeout(@TypeOf(join)).init(\n", .{});
     std.debug.print("      join,\n", .{});
     std.debug.print("      io.Duration.fromSecs(5),\n", .{});
     std.debug.print("  );\n\n", .{});
 
     std.debug.print("Example: Accept with shutdown and timeout\n", .{});
     std.debug.print("  // First, race accept against shutdown\n", .{});
-    std.debug.print("  var select = io.Select2(AcceptFuture, ShutdownFuture).init(...);\n", .{});
+    std.debug.print("  var select = io.async_ops.Select2(AcceptFuture, ShutdownFuture).init(...);\n", .{});
     std.debug.print("  \n", .{});
     std.debug.print("  // Then wrap with timeout\n", .{});
-    std.debug.print("  var timeout = io.Timeout(@TypeOf(select)).init(\n", .{});
+    std.debug.print("  var timeout = io.async_ops.Timeout(@TypeOf(select)).init(\n", .{});
     std.debug.print("      select,\n", .{});
     std.debug.print("      io.Duration.fromSecs(30),\n", .{});
     std.debug.print("  );\n\n", .{});
@@ -120,7 +120,7 @@ pub fn main() !void {
     // Test Timeout
     std.debug.print("Testing Timeout with immediate completion...\n", .{});
     const future1 = MockFuture.init(42, 0);
-    var timeout1 = io.Timeout(MockFuture).init(future1, io.Duration.fromSecs(10));
+    var timeout1 = io.async_ops.Timeout(MockFuture).init(future1, io.Duration.fromSecs(10));
     const result1 = timeout1.poll(.{});
     std.debug.print("  Result: {}\n", .{result1});
 
@@ -128,7 +128,7 @@ pub fn main() !void {
     std.debug.print("Testing Join2 with two futures...\n", .{});
     const f1 = MockFuture.init(1, 0);
     const f2 = MockFuture.init(2, 0);
-    var join = io.Join2(MockFuture, MockFuture).init(f1, f2);
+    var join = io.async_ops.Join2(MockFuture, MockFuture).init(f1, f2);
     const result2 = join.poll(.{});
     std.debug.print("  Result: {}\n", .{result2});
 
@@ -136,7 +136,7 @@ pub fn main() !void {
     std.debug.print("Testing Select2 with two futures...\n", .{});
     const s1 = MockFuture.init(10, 1); // Takes 1 poll
     const s2 = MockFuture.init(20, 0); // Ready immediately
-    var select = io.Select2(MockFuture, MockFuture).init(s1, s2);
+    var select = io.async_ops.Select2(MockFuture, MockFuture).init(s1, s2);
     const result3 = select.poll(.{});
     std.debug.print("  Result: {} (second completed first)\n", .{result3});
 

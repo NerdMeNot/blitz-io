@@ -20,24 +20,26 @@
 //! - Other callers wait until INITIALIZED
 //! - Value is stored inline (no allocation)
 //!
-//! Reference: tokio/src/sync/once_cell.rs
+
 
 const std = @import("std");
 
-const LinkedList = @import("../util/linked_list.zig").LinkedList;
-const Pointers = @import("../util/linked_list.zig").Pointers;
-const WakeList = @import("../util/wake_list.zig").WakeList;
-const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("../internal/util/linked_list.zig").Pointers;
+const WakeList = @import("../internal/util/wake_list.zig").WakeList;
+const InvocationId = @import("../internal/util/invocation_id.zig").InvocationId;
 
-// Unified waiter for the simple blocking API
-const unified_waiter = @import("waiter.zig");
-const UnifiedWaiter = unified_waiter.Waiter;
+// Future system imports
+const future_mod = @import("../future.zig");
+const Waker = future_mod.Waker;
+const Context = future_mod.Context;
+const PollResult = future_mod.PollResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────────────────────────────────
 
-const State = enum(u8) {
+pub const State = enum(u8) {
     empty,
     initializing,
     initialized,
@@ -66,6 +68,15 @@ pub const InitWaiter = struct {
         return .{};
     }
 
+    /// Create a waiter with waker already configured.
+    /// Reduces the 3-step ceremony (init + setWaker + getOrInitWith) to 2 steps.
+    pub fn initWithWaker(ctx: *anyopaque, wake_fn: WakerFn) Self {
+        return .{
+            .waker_ctx = ctx,
+            .waker = wake_fn,
+        };
+    }
+
     pub fn setWaker(self: *Self, ctx: *anyopaque, wake_fn: WakerFn) void {
         self.waker_ctx = ctx;
         self.waker = wake_fn;
@@ -79,9 +90,14 @@ pub const InitWaiter = struct {
         }
     }
 
-    pub fn isComplete(self: *const Self) bool {
-        return self.complete.load(.seq_cst);
+    /// Check if the waiter is ready (initialization completed).
+    /// This is the unified completion check method across all sync primitives.
+    pub fn isReady(self: *const Self) bool {
+        return self.complete.load(.acquire);
     }
+
+    /// Check if initialization is complete (alias for isReady).
+    pub const isComplete = isReady;
 
     /// Get invocation token (for debug tracking)
     pub fn token(self: *const Self) InvocationId.Id {
@@ -95,7 +111,7 @@ pub const InitWaiter = struct {
 
     /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.complete.store(false, .seq_cst);
+        self.complete.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -152,8 +168,9 @@ pub fn OnceCell(comptime T: type) type {
         }
 
         /// Check if initialized.
+        /// Uses acquire ordering to synchronize-with the release in completeInit().
         pub fn isInitialized(self: *const Self) bool {
-            return @as(State, @enumFromInt(self.state.load(.seq_cst))) == .initialized;
+            return @as(State, @enumFromInt(self.state.load(.acquire))) == .initialized;
         }
 
         /// Get the value if initialized.
@@ -175,11 +192,12 @@ pub fn OnceCell(comptime T: type) type {
         /// Try to set the value. Returns false if already initialized.
         pub fn set(self: *Self, value: T) bool {
             // Try to transition EMPTY -> INITIALIZING
+            // acq_rel: acquire on read to see any prior writes, release on success
             const result = self.state.cmpxchgStrong(
                 @intFromEnum(State.empty),
                 @intFromEnum(State.initializing),
-                .seq_cst,
-                .seq_cst,
+                .acq_rel,
+                .acquire,
             );
 
             if (result != null) {
@@ -196,78 +214,18 @@ pub fn OnceCell(comptime T: type) type {
             return true;
         }
 
-        /// Get the value, initializing with the provided function if needed.
-        /// The init function is only called by the first caller.
-        pub fn getOrInit(self: *Self, comptime init_fn: fn () T) *T {
-            // Fast path: already initialized
-            if (self.isInitialized()) {
-                return &self.value;
-            }
-
-            // Try to become the initializer
-            const result = self.state.cmpxchgStrong(
-                @intFromEnum(State.empty),
-                @intFromEnum(State.initializing),
-                .seq_cst,
-                .seq_cst,
-            );
-
-            if (result == null) {
-                // We won - initialize
-                self.value = init_fn();
-                self.completeInit();
-                return &self.value;
-            }
-
-            // Someone else is initializing - wait
-            self.waitForInit();
-            return &self.value;
-        }
-
-        /// Get the value, initializing with the provided function if needed.
-        /// This version takes a context argument.
-        pub fn getOrInitCtx(
-            self: *Self,
-            comptime Ctx: type,
-            ctx: Ctx,
-            comptime init_fn: fn (Ctx) T,
-        ) *T {
-            // Fast path: already initialized
-            if (self.isInitialized()) {
-                return &self.value;
-            }
-
-            // Try to become the initializer
-            const result = self.state.cmpxchgStrong(
-                @intFromEnum(State.empty),
-                @intFromEnum(State.initializing),
-                .seq_cst,
-                .seq_cst,
-            );
-
-            if (result == null) {
-                // We won - initialize
-                self.value = init_fn(ctx);
-                self.completeInit();
-                return &self.value;
-            }
-
-            // Someone else is initializing - wait
-            self.waitForInit();
-            return &self.value;
-        }
-
-        /// Async version: get or init, potentially waiting.
+        /// Get or init with a waiter (low-level waiter API).
         /// Returns the value if already initialized or if we initialize it.
         /// Returns null if we need to wait (waiter added to queue).
-        pub fn getOrInitAsync(
+        /// For the async Future API, use `getOrInit(fn)` instead.
+        pub fn getOrInitWith(
             self: *Self,
             comptime init_fn: fn () T,
             waiter: *InitWaiter,
         ) ?*T {
             // Fast path: already initialized
             if (self.isInitialized()) {
-                waiter.complete.store(true, .seq_cst);
+                waiter.complete.store(true, .release);
                 return &self.value;
             }
 
@@ -275,21 +233,21 @@ pub fn OnceCell(comptime T: type) type {
             const result = self.state.cmpxchgStrong(
                 @intFromEnum(State.empty),
                 @intFromEnum(State.initializing),
-                .seq_cst,
-                .seq_cst,
+                .acq_rel,
+                .acquire,
             );
 
             if (result == null) {
                 // We won - initialize
                 self.value = init_fn();
                 self.completeInit();
-                waiter.complete.store(true, .seq_cst);
+                waiter.complete.store(true, .release);
                 return &self.value;
             }
 
             // Check if already initialized (race between cmpxchg and now)
             if (self.isInitialized()) {
-                waiter.complete.store(true, .seq_cst);
+                waiter.complete.store(true, .release);
                 return &self.value;
             }
 
@@ -299,11 +257,11 @@ pub fn OnceCell(comptime T: type) type {
             // Re-check under lock
             if (self.isInitialized()) {
                 self.mutex.unlock();
-                waiter.complete.store(true, .seq_cst);
+                waiter.complete.store(true, .release);
                 return &self.value;
             }
 
-            waiter.complete.store(false, .seq_cst);
+            waiter.complete.store(false, .release);
             self.waiters.pushBack(waiter);
             self.mutex.unlock();
 
@@ -335,15 +293,15 @@ pub fn OnceCell(comptime T: type) type {
 
             self.mutex.lock();
 
-            // Set to initialized
-            self.state.store(@intFromEnum(State.initialized), .seq_cst);
+            // Set to initialized - release ordering so readers see the value
+            self.state.store(@intFromEnum(State.initialized), .release);
 
             // Wake all waiters
             // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
             while (self.waiters.popFront()) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.complete.store(true, .seq_cst);
+                w.complete.store(true, .release);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         wake_list.push(.{ .context = ctx, .wake_fn = wf });
@@ -356,41 +314,180 @@ pub fn OnceCell(comptime T: type) type {
             wake_list.wakeAll();
         }
 
-        /// Wait for initialization to complete (blocking).
-        /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
-        fn waitForInit(self: *Self) void {
-            // Fast path: already initialized
-            if (self.isInitialized()) {
-                return;
-            }
+        // ═══════════════════════════════════════════════════════════════════════
+        // Async API
+        // ═══════════════════════════════════════════════════════════════════════
 
-            // Set up waiter with unified waiter bridge
-            var waiter = InitWaiter.init();
-            var unified = UnifiedWaiter.init();
-            const WakerBridge = struct {
-                fn wake(ctx: *anyopaque) void {
-                    const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
-                    uw.notify();
-                }
+        /// Get or initialize the value.
+        ///
+        /// Returns a `GetOrInitFuture` that resolves to a pointer to the value.
+        /// This integrates with the scheduler for true async behavior - the task
+        /// will be suspended (not spin-waiting) until initialization is complete.
+        ///
+        /// ## Example
+        ///
+        /// ```zig
+        /// var future = cell.getOrInit(initExpensiveResource);
+        /// // Poll through your runtime...
+        /// // When future.poll() returns .ready, you have the value pointer
+        /// const value = result.ready;
+        /// ```
+        pub fn getOrInit(self: *Self, comptime init_fn: fn () T) GetOrInitFuture(T, init_fn) {
+            return GetOrInitFuture(T, init_fn).init(self);
+        }
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GetOrInitFuture - Async initialization
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A future that resolves when the OnceCell is initialized.
+///
+/// This integrates with the scheduler's Future system for true async behavior.
+/// The task will be suspended (not spin-waiting or blocking) until initialization
+/// is complete.
+///
+/// ## Usage
+///
+/// ```zig
+/// var future = cell.getOrInit(initExpensiveResource);
+/// // ... poll the future through your runtime ...
+/// // When ready, you have a pointer to the initialized value
+/// const value = result.ready;
+/// ```
+pub fn GetOrInitFuture(comptime T: type, comptime init_fn: fn () T) type {
+    return struct {
+        const Self = @This();
+
+        /// Output type for Future trait
+        pub const Output = *T;
+
+        /// Reference to the cell we're initializing
+        cell: *OnceCell(T),
+
+        /// Our waiter node (embedded to avoid allocation)
+        waiter: InitWaiter,
+
+        /// State machine for the future
+        state: FutureState,
+
+        /// Stored waker for when we're woken by initialization completion
+        stored_waker: ?Waker,
+
+        const FutureState = enum {
+            /// Haven't tried to get/init yet
+            init,
+            /// Waiting for initialization to complete
+            waiting,
+            /// Value is ready
+            ready,
+        };
+
+        /// Initialize a new get-or-init future
+        pub fn init(cell: *OnceCell(T)) Self {
+            return .{
+                .cell = cell,
+                .waiter = InitWaiter.init(),
+                .state = .init,
+                .stored_waker = null,
             };
-            waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+        }
 
-            self.mutex.lock();
+        /// Poll the future - implements Future trait
+        ///
+        /// Returns `.pending` if initialization not yet complete (task will be woken when ready).
+        /// Returns `.{ .ready = value_ptr }` when value is available.
+        pub fn poll(self: *Self, ctx: *Context) PollResult(*T) {
+            switch (self.state) {
+                .init => {
+                    // First poll - try to get or initialize
+                    // Store the waker so we can be woken when initialization completes
+                    self.stored_waker = ctx.getWaker().clone();
 
-            // Re-check under lock
-            if (self.isInitialized()) {
-                self.mutex.unlock();
-                return;
+                    // Set up the waiter's callback to wake us via our stored waker
+                    self.waiter.setWaker(@ptrCast(self), wakeCallback);
+
+                    // Try to get or initialize
+                    if (self.cell.getOrInitWith(init_fn, &self.waiter)) |value_ptr| {
+                        // Got it immediately (already initialized or we initialized it)
+                        self.state = .ready;
+                        // Clean up stored waker since we don't need it
+                        if (self.stored_waker) |*w| {
+                            w.deinit();
+                            self.stored_waker = null;
+                        }
+                        return .{ .ready = value_ptr };
+                    } else {
+                        // Added to wait queue - will be woken when init complete
+                        self.state = .waiting;
+                        return .pending;
+                    }
+                },
+
+                .waiting => {
+                    // Check if initialization is complete
+                    if (self.waiter.isComplete()) {
+                        self.state = .ready;
+                        // Clean up stored waker
+                        if (self.stored_waker) |*w| {
+                            w.deinit();
+                            self.stored_waker = null;
+                        }
+                        return .{ .ready = self.cell.get().? };
+                    }
+
+                    // Not yet - update waker in case it changed (task migration)
+                    const new_waker = ctx.getWaker();
+                    if (self.stored_waker) |*old| {
+                        if (!old.willWakeSame(new_waker)) {
+                            old.deinit();
+                            self.stored_waker = new_waker.clone();
+                        }
+                    } else {
+                        self.stored_waker = new_waker.clone();
+                    }
+
+                    return .pending;
+                },
+
+                .ready => {
+                    // Already have the value
+                    return .{ .ready = self.cell.get().? };
+                },
             }
+        }
 
-            // Add to waiters list
-            waiter.complete.store(false, .seq_cst);
-            self.waiters.pushBack(&waiter);
+        /// Cancel the initialization wait
+        ///
+        /// If initialization hasn't completed yet, removes us from the wait queue.
+        /// If already ready, this is a no-op.
+        pub fn cancel(self: *Self) void {
+            if (self.state == .waiting) {
+                self.cell.cancelWait(&self.waiter);
+            }
+            // Clean up stored waker
+            if (self.stored_waker) |*w| {
+                w.deinit();
+                self.stored_waker = null;
+            }
+        }
 
-            self.mutex.unlock();
+        /// Deinit the future
+        ///
+        /// If waiting, cancels the wait.
+        pub fn deinit(self: *Self) void {
+            self.cancel();
+        }
 
-            // Wait until notified - yields in task context, blocks in thread context
-            unified.wait();
+        /// Callback invoked when initialization completes
+        /// This bridges the OnceCell's WakerFn to the Future's Waker
+        fn wakeCallback(ctx_ptr: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx_ptr));
+            if (self.stored_waker) |*w| {
+                // Wake the task through the Future system's Waker
+                w.wakeByRef();
+            }
         }
     };
 }
@@ -428,26 +525,6 @@ test "OnceCell - set once" {
     try std.testing.expectEqual(@as(u32, 42), cell.get().?.*);
 }
 
-test "OnceCell - getOrInit" {
-    var cell = OnceCell(u32).init();
-    defer cell.deinit();
-
-    const initFn = struct {
-        fn f() u32 {
-            return 42;
-        }
-    }.f;
-
-    // First call initializes
-    const val1 = cell.getOrInit(initFn);
-    try std.testing.expectEqual(@as(u32, 42), val1.*);
-
-    // Second call gets same value (doesn't reinitialize)
-    const val2 = cell.getOrInit(initFn);
-    try std.testing.expectEqual(@as(u32, 42), val2.*);
-    try std.testing.expect(val1 == val2); // Same pointer
-}
-
 test "OnceCell - async wait" {
     var cell = OnceCell(u32).init();
     defer cell.deinit();
@@ -478,7 +555,7 @@ test "OnceCell - async wait" {
         }
     }.f;
 
-    const result = cell.getOrInitAsync(initFn, &waiter);
+    const result = cell.getOrInitWith(initFn, &waiter);
     try std.testing.expect(result == null); // Should wait
 
     // Complete initialization
@@ -490,16 +567,167 @@ test "OnceCell - async wait" {
     try std.testing.expectEqual(@as(u32, 42), cell.get().?.*);
 }
 
-test "OnceCell - getOrInitCtx" {
+// ─────────────────────────────────────────────────────────────────────────────
+// GetOrInitFuture Tests (Async API)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test "GetOrInitFuture - immediate initialization" {
     var cell = OnceCell(u32).init();
     defer cell.deinit();
 
     const initFn = struct {
-        fn f(multiplier: u32) u32 {
-            return 10 * multiplier;
+        fn f() u32 {
+            return 42;
         }
     }.f;
 
-    const val = cell.getOrInitCtx(u32, 5, initFn);
-    try std.testing.expectEqual(@as(u32, 50), val.*);
+    // Create future and poll - should initialize and return immediately
+    var future = cell.getOrInit(initFn);
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isReady());
+    try std.testing.expectEqual(@as(u32, 42), result.ready.*);
+    try std.testing.expect(cell.isInitialized());
+}
+
+test "GetOrInitFuture - already initialized" {
+    var cell = OnceCell(u32).initWith(99);
+    defer cell.deinit();
+
+    const initFn = struct {
+        fn f() u32 {
+            return 42; // Should not be called
+        }
+    }.f;
+
+    // Create future and poll - should return existing value immediately
+    var future = cell.getOrInit(initFn);
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isReady());
+    try std.testing.expectEqual(@as(u32, 99), result.ready.*);
+}
+
+test "GetOrInitFuture - waits for initialization" {
+    var cell = OnceCell(u32).init();
+    defer cell.deinit();
+    var waker_called = false;
+
+    // Create a test waker that tracks calls
+    const TestWaker = struct {
+        called: *bool,
+
+        fn wake(data: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(data));
+            self.called.* = true;
+        }
+
+        fn clone(data: *anyopaque) future_mod.RawWaker {
+            return .{ .data = data, .vtable = &vtable };
+        }
+
+        fn drop(_: *anyopaque) void {}
+
+        const vtable = future_mod.RawWaker.VTable{
+            .wake = wake,
+            .wake_by_ref = wake,
+            .clone = clone,
+            .drop = drop,
+        };
+
+        fn toWaker(self: *@This()) Waker {
+            return .{ .raw = .{ .data = @ptrCast(self), .vtable = &vtable } };
+        }
+    };
+
+    var test_waker = TestWaker{ .called = &waker_called };
+    const waker = test_waker.toWaker();
+
+    // Simulate another task initializing (set state to initializing)
+    _ = cell.state.cmpxchgStrong(
+        @intFromEnum(State.empty),
+        @intFromEnum(State.initializing),
+        .acq_rel,
+        .acquire,
+    );
+
+    const initFn = struct {
+        fn f() u32 {
+            return 42;
+        }
+    }.f;
+
+    // Create future - first poll should return pending
+    var future = cell.getOrInit(initFn);
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &waker };
+    const result1 = future.poll(&ctx);
+
+    try std.testing.expect(result1.isPending());
+    try std.testing.expect(!waker_called);
+
+    // Complete initialization
+    cell.value = 77;
+    cell.completeInit();
+    try std.testing.expect(waker_called);
+
+    // Second poll should return ready
+    const result2 = future.poll(&ctx);
+    try std.testing.expect(result2.isReady());
+    try std.testing.expectEqual(@as(u32, 77), result2.ready.*);
+}
+
+test "GetOrInitFuture - cancel removes from queue" {
+    var cell = OnceCell(u32).init();
+    defer cell.deinit();
+
+    // Simulate another task initializing
+    _ = cell.state.cmpxchgStrong(
+        @intFromEnum(State.empty),
+        @intFromEnum(State.initializing),
+        .acq_rel,
+        .acquire,
+    );
+
+    const initFn = struct {
+        fn f() u32 {
+            return 42;
+        }
+    }.f;
+
+    // Create future and poll to add to queue
+    var future = cell.getOrInit(initFn);
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isPending());
+
+    // Cancel
+    future.cancel();
+
+    // Clean up
+    future.deinit();
+
+    // Complete initialization anyway (for cleanup)
+    cell.value = 42;
+    cell.completeInit();
+}
+
+test "GetOrInitFuture - is valid Future type" {
+    const initFn = struct {
+        fn f() u32 {
+            return 42;
+        }
+    }.f;
+
+    const FutureType = GetOrInitFuture(u32, initFn);
+    try std.testing.expect(future_mod.isFuture(FutureType));
+    try std.testing.expect(FutureType.Output == *u32);
 }

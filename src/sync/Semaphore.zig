@@ -2,81 +2,98 @@
 //!
 //! A counting semaphore that limits concurrent access to a resource.
 //! Tasks can acquire permits (decrement) and release permits (increment).
+//! For blocking semaphore, use std.Thread.Semaphore from the standard library.
 //!
 //! ## Usage
 //!
 //! ```zig
 //! var sem = Semaphore.init(3);  // Allow 3 concurrent accessors
 //!
-//! // Simple blocking acquire (recommended)
-//! sem.acquireBlocking(1);
-//! defer sem.release(1);
-//! // Limited concurrency section
-//!
-//! // Try to acquire without waiting
+//! // Try to acquire without waiting (non-blocking)
 //! if (sem.tryAcquire(1)) {
 //!     defer sem.release(1);
 //!     // Got permit
 //! }
 //!
-//! // Advanced: manual waiter for custom wait handling
+//! // Async acquire with waiter
 //! var waiter = Semaphore.Waiter.init(1);
-//! if (!sem.acquire(&waiter)) {
-//!     // ... yield task, wait for notification ...
+//! if (!sem.acquireWait(&waiter)) {
+//!     // Yield to scheduler, wait for notification
 //! }
 //! defer sem.release(1);
 //! ```
 //!
 //! ## Design
 //!
-//! - Waiters stored in FIFO queue for fairness
-//! - Batch waking after releasing lock
-//! - Supports acquiring/releasing multiple permits at once
-//! - `acquireBlocking()` uses the unified Waiter for proper yielding/blocking
+//! Batch semaphore algorithm with direct-handoff to prevent starvation:
 //!
-//! Reference: tokio/src/sync/semaphore.rs
+//! - tryAcquire: lock-free CAS loop (no mutex)
+//! - release: ALWAYS takes the mutex, serves waiters directly from the
+//!   release amount, only surplus goes to the atomic. No separate
+//!   waiter_count -- queue emptiness checked under lock.
+//! - acquireWait: lock-free CAS fast path for full acquisition. If
+//!   insufficient permits, locks the mutex BEFORE the CAS that drains
+//!   remaining permits. This eliminates the release-before-queue race.
+//!
+//! Key invariant: permits NEVER float in the atomic when waiters are
+//! queued. release() serves waiters directly, surplus to atomic.
+//! This prevents starvation and missed wakeups.
 
 const std = @import("std");
 
-const LinkedList = @import("../util/linked_list.zig").LinkedList;
-const Pointers = @import("../util/linked_list.zig").Pointers;
-const WakeList = @import("../util/wake_list.zig").WakeList;
-const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("../internal/util/linked_list.zig").Pointers;
+const InvocationId = @import("../internal/util/invocation_id.zig").InvocationId;
+const WakeList = @import("../internal/util/wake_list.zig").DefaultWakeList;
 
-// Unified waiter for the simple blocking API
-const unified_waiter = @import("waiter.zig");
-const UnifiedWaiter = unified_waiter.Waiter;
+// Future system imports
+const future_mod = @import("../future.zig");
+const FutureWaker = future_mod.Waker;
+const Context = future_mod.Context;
+const PollResult = future_mod.PollResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A waiter for semaphore permits.
+///
+/// The `state` field tracks remaining permits needed (starts at requested,
+/// decrements to 0). Completion is when state == 0.
 pub const Waiter = struct {
-    /// Number of permits requested
-    permits: usize,
+    /// Remaining permits needed. Starts at `permits_requested`, decremented
+    /// by assignPermits(). When 0, the waiter is satisfied.
+    state: std.atomic.Value(usize),
 
-    /// Number of permits acquired so far
-    acquired: usize = 0,
+    /// Original number of permits requested (for cancellation math)
+    permits_requested: usize,
 
     /// Waker to invoke when permits are granted
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
 
-    /// Whether acquisition is complete (atomic for cross-thread visibility)
-    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
     /// Intrusive list pointers
     pointers: Pointers(Waiter) = .{},
 
-    /// Debug-mode invocation tracking (detects use-after-free)
+    /// Debug-mode invocation tracking
     invocation: InvocationId = .{},
 
     const Self = @This();
 
     pub fn init(permits: usize) Self {
         return .{
-            .permits = permits,
+            .state = std.atomic.Value(usize).init(permits),
+            .permits_requested = permits,
+        };
+    }
+
+    /// Create a waiter with waker already configured.
+    pub fn initWithWaker(permits: usize, ctx: *anyopaque, wake_fn: WakerFn) Self {
+        return .{
+            .state = std.atomic.Value(usize).init(permits),
+            .permits_requested = permits,
+            .waker_ctx = ctx,
+            .waker = wake_fn,
         };
     }
 
@@ -86,19 +103,14 @@ pub const Waiter = struct {
         self.waker = wake_fn;
     }
 
-    /// Wake this waiter
-    pub fn wake(self: *Self) void {
-        if (self.waker) |wf| {
-            if (self.waker_ctx) |ctx| {
-                wf(ctx);
-            }
-        }
+    /// Check if the waiter is ready (acquisition is complete).
+    /// Completion = state == 0 (all requested permits granted).
+    pub fn isReady(self: *const Self) bool {
+        return self.state.load(.acquire) == 0;
     }
 
-    /// Check if acquisition is complete (uses seq_cst for cross-thread visibility)
-    pub fn isComplete(self: *const Self) bool {
-        return self.complete.load(.seq_cst);
-    }
+    /// Check if acquisition is complete (alias for isReady).
+    pub const isComplete = isReady;
 
     /// Get invocation token (for debug tracking)
     pub fn token(self: *const Self) InvocationId.Id {
@@ -112,12 +124,28 @@ pub const Waiter = struct {
 
     /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.acquired = 0;
-        self.complete.store(false, .seq_cst);
+        self.state.store(self.permits_requested, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
         self.invocation.bump();
+    }
+
+    /// Assign permits to this waiter. Decrements state by min(state, *n),
+    /// decrements *n by the same amount. Returns true if waiter is now
+    /// satisfied (state == 0).
+    ///
+    /// MUST be called under the semaphore's mutex. Since only the mutex
+    /// holder modifies waiter.state, a plain store is used (no CAS needed).
+    /// The .release ordering ensures the polling task's .acquire load in
+    /// isComplete() sees the update.
+    fn assignPermits(self: *Waiter, n: *usize) bool {
+        const curr = self.state.load(.monotonic);
+        if (curr == 0 or n.* == 0) return curr == 0;
+        const assign = @min(curr, n.*);
+        self.state.store(curr - assign, .release);
+        n.* -= assign;
+        return (curr - assign) == 0;
     }
 };
 
@@ -132,17 +160,20 @@ const WaiterList = LinkedList(Waiter, "pointers");
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A counting semaphore.
+///
+/// Batch semaphore with direct-handoff:
+/// - tryAcquire: lock-free CAS (no mutex)
+/// - release: always takes mutex, serves waiters directly
+/// - acquireWait: lock-free fast path, mutex-before-CAS slow path
 pub const Semaphore = struct {
-    /// Maximum permits
-    max_permits: usize,
-
-    /// Currently available permits
+    /// Currently available permits (only modified under mutex OR via CAS)
     permits: std.atomic.Value(usize),
 
-    /// Mutex protecting the waiters list
+    /// Mutex protecting the waiters list. Taken by release() and
+    /// acquireWait()'s slow path. NOT taken by tryAcquire().
     mutex: std.Thread.Mutex,
 
-    /// Waiters list (FIFO for fairness)
+    /// Waiters list: pushFront for new waiters, serve from back (FIFO)
     waiters: WaiterList,
 
     const Self = @This();
@@ -150,30 +181,27 @@ pub const Semaphore = struct {
     /// Create a semaphore with the given number of permits.
     pub fn init(permits: usize) Self {
         return .{
-            .max_permits = permits,
             .permits = std.atomic.Value(usize).init(permits),
             .mutex = .{},
             .waiters = .{},
         };
     }
 
-    /// Try to acquire permits without waiting.
+    /// Try to acquire permits without waiting (lock-free CAS loop).
     /// Returns true if permits were acquired, false if not enough available.
     pub fn tryAcquire(self: *Self, num: usize) bool {
-        var current = self.permits.load(.seq_cst);
+        var current = self.permits.load(.acquire);
         while (true) {
             if (current < num) {
                 return false;
             }
 
-            const result = self.permits.cmpxchgWeak(
+            if (self.permits.cmpxchgWeak(
                 current,
                 current - num,
-                .seq_cst,
-                .seq_cst,
-            );
-
-            if (result) |new_val| {
+                .acq_rel,
+                .acquire,
+            )) |new_val| {
                 current = new_val;
                 continue;
             }
@@ -182,111 +210,143 @@ pub const Semaphore = struct {
         }
     }
 
-    /// Acquire permits, potentially waiting.
+    /// Low-level: Acquire permits with explicit waiter.
     /// Returns true if permits were acquired immediately.
     /// Returns false if the waiter was added to the queue (task should yield).
     ///
     /// The waiter must be kept alive until complete or cancelled.
-    pub fn acquire(self: *Self, waiter: *Waiter) bool {
-        // Fast path: try to acquire without lock
-        if (self.tryAcquire(waiter.permits)) {
-            waiter.acquired = waiter.permits;
-            waiter.complete.store(true, .seq_cst);
+    ///
+    /// Algorithm:
+    /// 1. Lock-free CAS for full acquisition (fast path, no mutex)
+    /// 2. If insufficient: lock mutex BEFORE CAS that drains remaining permits
+    /// 3. Under lock: drain what we can, queue waiter if still not enough
+    /// No post-queue re-check needed — release() also takes the mutex.
+    pub fn acquireWait(self: *Self, waiter: *Waiter) bool {
+        const needed = waiter.state.load(.acquire);
+
+        // Fast path: try lock-free CAS for full acquisition
+        var curr = self.permits.load(.acquire);
+        while (curr >= needed) {
+            if (self.permits.cmpxchgWeak(curr, curr - needed, .acq_rel, .acquire)) |updated| {
+                curr = updated;
+                continue;
+            }
+            // Got all permits lock-free
+            waiter.state.store(0, .release);
             return true;
         }
 
-        // Slow path: add to waiters list
+        // Slow path: lock BEFORE CAS to close the race window.
+        // This ensures no release() can add permits between our CAS and
+        // queue insertion, because release() also needs this mutex.
         self.mutex.lock();
 
-        // Re-check permits under lock
-        const current = self.permits.load(.seq_cst);
-        if (current >= waiter.permits) {
-            _ = self.permits.fetchSub(waiter.permits, .seq_cst);
+        // Under lock: CAS to drain available permits.
+        // tryAcquire() is lock-free, so permits can change concurrently.
+        var acquired: usize = 0;
+        curr = self.permits.load(.acquire);
+        while (acquired < needed and curr > 0) {
+            const take = @min(curr, needed - acquired);
+            if (self.permits.cmpxchgWeak(curr, curr - take, .acq_rel, .acquire)) |updated| {
+                curr = updated;
+                continue;
+            }
+            acquired += take;
+            curr = self.permits.load(.acquire);
+        }
+
+        if (acquired >= needed) {
+            // Got all permits under lock
+            waiter.state.store(0, .release);
             self.mutex.unlock();
-            waiter.acquired = waiter.permits;
-            waiter.complete.store(true, .seq_cst);
             return true;
         }
 
-        // Not enough permits - take what we can and wait
-        waiter.acquired = current;
-        if (current > 0) {
-            _ = self.permits.fetchSub(current, .seq_cst);
+        // Partially fulfilled — update waiter state
+        if (acquired > 0) {
+            var rem = acquired;
+            _ = waiter.assignPermits(&rem);
         }
-        waiter.complete.store(false, .seq_cst);
 
-        // Add to waiters list
-        self.waiters.pushBack(waiter);
+        // Add to front of list (FIFO: serve from back)
+        self.waiters.pushFront(waiter);
 
         self.mutex.unlock();
-
         return false;
     }
 
-    /// Release permits.
+    /// Release permits back to the semaphore.
+    ///
+    /// ALWAYS takes the mutex to check for waiters. This ensures no race
+    /// between release() adding permits and acquireWait() queueing a waiter.
+    /// If no waiters, surplus goes to atomic. If waiters, serves them directly.
     pub fn release(self: *Self, num: usize) void {
-        // Add permits
-        _ = self.permits.fetchAdd(num, .seq_cst);
-
-        // Wake waiters that can now proceed
-        var wake_list: WakeList(32) = .{};
+        if (num == 0) return;
 
         self.mutex.lock();
 
-        // Try to satisfy waiters in FIFO order
-        // NOTE: We must read the current permit count fresh each iteration because:
-        // 1. Other threads may be calling release() concurrently
-        // 2. tryAcquire() can race with us (it doesn't hold the mutex)
-        // We use cmpxchg to safely claim permits without risking underflow.
-        outer: while (self.waiters.front()) |waiter| {
-            const needed = waiter.permits - waiter.acquired;
+        // Check for waiters under lock
+        if (self.waiters.back() == null) {
+            _ = self.permits.fetchAdd(num, .release);
+            self.mutex.unlock();
+            return;
+        }
 
-            // Try to claim permits atomically
-            while (true) {
-                const current = self.permits.load(.seq_cst);
+        // Serve queued waiters
+        self.releaseToWaiters(num);
+    }
 
-                if (current >= needed) {
-                    // Try to claim exactly what this waiter needs
-                    if (self.permits.cmpxchgWeak(current, current - needed, .seq_cst, .seq_cst)) |_| {
-                        // CAS failed, permits changed - retry
-                        continue;
+    /// Slow path for release(): serve permits to queued waiters.
+    /// Called with mutex held. Unlocks mutex and wakes waiters on return.
+    fn releaseToWaiters(self: *Self, num: usize) void {
+        var wake_list: WakeList = .{};
+        var rem = num;
+
+        // Serve waiters from the back (oldest first = FIFO)
+        while (rem > 0) {
+            const waiter = self.waiters.back() orelse break;
+
+            // Under lock — only we modify waiter.state
+            const remaining = waiter.state.load(.monotonic);
+            if (remaining == 0) {
+                // Already satisfied — remove and collect waker
+                _ = self.waiters.popBack();
+                if (waiter.waker) |wf| {
+                    if (waiter.waker_ctx) |ctx| {
+                        wake_list.push(.{ .context = ctx, .wake_fn = wf });
                     }
-                    // Success - waiter fully satisfied
-                    waiter.acquired = waiter.permits;
-
-                    // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free
-                    const waker_fn = waiter.waker;
-                    const waker_ctx = waiter.waker_ctx;
-                    waiter.complete.store(true, .seq_cst);
-
-                    _ = self.waiters.popFront();
-
-                    if (waker_fn) |wf| {
-                        if (waker_ctx) |ctx| {
-                            wake_list.push(.{ .context = ctx, .wake_fn = wf });
-                        }
-                    }
-                    // Continue to next waiter
-                    break;
-                } else if (current > 0) {
-                    // Partial fulfillment - take all available
-                    if (self.permits.cmpxchgWeak(current, 0, .seq_cst, .seq_cst)) |_| {
-                        // CAS failed, permits changed - retry
-                        continue;
-                    }
-                    waiter.acquired += current;
-                    // Can't fully satisfy, stop processing waiters
-                    break :outer;
-                } else {
-                    // No permits available
-                    break :outer;
                 }
+                continue;
             }
+
+            const assign = @min(rem, remaining);
+            // Plain store — we hold the mutex, no concurrent writers.
+            // .release ensures polling task's .acquire load sees the update.
+            waiter.state.store(remaining - assign, .release);
+            rem -= assign;
+
+            if (remaining - assign == 0) {
+                // Waiter fully satisfied — remove from queue
+                _ = self.waiters.popBack();
+                if (waiter.waker) |wf| {
+                    if (waiter.waker_ctx) |ctx| {
+                        wake_list.push(.{ .context = ctx, .wake_fn = wf });
+                    }
+                }
+            } else {
+                // Waiter partially satisfied — can't help further
+                break;
+            }
+        }
+
+        // Only surplus permits go to the atomic
+        if (rem > 0) {
+            _ = self.permits.fetchAdd(rem, .release);
         }
 
         self.mutex.unlock();
 
-        // Wake outside lock
+        // Wake AFTER releasing the lock
         wake_list.wakeAll();
     }
 
@@ -307,71 +367,72 @@ pub const Semaphore = struct {
         }
 
         // Remove from list if linked
-        if (WaiterList.isLinked(waiter) or self.waiters.front() == waiter) {
+        if (WaiterList.isLinked(waiter) or self.waiters.front() == waiter or self.waiters.back() == waiter) {
             self.waiters.remove(waiter);
             waiter.pointers.reset();
         }
 
-        // Return any partially acquired permits
-        const to_return = waiter.acquired;
-        waiter.acquired = 0;
+        // Calculate how many permits were partially acquired
+        const remaining = waiter.state.load(.monotonic); // under lock
+        const acquired = waiter.permits_requested - remaining;
 
         self.mutex.unlock();
 
-        // Return permits (may wake other waiters)
-        if (to_return > 0) {
-            self.release(to_return);
+        // Return partial permits (may wake other waiters)
+        if (acquired > 0) {
+            self.release(acquired);
         }
-    }
-
-    /// Blocking permit acquisition.
-    /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
-    /// This is the simplest API for acquiring permits - NO SPIN WAITING.
-    ///
-    /// Example:
-    /// ```zig
-    /// sem.acquireBlocking(1);
-    /// defer sem.release(1);
-    /// // Limited concurrency section
-    /// ```
-    pub fn acquireBlocking(self: *Self, num: usize) void {
-        // Fast path: try to acquire without waiting
-        if (self.tryAcquire(num)) {
-            return;
-        }
-
-        // Slow path: use unified waiter
-        var waiter = Waiter.init(num);
-
-        // Set up waker bridge to unified waiter
-        var unified = UnifiedWaiter.init();
-        const WakerBridge = struct {
-            fn wake(ctx: *anyopaque) void {
-                const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
-                uw.notify();
-            }
-        };
-        waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
-
-        // Use the internal acquire path
-        if (self.acquire(&waiter)) {
-            return; // Got permits immediately on retry
-        }
-
-        // Wait until notified - this yields in task context, blocks in thread context
-        unified.wait();
     }
 
     /// Get available permits (for debugging).
     pub fn availablePermits(self: *const Self) usize {
-        return self.permits.load(.seq_cst);
+        return self.permits.load(.acquire);
     }
 
-    /// Get number of waiters (for debugging).
+    /// Get number of waiters (for debugging/testing — O(n) list walk).
     pub fn waiterCount(self: *Self) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.waiters.count();
+        var count: usize = 0;
+        var it = self.waiters.iterator();
+        while (it.next()) |_| count += 1;
+        return count;
+    }
+
+    /// Walk the waiter queue and count waiters matching a predicate.
+    /// Must be called under mutex or when no concurrent access.
+    pub fn countWaitersMatching(self: *Self, comptime pred: fn (usize) bool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        var it = self.waiters.iterator();
+        while (it.next()) |w| {
+            if (pred(w.permits_requested)) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Permit Convenience Methods
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Try to acquire permits and return a permit guard if successful (non-blocking).
+    pub fn tryAcquirePermit(self: *Self, num: usize) ?SemaphorePermit {
+        if (self.tryAcquire(num)) {
+            return SemaphorePermit.init(self, num);
+        }
+        return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Async API
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Acquire permits. Returns an `AcquireFuture` that resolves when acquired.
+    pub fn acquire(self: *Self, num: usize) AcquireFuture {
+        return AcquireFuture.init(self, num);
     }
 };
 
@@ -413,6 +474,132 @@ pub const SemaphorePermit = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AcquireFuture - Async permit acquisition
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A future that resolves when semaphore permits are acquired.
+pub const AcquireFuture = struct {
+    const Self = @This();
+
+    /// Output type for Future trait
+    pub const Output = void;
+
+    /// Reference to the semaphore
+    semaphore: *Semaphore,
+
+    /// Number of permits to acquire
+    num_permits: usize,
+
+    /// Our waiter node (embedded to avoid allocation)
+    waiter: Waiter,
+
+    /// State machine for the future
+    state: State,
+
+    /// Stored waker for when we're woken by release()
+    stored_waker: ?FutureWaker,
+
+    const State = enum {
+        /// Haven't tried to acquire yet
+        init,
+        /// Waiting for permits
+        waiting,
+        /// Permits acquired
+        acquired,
+    };
+
+    /// Initialize a new acquire future
+    pub fn init(semaphore: *Semaphore, num_permits: usize) Self {
+        return .{
+            .semaphore = semaphore,
+            .num_permits = num_permits,
+            .waiter = Waiter.init(num_permits),
+            .state = .init,
+            .stored_waker = null,
+        };
+    }
+
+    /// Poll the future - implements Future trait
+    pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
+        switch (self.state) {
+            .init => {
+                // First poll - try to acquire permits
+                self.stored_waker = ctx.getWaker().clone();
+
+                // Set up the waiter's callback to wake us via our stored waker
+                self.waiter.setWaker(@ptrCast(self), wakeCallback);
+
+                // Try to acquire
+                if (self.semaphore.acquireWait(&self.waiter)) {
+                    self.state = .acquired;
+                    if (self.stored_waker) |*w| {
+                        w.deinit();
+                        self.stored_waker = null;
+                    }
+                    return .{ .ready = {} };
+                } else {
+                    self.state = .waiting;
+                    return .pending;
+                }
+            },
+
+            .waiting => {
+                // Check if we've been granted the permits
+                if (self.waiter.isComplete()) {
+                    self.state = .acquired;
+                    if (self.stored_waker) |*w| {
+                        w.deinit();
+                        self.stored_waker = null;
+                    }
+                    return .{ .ready = {} };
+                }
+
+                // Not yet - update waker in case it changed (task migration)
+                const new_waker = ctx.getWaker();
+                if (self.stored_waker) |*old| {
+                    if (!old.willWakeSame(new_waker)) {
+                        old.deinit();
+                        self.stored_waker = new_waker.clone();
+                    }
+                } else {
+                    self.stored_waker = new_waker.clone();
+                }
+
+                return .pending;
+            },
+
+            .acquired => {
+                return .{ .ready = {} };
+            },
+        }
+    }
+
+    /// Cancel the acquisition
+    pub fn cancel(self: *Self) void {
+        if (self.state == .waiting) {
+            self.semaphore.cancelAcquire(&self.waiter);
+        }
+        if (self.stored_waker) |*w| {
+            w.deinit();
+            self.stored_waker = null;
+        }
+    }
+
+    /// Deinit the future
+    pub fn deinit(self: *Self) void {
+        self.cancel();
+    }
+
+    /// Callback invoked by Semaphore.release() when permits are granted
+    fn wakeCallback(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.stored_waker) |*w| {
+            w.wakeByRef();
+        }
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -436,7 +623,7 @@ test "Semaphore - tryAcquire failure" {
     try std.testing.expect(!sem.tryAcquire(1));
 }
 
-test "Semaphore - acquire and release" {
+test "Semaphore - acquire and release with waiter" {
     var sem = Semaphore.init(1);
     var woken = false;
 
@@ -449,13 +636,13 @@ test "Semaphore - acquire and release" {
 
     // First acquire succeeds immediately
     var waiter1 = Waiter.init(1);
-    try std.testing.expect(sem.acquire(&waiter1));
+    try std.testing.expect(sem.acquireWait(&waiter1));
     try std.testing.expect(waiter1.isComplete());
 
     // Second acquire should wait
     var waiter2 = Waiter.init(1);
     waiter2.setWaker(@ptrCast(&woken), TestWaker.wake);
-    try std.testing.expect(!sem.acquire(&waiter2));
+    try std.testing.expect(!sem.acquireWait(&waiter2));
     try std.testing.expect(!waiter2.isComplete());
     try std.testing.expectEqual(@as(usize, 1), sem.waiterCount());
 
@@ -472,7 +659,7 @@ test "Semaphore - FIFO ordering" {
     var waiters: [3]Waiter = undefined;
     for (&waiters) |*w| {
         w.* = Waiter.init(1);
-        _ = sem.acquire(w);
+        _ = sem.acquireWait(w);
     }
 
     try std.testing.expectEqual(@as(usize, 3), sem.waiterCount());
@@ -500,146 +687,223 @@ test "Semaphore - cancel returns permits" {
 
     // Start waiting for more
     var waiter = Waiter.init(2);
-    try std.testing.expect(!sem.acquire(&waiter));
+    try std.testing.expect(!sem.acquireWait(&waiter));
 
     // Cancel - should return any partial acquisition
     sem.cancelAcquire(&waiter);
     try std.testing.expectEqual(@as(usize, 0), sem.waiterCount());
 }
 
-test "Semaphore - permit RAII" {
+test "Semaphore - tryAcquirePermit" {
+    var sem = Semaphore.init(2);
+
+    if (sem.tryAcquirePermit(1)) |p| {
+        var permit = p;
+        defer permit.deinit();
+        try std.testing.expectEqual(@as(usize, 1), sem.availablePermits());
+    } else {
+        try std.testing.expect(false);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), sem.availablePermits());
+}
+
+test "Semaphore - permit forget" {
     var sem = Semaphore.init(2);
 
     {
-        try std.testing.expect(sem.tryAcquire(1));
-        var permit = SemaphorePermit.init(&sem, 1);
+        var permit = sem.tryAcquirePermit(1).?;
         try std.testing.expectEqual(@as(usize, 1), sem.availablePermits());
 
+        // Forget the permit (don't release on deinit)
+        permit.forget();
         permit.deinit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), sem.availablePermits());
-}
-
-test "Semaphore - binary semaphore (mutex equivalent)" {
-    var sem = Semaphore.init(1);
-
-    // First acquire succeeds
-    try std.testing.expect(sem.tryAcquire(1));
-    try std.testing.expectEqual(@as(usize, 0), sem.availablePermits());
-
-    // Second acquire fails (semaphore is "locked")
-    try std.testing.expect(!sem.tryAcquire(1));
-
-    // Release
-    sem.release(1);
+    // Permit was not released
     try std.testing.expectEqual(@as(usize, 1), sem.availablePermits());
 
-    // Can acquire again
-    try std.testing.expect(sem.tryAcquire(1));
-}
-
-test "Semaphore - large permit count" {
-    var sem = Semaphore.init(1000);
-
-    // Acquire in chunks
-    try std.testing.expect(sem.tryAcquire(100));
-    try std.testing.expectEqual(@as(usize, 900), sem.availablePermits());
-
-    try std.testing.expect(sem.tryAcquire(400));
-    try std.testing.expectEqual(@as(usize, 500), sem.availablePermits());
-
-    try std.testing.expect(sem.tryAcquire(500));
-    try std.testing.expectEqual(@as(usize, 0), sem.availablePermits());
-
-    // Can't acquire more
-    try std.testing.expect(!sem.tryAcquire(1));
-
-    // Release all
-    sem.release(1000);
-    try std.testing.expectEqual(@as(usize, 1000), sem.availablePermits());
-}
-
-test "Semaphore - multiple acquire release cycles" {
-    var sem = Semaphore.init(5);
-
-    // Multiple cycles
-    for (0..10) |_| {
-        // Acquire all
-        try std.testing.expect(sem.tryAcquire(5));
-        try std.testing.expectEqual(@as(usize, 0), sem.availablePermits());
-
-        // Release all
-        sem.release(5);
-        try std.testing.expectEqual(@as(usize, 5), sem.availablePermits());
-    }
-
-    // Partial acquire/release cycles
-    for (0..10) |_| {
-        try std.testing.expect(sem.tryAcquire(3));
-        try std.testing.expect(sem.tryAcquire(2));
-        try std.testing.expectEqual(@as(usize, 0), sem.availablePermits());
-
-        sem.release(2);
-        sem.release(3);
-        try std.testing.expectEqual(@as(usize, 5), sem.availablePermits());
-    }
-}
-
-test "Semaphore - release increases permits" {
-    var sem = Semaphore.init(2);
-
-    // Release can increase beyond initial count
-    sem.release(3);
-    try std.testing.expectEqual(@as(usize, 5), sem.availablePermits());
-
-    // Acquire all the permits
-    try std.testing.expect(sem.tryAcquire(5));
-    try std.testing.expectEqual(@as(usize, 0), sem.availablePermits());
-}
-
-test "Semaphore - acquireBlocking simple" {
-    var sem = Semaphore.init(2);
-
-    // First acquire should succeed immediately
-    sem.acquireBlocking(1);
-    try std.testing.expectEqual(@as(usize, 1), sem.availablePermits());
-
+    // Clean up
     sem.release(1);
-    try std.testing.expectEqual(@as(usize, 2), sem.availablePermits());
 }
 
-test "Semaphore - acquireBlocking with contention" {
-    var sem = Semaphore.init(1);
-    var counter: u32 = 0;
-    var done = std.atomic.Value(bool).init(false);
+test "Semaphore.Waiter - initWithWaker convenience" {
+    var sem = Semaphore.init(0); // No permits
+    var woken = false;
 
-    // Acquire the only permit
-    sem.acquireBlocking(1);
-
-    // Start a thread that will try to acquire
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(s: *Semaphore, c: *u32, d: *std.atomic.Value(bool)) void {
-            s.acquireBlocking(1); // Should block until main thread releases
-            c.* += 1;
-            s.release(1);
-            d.store(true, .release);
+    const TestWaker = struct {
+        fn wake(ctx: *anyopaque) void {
+            const w: *bool = @ptrCast(@alignCast(ctx));
+            w.* = true;
         }
-    }.run, .{ &sem, &counter, &done });
+    };
 
-    // Give the thread time to start and block
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    // Create waiter with initWithWaker (fewer steps than init + setWaker)
+    var waiter = Waiter.initWithWaker(1, @ptrCast(&woken), TestWaker.wake);
+    try std.testing.expect(!sem.acquireWait(&waiter));
+    try std.testing.expect(!waiter.isReady()); // Using isReady (unified API)
 
-    // Counter should still be 0 (thread is blocked)
-    try std.testing.expectEqual(@as(u32, 0), counter);
-
-    // Release - this should wake the other thread
+    // Release permits
     sem.release(1);
+    try std.testing.expect(waiter.isReady());
+    try std.testing.expect(woken);
+}
 
-    // Wait for the thread to finish
-    thread.join();
+test "Semaphore.Waiter - isReady is alias for isComplete" {
+    var sem = Semaphore.init(1);
+    var waiter = Waiter.init(1);
 
-    // Now counter should be 1
-    try std.testing.expectEqual(@as(u32, 1), counter);
-    try std.testing.expect(done.load(.acquire));
+    // Both should return false initially
+    try std.testing.expect(!waiter.isReady());
+    try std.testing.expect(!waiter.isComplete());
+
+    // Acquire should succeed immediately
+    try std.testing.expect(sem.acquireWait(&waiter));
+
+    // Both should return true
+    try std.testing.expect(waiter.isReady());
+    try std.testing.expect(waiter.isComplete());
+
+    sem.release(1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AcquireFuture Tests (Async API)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test "AcquireFuture - immediate acquisition" {
+    var sem = Semaphore.init(3);
+
+    // Create future and poll - should acquire immediately
+    var future = sem.acquire(2);
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isReady());
+    try std.testing.expectEqual(@as(usize, 1), sem.availablePermits());
+
+    sem.release(2);
+    try std.testing.expectEqual(@as(usize, 3), sem.availablePermits());
+}
+
+test "AcquireFuture - waits when not enough permits" {
+    var sem = Semaphore.init(1);
+    var waker_called = false;
+
+    // Create a test waker that tracks calls
+    const TestWaker = struct {
+        called: *bool,
+
+        fn wake(data: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(data));
+            self.called.* = true;
+        }
+
+        fn clone(data: *anyopaque) future_mod.RawWaker {
+            return .{ .data = data, .vtable = &vtable };
+        }
+
+        fn drop(_: *anyopaque) void {}
+
+        const vtable = future_mod.RawWaker.VTable{
+            .wake = wake,
+            .wake_by_ref = wake,
+            .clone = clone,
+            .drop = drop,
+        };
+
+        fn toWaker(self: *@This()) FutureWaker {
+            return .{ .raw = .{ .data = @ptrCast(self), .vtable = &vtable } };
+        }
+    };
+
+    var test_waker = TestWaker{ .called = &waker_called };
+    const waker = test_waker.toWaker();
+
+    // Acquire the only permit first
+    try std.testing.expect(sem.tryAcquire(1));
+
+    // Create future for 1 permit - first poll should return pending
+    var future = sem.acquire(1);
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &waker };
+    const result1 = future.poll(&ctx);
+
+    try std.testing.expect(result1.isPending());
+    try std.testing.expect(!waker_called);
+    try std.testing.expectEqual(@as(usize, 1), sem.waiterCount());
+
+    // Release - should wake the future
+    sem.release(1);
+    try std.testing.expect(waker_called);
+
+    // Second poll should return ready
+    const result2 = future.poll(&ctx);
+    try std.testing.expect(result2.isReady());
+
+    sem.release(1);
+}
+
+test "AcquireFuture - cancel removes from queue" {
+    var sem = Semaphore.init(0); // No permits initially
+
+    // Create future and poll to add to queue
+    var future = sem.acquire(2);
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isPending());
+    try std.testing.expectEqual(@as(usize, 1), sem.waiterCount());
+
+    // Cancel
+    future.cancel();
+    try std.testing.expectEqual(@as(usize, 0), sem.waiterCount());
+
+    // Clean up
+    future.deinit();
+}
+
+test "AcquireFuture - multiple waiters FIFO" {
+    var sem = Semaphore.init(0); // No permits initially
+
+    // Create multiple futures
+    var future1 = sem.acquire(1);
+    var future2 = sem.acquire(1);
+    var future3 = sem.acquire(1);
+
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+
+    // All should return pending
+    try std.testing.expect(future1.poll(&ctx).isPending());
+    try std.testing.expect(future2.poll(&ctx).isPending());
+    try std.testing.expect(future3.poll(&ctx).isPending());
+
+    try std.testing.expectEqual(@as(usize, 3), sem.waiterCount());
+
+    // Release one permit - future1 should be ready
+    sem.release(1);
+    try std.testing.expect(future1.poll(&ctx).isReady());
+    try std.testing.expect(future2.poll(&ctx).isPending());
+    try std.testing.expect(future3.poll(&ctx).isPending());
+
+    // Release another - future2 should be ready
+    sem.release(1);
+    try std.testing.expect(future2.poll(&ctx).isReady());
+    try std.testing.expect(future3.poll(&ctx).isPending());
+
+    // Release another - future3 should be ready
+    sem.release(1);
+    try std.testing.expect(future3.poll(&ctx).isReady());
+
+    future1.deinit();
+    future2.deinit();
+    future3.deinit();
+}
+
+test "AcquireFuture - is valid Future type" {
+    try std.testing.expect(future_mod.isFuture(AcquireFuture));
+    try std.testing.expect(AcquireFuture.Output == void);
 }

@@ -5,9 +5,16 @@ libroot.a
 
 # Reference implementations (not part of this project)
 tokio/
+tigerbeetle/
+zio/
 
-# Test binaries
+# Test and benchmark binaries
 test_bounded
+blitz_bench_test
+mpmc_test
+
+# Rust build artifacts
+bench/rust_bench/target/
 
 # Editor/IDE
 .vscode/
@@ -32,6 +39,11 @@ coverage/
 # Temporary files
 *.tmp
 *.temp
+
+# Docs build artifacts
+docs/node_modules/
+docs/dist/
+docs/.astro/
 
 # Benchmark results (keep committed ones in benchmarks/)
 bench-results/

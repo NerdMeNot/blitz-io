@@ -15,8 +15,6 @@
 //!     std.debug.print("{s}\n", .{line});
 //! }
 //! ```
-//!
-//! Reference: tokio/src/io/util/lines.rs
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

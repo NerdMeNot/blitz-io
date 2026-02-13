@@ -8,8 +8,12 @@
 //! ```zig
 //! var notify = Notify.init();
 //!
-//! // Waiting task:
-//! notify.wait(waker);  // Returns .pending, waker stored
+//! // Async (returns Future):
+//! var future = notify.wait();
+//!
+//! // Low-level waiter API:
+//! var waiter = Waiter.init();
+//! notify.waitWith(&waiter);
 //!
 //! // Notifying task:
 //! notify.notifyOne();  // Wakes one waiter
@@ -23,13 +27,18 @@
 //! - Batch waking after releasing lock to avoid holding lock during wake
 //! - Permit-based semantics to handle notify-before-wait race
 //!
-//! Reference: tokio/src/sync/notify.rs
 
 const std = @import("std");
 
-const LinkedList = @import("../util/linked_list.zig").LinkedList;
-const Pointers = @import("../util/linked_list.zig").Pointers;
-const WakeList = @import("../util/wake_list.zig").WakeList;
+const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("../internal/util/linked_list.zig").Pointers;
+const WakeList = @import("../internal/util/wake_list.zig").WakeList;
+
+// Future system imports
+const future_mod = @import("../future.zig");
+const Waker = future_mod.Waker;
+const Context = future_mod.Context;
+const PollResult = future_mod.PollResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
@@ -54,6 +63,15 @@ pub const Waiter = struct {
         return .{};
     }
 
+    /// Create a waiter with waker already configured.
+    /// Reduces the 3-step ceremony (init + setWaker + wait) to 2 steps.
+    pub fn initWithWaker(ctx: *anyopaque, wake_fn: WakerFn) Self {
+        return .{
+            .waker_ctx = ctx,
+            .waker = wake_fn,
+        };
+    }
+
     /// Set the waker for this waiter
     pub fn setWaker(self: *Self, ctx: *anyopaque, wake_fn: WakerFn) void {
         self.waker_ctx = ctx;
@@ -68,8 +86,8 @@ pub const Waiter = struct {
         const waker_ctx = self.waker_ctx;
 
         // Now safe to set the flag - we have our own copies
-        // Use SeqCst like Tokio for proper cross-thread synchronization
-        self.notified.store(true, .seq_cst);
+        // Release pairs with acquire in isReady()
+        self.notified.store(true, .release);
 
         // Wake using copied function pointers
         if (waker_fn) |wf| {
@@ -79,14 +97,18 @@ pub const Waiter = struct {
         }
     }
 
-    /// Check if notified (uses SeqCst for cross-thread visibility)
-    pub fn isNotified(self: *const Self) bool {
-        return self.notified.load(.seq_cst);
+    /// Check if the waiter is ready (notified).
+    /// This is the unified completion check method across all sync primitives.
+    pub fn isReady(self: *const Self) bool {
+        return self.notified.load(.acquire);
     }
+
+    /// Check if notified (alias for isReady, uses SeqCst for cross-thread visibility).
+    pub const isNotified = isReady;
 
     /// Reset for reuse
     pub fn reset(self: *Self) void {
-        self.notified.store(false, .seq_cst);
+        self.notified.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -141,13 +163,12 @@ pub const Notify = struct {
     /// If no task is waiting, stores a permit that will be consumed by the next wait.
     pub fn notifyOne(self: *Self) void {
         // Fast path: try to transition EMPTY -> NOTIFIED
-        // Use SeqCst like Tokio for proper cross-thread synchronization
-        var curr = self.state.load(.seq_cst);
+        var curr = self.state.load(.acquire);
 
         while (curr & State.WAITING == 0) {
             // No waiters - try to store a permit via CAS
             const new = curr | State.PERMIT;
-            const result = self.state.cmpxchgWeak(curr, new, .seq_cst, .seq_cst);
+            const result = self.state.cmpxchgWeak(curr, new, .acq_rel, .acquire);
             if (result == null) {
                 // Successfully stored permit
                 return;
@@ -159,13 +180,13 @@ pub const Notify = struct {
         // Slow path: there are waiters, must acquire lock
         self.mutex.lock();
 
-        // CRITICAL: Reload state while holding lock (Tokio pattern)
+        // CRITICAL: Reload state while holding lock.
         // State can only transition OUT of WAITING while lock is held
-        curr = self.state.load(.seq_cst);
+        curr = self.state.load(.acquire);
 
         if (curr & State.WAITING == 0) {
-            // No waiters anymore, store permit
-            _ = self.state.fetchOr(State.PERMIT, .seq_cst);
+            // No waiters anymore, store permit (under lock, release sufficient)
+            _ = self.state.fetchOr(State.PERMIT, .release);
             self.mutex.unlock();
             return;
         }
@@ -173,9 +194,9 @@ pub const Notify = struct {
         // Pop one waiter
         const waiter = self.waiters.popFront();
 
-        // Update state if list is now empty
+        // Update state if list is now empty (under lock, release sufficient)
         if (self.waiters.isEmpty()) {
-            _ = self.state.fetchAnd(~State.WAITING, .seq_cst);
+            _ = self.state.fetchAnd(~State.WAITING, .release);
         }
 
         self.mutex.unlock();
@@ -190,8 +211,7 @@ pub const Notify = struct {
     /// Does NOT store a permit if no tasks are waiting.
     pub fn notifyAll(self: *Self) void {
         // Fast path: check if anyone is waiting
-        // Use SeqCst like Tokio for proper cross-thread synchronization
-        const state = self.state.load(.seq_cst);
+        const state = self.state.load(.acquire);
         if (state & State.WAITING == 0) {
             return;
         }
@@ -207,8 +227,8 @@ pub const Notify = struct {
             const waker_fn = waiter.waker;
             const waker_ctx = waiter.waker_ctx;
 
-            // Now safe to set the flag (atomic for cross-thread visibility)
-            waiter.notified.store(true, .seq_cst);
+            // Now safe to set the flag — release pairs with acquire in isReady()
+            waiter.notified.store(true, .release);
 
             if (waker_fn) |wf| {
                 if (waker_ctx) |ctx| {
@@ -217,8 +237,8 @@ pub const Notify = struct {
             }
         }
 
-        // Clear WAITING flag
-        _ = self.state.fetchAnd(~State.WAITING, .seq_cst);
+        // Clear WAITING flag (under lock, release sufficient)
+        _ = self.state.fetchAnd(~State.WAITING, .release);
 
         self.mutex.unlock();
 
@@ -226,26 +246,26 @@ pub const Notify = struct {
         wake_list.wakeAll();
     }
 
-    /// Wait for notification.
+    /// Wait for notification (low-level waiter API).
     /// Returns true if a permit was consumed (immediate return).
     /// Returns false if the waiter was added to the queue (task should yield).
     ///
     /// The waiter must be kept alive until notified or cancelled.
-    pub fn wait(self: *Self, waiter: *Waiter) bool {
+    /// For the async Future API, use `wait()` instead.
+    pub fn waitWith(self: *Self, waiter: *Waiter) bool {
         // Fast path: check for permit
-        // Use SeqCst like Tokio for proper cross-thread synchronization
-        var state = self.state.load(.seq_cst);
+        var state = self.state.load(.acquire);
         if (state & State.PERMIT != 0) {
             // Try to consume permit
             const result = self.state.cmpxchgWeak(
                 state,
                 state & ~State.PERMIT,
-                .seq_cst,
-                .seq_cst,
+                .acq_rel,
+                .acquire,
             );
             if (result == null) {
                 // Consumed permit
-                waiter.notified.store(true, .seq_cst);
+                waiter.notified.store(true, .release);
                 return true;
             }
             // CAS failed, fall through to slow path
@@ -255,20 +275,20 @@ pub const Notify = struct {
         self.mutex.lock();
 
         // Re-check for permit under lock
-        state = self.state.load(.seq_cst);
+        state = self.state.load(.acquire);
         if (state & State.PERMIT != 0) {
-            _ = self.state.fetchAnd(~State.PERMIT, .seq_cst);
+            _ = self.state.fetchAnd(~State.PERMIT, .release);
             self.mutex.unlock();
-            waiter.notified.store(true, .seq_cst);
+            waiter.notified.store(true, .release);
             return true;
         }
 
         // Add to waiters list
-        waiter.notified.store(false, .seq_cst);
+        waiter.notified.store(false, .release);
         self.waiters.pushBack(waiter);
 
-        // Set WAITING flag
-        _ = self.state.fetchOr(State.WAITING, .seq_cst);
+        // Set WAITING flag (under lock, release sufficient)
+        _ = self.state.fetchOr(State.WAITING, .release);
 
         self.mutex.unlock();
 
@@ -299,7 +319,7 @@ pub const Notify = struct {
 
             // Update state if list is now empty
             if (self.waiters.isEmpty()) {
-                _ = self.state.fetchAnd(~State.WAITING, .seq_cst);
+                _ = self.state.fetchAnd(~State.WAITING, .release);
             }
         }
 
@@ -308,7 +328,7 @@ pub const Notify = struct {
 
     /// Check if there are pending permits (for testing/debugging).
     pub fn hasPermit(self: *const Self) bool {
-        return self.state.load(.seq_cst) & State.PERMIT != 0;
+        return self.state.load(.acquire) & State.PERMIT != 0;
     }
 
     /// Get the number of waiters (for debugging).
@@ -316,6 +336,177 @@ pub const Notify = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.waiters.count();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Async API
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Wait for notification.
+    ///
+    /// Returns a `WaitFuture` that resolves when the notification is received.
+    /// This integrates with the scheduler for true async behavior - the task
+    /// will be suspended (not spin-waiting) until notified.
+    ///
+    /// ## Example
+    ///
+    /// ```zig
+    /// var future = notify.wait();
+    /// // Poll through your runtime...
+    /// // When future.poll() returns .ready, you've been notified
+    /// ```
+    pub fn wait(self: *Self) WaitFuture {
+        return WaitFuture.init(self);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WaitFuture - Async notification wait
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A future that resolves when a notification is received.
+///
+/// This integrates with the scheduler's Future system for true async behavior.
+/// The task will be suspended (not spin-waiting or blocking) until notified.
+///
+/// ## Usage
+///
+/// ```zig
+/// var future = notify.wait();
+/// // ... poll the future through your runtime ...
+/// // When ready, you've been notified
+/// ```
+pub const WaitFuture = struct {
+    const Self = @This();
+
+    /// Output type for Future trait
+    pub const Output = void;
+
+    /// Reference to the notify we're waiting on
+    notify: *Notify,
+
+    /// Our waiter node (embedded to avoid allocation)
+    waiter: Waiter,
+
+    /// State machine for the future
+    state: FutureState,
+
+    /// Stored waker for when we're woken by notify
+    stored_waker: ?Waker,
+
+    const FutureState = enum {
+        /// Haven't tried to wait yet
+        init,
+        /// Waiting in queue for notification
+        waiting,
+        /// Notified
+        notified,
+    };
+
+    /// Initialize a new wait future
+    pub fn init(notify_ptr: *Notify) Self {
+        return .{
+            .notify = notify_ptr,
+            .waiter = Waiter.init(),
+            .state = .init,
+            .stored_waker = null,
+        };
+    }
+
+    /// Poll the future - implements Future trait
+    ///
+    /// Returns `.pending` if not yet notified (task will be woken when notified).
+    /// Returns `.{ .ready = {} }` when notification is received.
+    pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
+        switch (self.state) {
+            .init => {
+                // First poll - try to wait
+                // Store the waker so we can be woken when notified
+                self.stored_waker = ctx.getWaker().clone();
+
+                // Set up the waiter's callback to wake us via our stored waker
+                self.waiter.setWaker(@ptrCast(self), wakeCallback);
+
+                // Try to wait (may consume permit immediately)
+                if (self.notify.waitWith(&self.waiter)) {
+                    // Got notification immediately (permit consumed)
+                    self.state = .notified;
+                    // Clean up stored waker since we don't need it
+                    if (self.stored_waker) |*w| {
+                        w.deinit();
+                        self.stored_waker = null;
+                    }
+                    return .{ .ready = {} };
+                } else {
+                    // Added to wait queue - will be woken when notified
+                    self.state = .waiting;
+                    return .pending;
+                }
+            },
+
+            .waiting => {
+                // Check if we've been notified
+                if (self.waiter.isNotified()) {
+                    self.state = .notified;
+                    // Clean up stored waker
+                    if (self.stored_waker) |*w| {
+                        w.deinit();
+                        self.stored_waker = null;
+                    }
+                    return .{ .ready = {} };
+                }
+
+                // Not yet - update waker in case it changed (task migration)
+                const new_waker = ctx.getWaker();
+                if (self.stored_waker) |*old| {
+                    if (!old.willWakeSame(new_waker)) {
+                        old.deinit();
+                        self.stored_waker = new_waker.clone();
+                    }
+                } else {
+                    self.stored_waker = new_waker.clone();
+                }
+
+                return .pending;
+            },
+
+            .notified => {
+                // Already notified
+                return .{ .ready = {} };
+            },
+        }
+    }
+
+    /// Cancel the wait operation
+    ///
+    /// If not yet notified, removes us from the wait queue.
+    /// If already notified, this is a no-op.
+    pub fn cancel(self: *Self) void {
+        if (self.state == .waiting) {
+            self.notify.cancelWait(&self.waiter);
+        }
+        // Clean up stored waker
+        if (self.stored_waker) |*w| {
+            w.deinit();
+            self.stored_waker = null;
+        }
+    }
+
+    /// Deinit the future
+    ///
+    /// If waiting, cancels the wait operation.
+    pub fn deinit(self: *Self) void {
+        self.cancel();
+    }
+
+    /// Callback invoked by Notify when notification is received
+    /// This bridges the Notify's WakerFn to the Future's Waker
+    fn wakeCallback(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.stored_waker) |*w| {
+            // Wake the task through the Future system's Waker
+            w.wakeByRef();
+        }
     }
 };
 
@@ -332,7 +523,7 @@ test "Notify - notify before wait consumes permit" {
 
     // Wait should consume permit immediately
     var waiter = Waiter.init();
-    const consumed = notify.wait(&waiter);
+    const consumed = notify.waitWith(&waiter);
 
     try std.testing.expect(consumed);
     try std.testing.expect(waiter.isNotified());
@@ -354,7 +545,7 @@ test "Notify - wait then notify" {
     waiter.setWaker(@ptrCast(&woken), TestWaker.wake);
 
     // Wait should return false (added to queue)
-    const consumed = notify.wait(&waiter);
+    const consumed = notify.waitWith(&waiter);
     try std.testing.expect(!consumed);
     try std.testing.expect(!waiter.isNotified());
     try std.testing.expectEqual(@as(usize, 1), notify.waiterCount());
@@ -381,7 +572,7 @@ test "Notify - notifyAll wakes all waiters" {
     for (&waiters, 0..) |*w, i| {
         w.* = Waiter.init();
         w.setWaker(@ptrCast(&woken[i]), TestWaker.wake);
-        _ = notify.wait(w);
+        _ = notify.waitWith(w);
     }
 
     try std.testing.expectEqual(@as(usize, 3), notify.waiterCount());
@@ -400,8 +591,8 @@ test "Notify - cancel removes waiter" {
     var waiter1 = Waiter.init();
     var waiter2 = Waiter.init();
 
-    _ = notify.wait(&waiter1);
-    _ = notify.wait(&waiter2);
+    _ = notify.waitWith(&waiter1);
+    _ = notify.waitWith(&waiter2);
 
     try std.testing.expectEqual(@as(usize, 2), notify.waiterCount());
 
@@ -439,7 +630,7 @@ test "Notify - notifyOne wakes exactly one waiter" {
     for (&waiters, 0..) |*w, i| {
         w.* = Waiter.init();
         w.setWaker(@ptrCast(&woken[i]), TestWaker.wake);
-        _ = notify.wait(w);
+        _ = notify.waitWith(w);
     }
 
     try std.testing.expectEqual(@as(usize, 3), notify.waiterCount());
@@ -468,13 +659,13 @@ test "Notify - permit does not accumulate" {
 
     // First wait consumes the permit
     var waiter1 = Waiter.init();
-    const consumed1 = notify.wait(&waiter1);
+    const consumed1 = notify.waitWith(&waiter1);
     try std.testing.expect(consumed1);
     try std.testing.expect(waiter1.isNotified());
 
     // Second wait should block (no permit left)
     var waiter2 = Waiter.init();
-    const consumed2 = notify.wait(&waiter2);
+    const consumed2 = notify.waitWith(&waiter2);
     try std.testing.expect(!consumed2);
     try std.testing.expect(!waiter2.isNotified());
 
@@ -492,7 +683,7 @@ test "Notify - rapid notify wait cycles" {
 
         // Wait consumes permit
         var waiter = Waiter.init();
-        const consumed = notify.wait(&waiter);
+        const consumed = notify.waitWith(&waiter);
         try std.testing.expect(consumed);
         try std.testing.expect(waiter.isNotified());
         try std.testing.expect(!notify.hasPermit());
@@ -520,7 +711,7 @@ test "Notify - many waiters notify one at a time" {
     for (&waiters) |*w| {
         w.* = Waiter.init();
         w.setWaker(@ptrCast(&woken_count), TestWaker.wake);
-        _ = notify.wait(w);
+        _ = notify.waitWith(w);
     }
 
     try std.testing.expectEqual(@as(usize, num_waiters), notify.waiterCount());
@@ -553,7 +744,7 @@ test "Notify - waiter reset and reuse" {
     // First use
     var waiter = Waiter.init();
     waiter.setWaker(@ptrCast(&woken), TestWaker.wake);
-    _ = notify.wait(&waiter);
+    _ = notify.waitWith(&waiter);
 
     notify.notifyOne();
     try std.testing.expect(waiter.isNotified());
@@ -568,9 +759,49 @@ test "Notify - waiter reset and reuse" {
 
     // Second use
     waiter.setWaker(@ptrCast(&woken), TestWaker.wake);
-    _ = notify.wait(&waiter);
+    _ = notify.waitWith(&waiter);
 
     notify.notifyOne();
     try std.testing.expect(waiter.isNotified());
     try std.testing.expect(woken);
+}
+
+test "Notify.Waiter - initWithWaker convenience" {
+    var notify = Notify.init();
+    var woken = false;
+
+    const TestWaker = struct {
+        fn wake(ctx: *anyopaque) void {
+            const w: *bool = @ptrCast(@alignCast(ctx));
+            w.* = true;
+        }
+    };
+
+    // Create waiter with initWithWaker (fewer steps than init + setWaker)
+    var waiter = Waiter.initWithWaker(@ptrCast(&woken), TestWaker.wake);
+    try std.testing.expect(!notify.waitWith(&waiter));
+    try std.testing.expect(!waiter.isReady()); // Using isReady (unified API)
+
+    notify.notifyOne();
+    try std.testing.expect(waiter.isReady());
+    try std.testing.expect(woken);
+}
+
+test "Notify.Waiter - isReady is alias for isNotified" {
+    var notify = Notify.init();
+    var waiter = Waiter.init();
+
+    // Both should return false initially
+    try std.testing.expect(!waiter.isReady());
+    try std.testing.expect(!waiter.isNotified());
+
+    // Notify with permit
+    notify.notifyOne();
+
+    // Wait should consume permit
+    try std.testing.expect(notify.waitWith(&waiter));
+
+    // Both should return true
+    try std.testing.expect(waiter.isReady());
+    try std.testing.expect(waiter.isNotified());
 }

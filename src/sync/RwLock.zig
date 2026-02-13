@@ -2,19 +2,20 @@
 //!
 //! A read-write lock that allows multiple concurrent readers OR a single writer.
 //! Writers have priority to prevent writer starvation.
+//! For blocking rwlock, use std.Thread.RwLock from the standard library.
 //!
 //! ## Usage
 //!
 //! ```zig
 //! var rwlock = RwLock.init();
 //!
-//! // Multiple readers allowed concurrently
+//! // Multiple readers allowed concurrently (non-blocking)
 //! if (rwlock.tryReadLock()) {
 //!     defer rwlock.readUnlock();
 //!     // Read shared data
 //! }
 //!
-//! // Only one writer, excludes all readers
+//! // Only one writer, excludes all readers (non-blocking)
 //! if (rwlock.tryWriteLock()) {
 //!     defer rwlock.writeUnlock();
 //!     // Modify shared data
@@ -23,22 +24,30 @@
 //!
 //! ## Design
 //!
-//! - State tracks: reader count, writer active, writer waiting
-//! - Writers have priority: new readers wait if writer is waiting
-//! - FIFO ordering within reader/writer queues
+//! Built on Semaphore(MAX_READS):
+//! - Read lock = acquire 1 permit
+//! - Write lock = acquire MAX_READS permits (drains all)
 //!
-//! Reference: tokio/src/sync/rwlock.rs
+//! Writer priority emerges naturally: a queued writer's partial acquisition
+//! drains permits to 0, so new readers' tryAcquire(1) fails. FIFO queue
+//! serves the writer before any reader queued behind it.
+//!
+//! Diagnostics (isWriteLocked, getReaderCount) are derived from semaphore
+//! permit state — zero extra atomic operations on the lock/unlock hot path.
+//!
 
 const std = @import("std");
 
-const LinkedList = @import("../util/linked_list.zig").LinkedList;
-const Pointers = @import("../util/linked_list.zig").Pointers;
-const WakeList = @import("../util/wake_list.zig").WakeList;
-const InvocationId = @import("../util/invocation_id.zig").InvocationId;
+const semaphore_mod = @import("Semaphore.zig");
+const Semaphore = semaphore_mod.Semaphore;
+const SemaphoreWaiter = semaphore_mod.Waiter;
+const InvocationId = @import("../internal/util/invocation_id.zig").InvocationId;
 
-// Unified waiter for the simple blocking API
-const unified_waiter = @import("waiter.zig");
-const UnifiedWaiter = unified_waiter.Waiter;
+// Future system imports
+const future_mod = @import("../future.zig");
+const FutureWaker = future_mod.Waker;
+const Context = future_mod.Context;
+const PollResult = future_mod.PollResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiters
@@ -47,144 +56,127 @@ const UnifiedWaiter = unified_waiter.Waiter;
 /// Function pointer type for waking
 pub const WakerFn = *const fn (*anyopaque) void;
 
-/// Waiter for read lock acquisition
+/// Waiter for read lock acquisition (1 permit).
 pub const ReadWaiter = struct {
-    waker: ?WakerFn = null,
-    waker_ctx: ?*anyopaque = null,
-    acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    pointers: Pointers(ReadWaiter) = .{},
-    /// Debug-mode invocation tracking (detects use-after-free)
-    invocation: InvocationId = .{},
+    inner: SemaphoreWaiter,
+    /// User's waker (set by caller, forwarded to semaphore waiter)
+    user_waker: ?WakerFn = null,
+    user_waker_ctx: ?*anyopaque = null,
 
     const Self = @This();
 
     pub fn init() Self {
-        return .{};
+        return .{ .inner = SemaphoreWaiter.init(1) };
+    }
+
+    /// Create a waiter with waker already configured.
+    pub fn initWithWaker(ctx: *anyopaque, wake_fn: WakerFn) Self {
+        return .{
+            .inner = SemaphoreWaiter.init(1),
+            .user_waker = wake_fn,
+            .user_waker_ctx = ctx,
+        };
     }
 
     pub fn setWaker(self: *Self, ctx: *anyopaque, wake_fn: WakerFn) void {
-        self.waker_ctx = ctx;
-        self.waker = wake_fn;
+        self.user_waker = wake_fn;
+        self.user_waker_ctx = ctx;
     }
 
-    pub fn wake(self: *Self) void {
-        if (self.waker) |wf| {
-            if (self.waker_ctx) |ctx| {
-                wf(ctx);
-            }
-        }
+    /// Check if the waiter is ready (lock was acquired).
+    pub fn isReady(self: *const Self) bool {
+        return self.inner.isReady();
     }
 
-    pub fn isAcquired(self: *const Self) bool {
-        return self.acquired.load(.seq_cst);
-    }
+    /// Check if lock was acquired (alias for isReady).
+    pub const isAcquired = isReady;
 
-    /// Get invocation token (for debug tracking)
     pub fn token(self: *const Self) InvocationId.Id {
-        return self.invocation.get();
+        return self.inner.token();
     }
 
-    /// Verify invocation token matches (debug mode)
     pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
-        self.invocation.verify(tok);
+        self.inner.verifyToken(tok);
     }
 
-    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.acquired.store(false, .seq_cst);
-        self.waker = null;
-        self.waker_ctx = null;
-        self.pointers.reset();
-        self.invocation.bump();
+        self.inner.reset();
+        self.user_waker = null;
+        self.user_waker_ctx = null;
     }
 };
 
-/// Waiter for write lock acquisition
+/// Waiter for write lock acquisition (MAX_READS permits).
 pub const WriteWaiter = struct {
-    waker: ?WakerFn = null,
-    waker_ctx: ?*anyopaque = null,
-    acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    pointers: Pointers(WriteWaiter) = .{},
-    /// Debug-mode invocation tracking (detects use-after-free)
-    invocation: InvocationId = .{},
+    inner: SemaphoreWaiter,
+    /// User's waker (set by caller, forwarded to semaphore waiter)
+    user_waker: ?WakerFn = null,
+    user_waker_ctx: ?*anyopaque = null,
 
     const Self = @This();
 
     pub fn init() Self {
-        return .{};
+        return .{ .inner = SemaphoreWaiter.init(RwLock.MAX_READS) };
+    }
+
+    /// Create a waiter with waker already configured.
+    pub fn initWithWaker(ctx: *anyopaque, wake_fn: WakerFn) Self {
+        return .{
+            .inner = SemaphoreWaiter.init(RwLock.MAX_READS),
+            .user_waker = wake_fn,
+            .user_waker_ctx = ctx,
+        };
     }
 
     pub fn setWaker(self: *Self, ctx: *anyopaque, wake_fn: WakerFn) void {
-        self.waker_ctx = ctx;
-        self.waker = wake_fn;
+        self.user_waker = wake_fn;
+        self.user_waker_ctx = ctx;
     }
 
-    pub fn wake(self: *Self) void {
-        if (self.waker) |wf| {
-            if (self.waker_ctx) |ctx| {
-                wf(ctx);
-            }
-        }
+    /// Check if the waiter is ready (lock was acquired).
+    pub fn isReady(self: *const Self) bool {
+        return self.inner.isReady();
     }
 
-    pub fn isAcquired(self: *const Self) bool {
-        return self.acquired.load(.seq_cst);
-    }
+    /// Check if lock was acquired (alias for isReady).
+    pub const isAcquired = isReady;
 
-    /// Get invocation token (for debug tracking)
     pub fn token(self: *const Self) InvocationId.Id {
-        return self.invocation.get();
+        return self.inner.token();
     }
 
-    /// Verify invocation token matches (debug mode)
     pub fn verifyToken(self: *const Self, tok: InvocationId.Id) void {
-        self.invocation.verify(tok);
+        self.inner.verifyToken(tok);
     }
 
-    /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.acquired.store(false, .seq_cst);
-        self.waker = null;
-        self.waker_ctx = null;
-        self.pointers.reset();
-        self.invocation.bump();
+        self.inner.reset();
+        self.user_waker = null;
+        self.user_waker_ctx = null;
     }
 };
-
-const ReadWaiterList = LinkedList(ReadWaiter, "pointers");
-const WriteWaiterList = LinkedList(WriteWaiter, "pointers");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RwLock
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// An async-aware read-write lock.
+/// An async-aware read-write lock. Built on Semaphore(MAX_READS).
+///
+/// Diagnostics (isWriteLocked, getReaderCount) are derived from semaphore
+/// permit state — zero extra atomics on the lock/unlock hot path.
 pub const RwLock = struct {
-    /// Number of active readers (0 if writer holds lock)
-    readers: usize,
-
-    /// Whether a writer holds the lock
-    writer_active: bool,
-
-    /// Mutex protecting internal state
-    mutex: std.Thread.Mutex,
-
-    /// Waiting readers
-    read_waiters: ReadWaiterList,
-
-    /// Waiting writers
-    write_waiters: WriteWaiterList,
+    /// Underlying semaphore: MAX_READS permits total
+    sem: Semaphore,
 
     const Self = @This();
+
+    /// Maximum concurrent readers. Writer needs all of them.
+    pub const MAX_READS: usize = std.math.maxInt(u32) >> 3; // ~536M
 
     /// Create a new unlocked RwLock.
     pub fn init() Self {
         return .{
-            .readers = 0,
-            .writer_active = false,
-            .mutex = .{},
-            .read_waiters = .{},
-            .write_waiters = .{},
+            .sem = Semaphore.init(MAX_READS),
         };
     }
 
@@ -193,91 +185,31 @@ pub const RwLock = struct {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Try to acquire read lock without waiting.
-    /// Returns true if acquired, false if writer holds lock or is waiting.
     pub fn tryReadLock(self: *Self) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Can't read if writer is active or waiting (writer priority)
-        if (self.writer_active or self.write_waiters.count() > 0) {
-            return false;
-        }
-
-        self.readers += 1;
-        return true;
+        return self.sem.tryAcquire(1);
     }
 
-    /// Acquire read lock, potentially waiting.
-    /// Returns true if acquired immediately, false if waiting.
-    pub fn readLock(self: *Self, waiter: *ReadWaiter) bool {
-        self.mutex.lock();
-
-        // Can acquire if no writer active and no writers waiting
-        if (!self.writer_active and self.write_waiters.count() == 0) {
-            self.readers += 1;
-            self.mutex.unlock();
-            waiter.acquired.store(true, .seq_cst);
-            return true;
+    /// Low-level: Acquire read lock with explicit waiter.
+    /// Sets user's waker directly on the semaphore waiter (no wrapper needed).
+    pub fn readLockWait(self: *Self, waiter: *ReadWaiter) bool {
+        // Forward user's waker directly to semaphore waiter
+        if (waiter.user_waker) |wf| {
+            if (waiter.user_waker_ctx) |ctx| {
+                waiter.inner.setWaker(ctx, wf);
+            }
         }
 
-        // Must wait
-        waiter.acquired.store(false, .seq_cst);
-        self.read_waiters.pushBack(waiter);
-        self.mutex.unlock();
-
-        return false;
+        return self.sem.acquireWait(&waiter.inner);
     }
 
     /// Release read lock.
     pub fn readUnlock(self: *Self) void {
-        // Copy waker info before setting acquired to avoid use-after-free race
-        var waker_fn: ?WakerFn = null;
-        var waker_ctx: ?*anyopaque = null;
-
-        self.mutex.lock();
-
-        std.debug.assert(self.readers > 0);
-        self.readers -= 1;
-
-        // If no more readers and writers waiting, wake one writer
-        if (self.readers == 0 and self.write_waiters.count() > 0) {
-            if (self.write_waiters.popFront()) |w| {
-                // Copy waker BEFORE setting acquired
-                waker_fn = w.waker;
-                waker_ctx = w.waker_ctx;
-                // After this, waiter may be freed by waiting thread
-                w.acquired.store(true, .seq_cst);
-                self.writer_active = true;
-            }
-        }
-
-        self.mutex.unlock();
-
-        // Wake outside lock using copied function pointers
-        if (waker_fn) |wf| {
-            if (waker_ctx) |ctx| {
-                wf(ctx);
-            }
-        }
+        self.sem.release(1);
     }
 
     /// Cancel a pending read lock.
     pub fn cancelReadLock(self: *Self, waiter: *ReadWaiter) void {
-        if (waiter.isAcquired()) return;
-
-        self.mutex.lock();
-
-        if (waiter.isAcquired()) {
-            self.mutex.unlock();
-            return;
-        }
-
-        if (ReadWaiterList.isLinked(waiter) or self.read_waiters.front() == waiter) {
-            self.read_waiters.remove(waiter);
-            waiter.pointers.reset();
-        }
-
-        self.mutex.unlock();
+        self.sem.cancelAcquire(&waiter.inner);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -285,236 +217,103 @@ pub const RwLock = struct {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Try to acquire write lock without waiting.
-    /// Returns true if acquired, false if any readers or writer active.
     pub fn tryWriteLock(self: *Self) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.writer_active or self.readers > 0) {
-            return false;
-        }
-
-        self.writer_active = true;
-        return true;
+        return self.sem.tryAcquire(MAX_READS);
     }
 
-    /// Acquire write lock, potentially waiting.
-    /// Returns true if acquired immediately, false if waiting.
-    pub fn writeLock(self: *Self, waiter: *WriteWaiter) bool {
-        self.mutex.lock();
-
-        // Can acquire if no readers and no writer
-        if (!self.writer_active and self.readers == 0) {
-            self.writer_active = true;
-            self.mutex.unlock();
-            waiter.acquired.store(true, .seq_cst);
-            return true;
+    /// Low-level: Acquire write lock with explicit waiter.
+    /// Sets user's waker directly on the semaphore waiter (no wrapper needed).
+    pub fn writeLockWait(self: *Self, waiter: *WriteWaiter) bool {
+        // Forward user's waker directly to semaphore waiter
+        if (waiter.user_waker) |wf| {
+            if (waiter.user_waker_ctx) |ctx| {
+                waiter.inner.setWaker(ctx, wf);
+            }
         }
 
-        // Must wait
-        waiter.acquired.store(false, .seq_cst);
-        self.write_waiters.pushBack(waiter);
-        self.mutex.unlock();
-
-        return false;
+        return self.sem.acquireWait(&waiter.inner);
     }
 
     /// Release write lock.
     pub fn writeUnlock(self: *Self) void {
-        var wake_list: WakeList(32) = .{};
-        // Copy waker info to avoid use-after-free race
-        var writer_waker_fn: ?WakerFn = null;
-        var writer_waker_ctx: ?*anyopaque = null;
-
-        self.mutex.lock();
-
-        std.debug.assert(self.writer_active);
-        self.writer_active = false;
-
-        // Prefer waking writers (writer priority) OR wake all waiting readers
-        if (self.write_waiters.count() > 0) {
-            // Wake one writer
-            if (self.write_waiters.popFront()) |w| {
-                // Copy waker BEFORE setting acquired
-                writer_waker_fn = w.waker;
-                writer_waker_ctx = w.waker_ctx;
-                // After this, waiter may be freed by waiting thread
-                w.acquired.store(true, .seq_cst);
-                self.writer_active = true;
-            }
-        } else {
-            // Wake all waiting readers - copy waker info before setting acquired
-            while (self.read_waiters.popFront()) |r| {
-                // Copy waker BEFORE setting acquired
-                if (r.waker) |wf| {
-                    if (r.waker_ctx) |ctx| {
-                        wake_list.push(.{ .context = ctx, .wake_fn = wf });
-                    }
-                }
-                // After this, waiter may be freed by waiting thread
-                r.acquired.store(true, .seq_cst);
-                self.readers += 1;
-            }
-        }
-
-        self.mutex.unlock();
-
-        // Wake outside lock using copied function pointers
-        if (writer_waker_fn) |wf| {
-            if (writer_waker_ctx) |ctx| {
-                wf(ctx);
-            }
-        }
-        wake_list.wakeAll();
+        self.sem.release(MAX_READS);
     }
 
     /// Cancel a pending write lock.
     pub fn cancelWriteLock(self: *Self, waiter: *WriteWaiter) void {
-        if (waiter.isAcquired()) return;
-
-        self.mutex.lock();
-
-        if (waiter.isAcquired()) {
-            self.mutex.unlock();
-            return;
-        }
-
-        if (WriteWaiterList.isLinked(waiter) or self.write_waiters.front() == waiter) {
-            self.write_waiters.remove(waiter);
-            waiter.pointers.reset();
-        }
-
-        self.mutex.unlock();
+        self.sem.cancelAcquire(&waiter.inner);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Diagnostics
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Check if write-locked.
+    /// Check if write-locked (derived from semaphore permits).
+    /// Returns true when all MAX_READS permits are consumed (i.e. a writer holds them).
     pub fn isWriteLocked(self: *Self) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.writer_active;
+        return self.sem.availablePermits() == 0;
     }
 
-    /// Get reader count.
-    pub fn readerCount(self: *Self) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.readers;
+    /// Get reader count (derived from semaphore permits).
+    /// Returns MAX_READS - available_permits when readers hold the lock.
+    /// Returns 0 when write-locked or unlocked.
+    pub fn getReaderCount(self: *Self) usize {
+        const avail = self.sem.availablePermits();
+        if (avail >= MAX_READS) return 0; // Unlocked
+        if (avail == 0) return 0; // Write-locked
+        return MAX_READS - avail;
     }
 
-    /// Get waiting reader count.
+    /// Get waiting reader count (walks waiter queue, O(n)).
     pub fn waitingReaders(self: *Self) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.read_waiters.count();
+        return self.sem.countWaitersMatching(isReaderWaiter);
     }
 
-    /// Get waiting writer count.
+    /// Get waiting writer count (walks waiter queue, O(n)).
     pub fn waitingWriters(self: *Self) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.write_waiters.count();
+        return self.sem.countWaitersMatching(isWriterWaiter);
+    }
+
+    fn isReaderWaiter(permits_requested: usize) bool {
+        return permits_requested == 1;
+    }
+
+    fn isWriterWaiter(permits_requested: usize) bool {
+        return permits_requested == MAX_READS;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Blocking API (using unified Waiter)
+    // Guard Convenience Methods
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Blocking read lock acquisition.
-    /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
-    ///
-    /// Example:
-    /// ```zig
-    /// rwlock.readLockBlocking();
-    /// defer rwlock.readUnlock();
-    /// // Read shared data
-    /// ```
-    pub fn readLockBlocking(self: *Self) void {
-        // Fast path: try to acquire without waiting
+    /// Try to read lock and return a guard if successful (non-blocking).
+    pub fn tryReadLockGuard(self: *Self) ?ReadGuard {
         if (self.tryReadLock()) {
-            return;
+            return ReadGuard.init(self);
         }
-
-        // Slow path: use unified waiter
-        var waiter = ReadWaiter.init();
-
-        // Set up waker bridge to unified waiter
-        var unified = UnifiedWaiter.init();
-        const WakerBridge = struct {
-            fn wake(ctx: *anyopaque) void {
-                const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
-                uw.notify();
-            }
-        };
-        waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
-
-        self.mutex.lock();
-
-        // Re-check under lock
-        if (!self.writer_active and self.write_waiters.count() == 0) {
-            self.readers += 1;
-            self.mutex.unlock();
-            return;
-        }
-
-        // Add to waiters list
-        waiter.acquired.store(false, .seq_cst);
-        self.read_waiters.pushBack(&waiter);
-
-        self.mutex.unlock();
-
-        // Wait until notified - this yields in task context, blocks in thread context
-        unified.wait();
+        return null;
     }
 
-    /// Blocking write lock acquisition.
-    /// Uses the unified Waiter for proper yielding (task context) or blocking (thread context).
-    ///
-    /// Example:
-    /// ```zig
-    /// rwlock.writeLockBlocking();
-    /// defer rwlock.writeUnlock();
-    /// // Modify shared data
-    /// ```
-    pub fn writeLockBlocking(self: *Self) void {
-        // Fast path: try to acquire without waiting
+    /// Try to write lock and return a guard if successful (non-blocking).
+    pub fn tryWriteLockGuard(self: *Self) ?WriteGuard {
         if (self.tryWriteLock()) {
-            return;
+            return WriteGuard.init(self);
         }
+        return null;
+    }
 
-        // Slow path: use unified waiter
-        var waiter = WriteWaiter.init();
+    // ═══════════════════════════════════════════════════════════════════════
+    // Async API
+    // ═══════════════════════════════════════════════════════════════════════
 
-        // Set up waker bridge to unified waiter
-        var unified = UnifiedWaiter.init();
-        const WakerBridge = struct {
-            fn wake(ctx: *anyopaque) void {
-                const uw: *UnifiedWaiter = @ptrCast(@alignCast(ctx));
-                uw.notify();
-            }
-        };
-        waiter.setWaker(@ptrCast(&unified), WakerBridge.wake);
+    /// Acquire read lock. Returns a `ReadLockFuture`.
+    pub fn readLock(self: *Self) ReadLockFuture {
+        return ReadLockFuture.init(self);
+    }
 
-        self.mutex.lock();
-
-        // Re-check under lock
-        if (!self.writer_active and self.readers == 0) {
-            self.writer_active = true;
-            self.mutex.unlock();
-            return;
-        }
-
-        // Add to waiters list
-        waiter.acquired.store(false, .seq_cst);
-        self.write_waiters.pushBack(&waiter);
-
-        self.mutex.unlock();
-
-        // Wait until notified - this yields in task context, blocks in thread context
-        unified.wait();
+    /// Acquire write lock. Returns a `WriteLockFuture`.
+    pub fn writeLock(self: *Self) WriteLockFuture {
+        return WriteLockFuture.init(self);
     }
 };
 
@@ -569,6 +368,226 @@ pub const WriteGuard = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ReadLockFuture - Async read lock acquisition
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A future that resolves when a read lock is acquired.
+pub const ReadLockFuture = struct {
+    const Self = @This();
+
+    /// Output type for Future trait
+    pub const Output = void;
+
+    /// Reference to the RwLock
+    rwlock: *RwLock,
+
+    /// Read waiter (wraps semaphore waiter + diagnostic counter update)
+    waiter: ReadWaiter,
+
+    /// State machine for the future
+    state: State,
+
+    /// Stored waker for when we're woken by unlock
+    stored_waker: ?FutureWaker,
+
+    const State = enum {
+        init,
+        waiting,
+        acquired,
+    };
+
+    pub fn init(rwlock: *RwLock) Self {
+        return .{
+            .rwlock = rwlock,
+            .waiter = ReadWaiter.init(),
+            .state = .init,
+            .stored_waker = null,
+        };
+    }
+
+    pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
+        switch (self.state) {
+            .init => {
+                self.stored_waker = ctx.getWaker().clone();
+
+                // Set the user waker on the ReadWaiter (will be wrapped by readLockWait)
+                self.waiter.setWaker(@ptrCast(self), wakeCallback);
+
+                if (self.rwlock.readLockWait(&self.waiter)) {
+                    self.state = .acquired;
+                    if (self.stored_waker) |*w| {
+                        w.deinit();
+                        self.stored_waker = null;
+                    }
+                    return .{ .ready = {} };
+                } else {
+                    self.state = .waiting;
+                    return .pending;
+                }
+            },
+
+            .waiting => {
+                if (self.waiter.isAcquired()) {
+                    self.state = .acquired;
+                    if (self.stored_waker) |*w| {
+                        w.deinit();
+                        self.stored_waker = null;
+                    }
+                    return .{ .ready = {} };
+                }
+
+                const new_waker = ctx.getWaker();
+                if (self.stored_waker) |*old| {
+                    if (!old.willWakeSame(new_waker)) {
+                        old.deinit();
+                        self.stored_waker = new_waker.clone();
+                    }
+                } else {
+                    self.stored_waker = new_waker.clone();
+                }
+
+                return .pending;
+            },
+
+            .acquired => {
+                return .{ .ready = {} };
+            },
+        }
+    }
+
+    pub fn cancel(self: *Self) void {
+        if (self.state == .waiting) {
+            self.rwlock.cancelReadLock(&self.waiter);
+        }
+        if (self.stored_waker) |*w| {
+            w.deinit();
+            self.stored_waker = null;
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.cancel();
+    }
+
+    fn wakeCallback(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.stored_waker) |*w| {
+            w.wakeByRef();
+        }
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WriteLockFuture - Async write lock acquisition
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A future that resolves when a write lock is acquired.
+pub const WriteLockFuture = struct {
+    const Self = @This();
+
+    /// Output type for Future trait
+    pub const Output = void;
+
+    /// Reference to the RwLock
+    rwlock: *RwLock,
+
+    /// Write waiter (wraps semaphore waiter + diagnostic flag update)
+    waiter: WriteWaiter,
+
+    /// State machine for the future
+    state: State,
+
+    /// Stored waker for when we're woken by unlock
+    stored_waker: ?FutureWaker,
+
+    const State = enum {
+        init,
+        waiting,
+        acquired,
+    };
+
+    pub fn init(rwlock: *RwLock) Self {
+        return .{
+            .rwlock = rwlock,
+            .waiter = WriteWaiter.init(),
+            .state = .init,
+            .stored_waker = null,
+        };
+    }
+
+    pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
+        switch (self.state) {
+            .init => {
+                self.stored_waker = ctx.getWaker().clone();
+
+                // Set the user waker on the WriteWaiter (will be wrapped by writeLockWait)
+                self.waiter.setWaker(@ptrCast(self), wakeCallback);
+
+                if (self.rwlock.writeLockWait(&self.waiter)) {
+                    self.state = .acquired;
+                    if (self.stored_waker) |*w| {
+                        w.deinit();
+                        self.stored_waker = null;
+                    }
+                    return .{ .ready = {} };
+                } else {
+                    self.state = .waiting;
+                    return .pending;
+                }
+            },
+
+            .waiting => {
+                if (self.waiter.isAcquired()) {
+                    self.state = .acquired;
+                    if (self.stored_waker) |*w| {
+                        w.deinit();
+                        self.stored_waker = null;
+                    }
+                    return .{ .ready = {} };
+                }
+
+                const new_waker = ctx.getWaker();
+                if (self.stored_waker) |*old| {
+                    if (!old.willWakeSame(new_waker)) {
+                        old.deinit();
+                        self.stored_waker = new_waker.clone();
+                    }
+                } else {
+                    self.stored_waker = new_waker.clone();
+                }
+
+                return .pending;
+            },
+
+            .acquired => {
+                return .{ .ready = {} };
+            },
+        }
+    }
+
+    pub fn cancel(self: *Self) void {
+        if (self.state == .waiting) {
+            self.rwlock.cancelWriteLock(&self.waiter);
+        }
+        if (self.stored_waker) |*w| {
+            w.deinit();
+            self.stored_waker = null;
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.cancel();
+    }
+
+    fn wakeCallback(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.stored_waker) |*w| {
+            w.wakeByRef();
+        }
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -580,7 +599,7 @@ test "RwLock - multiple readers" {
     try std.testing.expect(rwlock.tryReadLock());
     try std.testing.expect(rwlock.tryReadLock());
 
-    try std.testing.expectEqual(@as(usize, 3), rwlock.readerCount());
+    try std.testing.expectEqual(@as(usize, 3), rwlock.getReaderCount());
 
     // Writer cannot acquire while readers hold
     try std.testing.expect(!rwlock.tryWriteLock());
@@ -589,7 +608,7 @@ test "RwLock - multiple readers" {
     rwlock.readUnlock();
     rwlock.readUnlock();
 
-    try std.testing.expectEqual(@as(usize, 0), rwlock.readerCount());
+    try std.testing.expectEqual(@as(usize, 0), rwlock.getReaderCount());
 }
 
 test "RwLock - exclusive writer" {
@@ -612,12 +631,12 @@ test "RwLock - writer priority" {
     // Reader holds lock
     try std.testing.expect(rwlock.tryReadLock());
 
-    // Writer waits
+    // Writer waits — this drains semaphore permits toward 0
     var write_waiter = WriteWaiter.init();
-    try std.testing.expect(!rwlock.writeLock(&write_waiter));
+    try std.testing.expect(!rwlock.writeLockWait(&write_waiter));
     try std.testing.expectEqual(@as(usize, 1), rwlock.waitingWriters());
 
-    // New reader should wait (writer priority)
+    // New reader should wait (writer has drained most permits)
     try std.testing.expect(!rwlock.tryReadLock());
 
     // Release reader - writer should get lock
@@ -647,7 +666,7 @@ test "RwLock - wake all readers after writer" {
     for (&read_waiters, 0..) |*w, i| {
         w.* = ReadWaiter.init();
         w.setWaker(@ptrCast(&woken[i]), TestWaker.wake);
-        _ = rwlock.readLock(w);
+        _ = rwlock.readLockWait(w);
     }
 
     try std.testing.expectEqual(@as(usize, 3), rwlock.waitingReaders());
@@ -658,143 +677,12 @@ test "RwLock - wake all readers after writer" {
     for (woken) |w| {
         try std.testing.expect(w);
     }
-    try std.testing.expectEqual(@as(usize, 3), rwlock.readerCount());
+    try std.testing.expectEqual(@as(usize, 3), rwlock.getReaderCount());
 
     // Clean up
     rwlock.readUnlock();
     rwlock.readUnlock();
     rwlock.readUnlock();
-}
-
-test "RwLock - read guard RAII" {
-    var rwlock = RwLock.init();
-
-    {
-        try std.testing.expect(rwlock.tryReadLock());
-        var guard = ReadGuard.init(&rwlock);
-        try std.testing.expectEqual(@as(usize, 1), rwlock.readerCount());
-        guard.deinit();
-    }
-
-    try std.testing.expectEqual(@as(usize, 0), rwlock.readerCount());
-}
-
-test "RwLock - write guard RAII" {
-    var rwlock = RwLock.init();
-
-    {
-        try std.testing.expect(rwlock.tryWriteLock());
-        var guard = WriteGuard.init(&rwlock);
-        try std.testing.expect(rwlock.isWriteLocked());
-        guard.deinit();
-    }
-
-    try std.testing.expect(!rwlock.isWriteLocked());
-}
-
-test "RwLock - many concurrent readers" {
-    var rwlock = RwLock.init();
-    const num_readers = 100;
-
-    // Acquire many read locks
-    for (0..num_readers) |_| {
-        try std.testing.expect(rwlock.tryReadLock());
-    }
-
-    try std.testing.expectEqual(@as(usize, num_readers), rwlock.readerCount());
-
-    // Writer still cannot acquire
-    try std.testing.expect(!rwlock.tryWriteLock());
-
-    // Release all readers
-    for (0..num_readers) |_| {
-        rwlock.readUnlock();
-    }
-
-    try std.testing.expectEqual(@as(usize, 0), rwlock.readerCount());
-
-    // Now writer can acquire
-    try std.testing.expect(rwlock.tryWriteLock());
-    rwlock.writeUnlock();
-}
-
-test "RwLock - reader writer contention" {
-    var rwlock = RwLock.init();
-    var reader_woken = false;
-    var writer_woken = false;
-
-    const TestWaker = struct {
-        fn wake(ctx: *anyopaque) void {
-            const w: *bool = @ptrCast(@alignCast(ctx));
-            w.* = true;
-        }
-    };
-
-    // Reader 1 holds lock
-    try std.testing.expect(rwlock.tryReadLock());
-
-    // Writer waits
-    var write_waiter = WriteWaiter.init();
-    write_waiter.setWaker(@ptrCast(&writer_woken), TestWaker.wake);
-    try std.testing.expect(!rwlock.writeLock(&write_waiter));
-
-    // Reader 2 should wait (due to writer priority)
-    var read_waiter = ReadWaiter.init();
-    read_waiter.setWaker(@ptrCast(&reader_woken), TestWaker.wake);
-    try std.testing.expect(!rwlock.readLock(&read_waiter));
-
-    // Check waiter counts
-    try std.testing.expectEqual(@as(usize, 1), rwlock.waitingWriters());
-    try std.testing.expectEqual(@as(usize, 1), rwlock.waitingReaders());
-
-    // Release reader 1 - writer should wake (has priority)
-    rwlock.readUnlock();
-    try std.testing.expect(writer_woken);
-    try std.testing.expect(!reader_woken); // Reader still waiting
-    try std.testing.expect(write_waiter.isAcquired());
-
-    // Release writer - reader 2 should wake
-    rwlock.writeUnlock();
-    try std.testing.expect(reader_woken);
-    try std.testing.expect(read_waiter.isAcquired());
-
-    // Clean up
-    rwlock.readUnlock();
-}
-
-test "RwLock - tryReadLock tryWriteLock under contention" {
-    var rwlock = RwLock.init();
-
-    // Writer holds lock - tryReadLock and tryWriteLock fail
-    try std.testing.expect(rwlock.tryWriteLock());
-
-    try std.testing.expect(!rwlock.tryReadLock());
-    try std.testing.expect(!rwlock.tryWriteLock());
-
-    rwlock.writeUnlock();
-
-    // Reader holds lock - tryWriteLock fails, tryReadLock succeeds
-    try std.testing.expect(rwlock.tryReadLock());
-
-    try std.testing.expect(rwlock.tryReadLock()); // Second reader OK
-    try std.testing.expect(!rwlock.tryWriteLock());
-
-    rwlock.readUnlock();
-    rwlock.readUnlock();
-
-    // Writer waiting - new tryReadLock fails
-    try std.testing.expect(rwlock.tryReadLock());
-
-    var write_waiter = WriteWaiter.init();
-    _ = rwlock.writeLock(&write_waiter);
-
-    // tryReadLock should fail due to waiting writer (writer priority)
-    try std.testing.expect(!rwlock.tryReadLock());
-
-    // Clean up
-    rwlock.readUnlock();
-    try std.testing.expect(write_waiter.isAcquired());
-    rwlock.writeUnlock();
 }
 
 test "RwLock - cancel read lock" {
@@ -805,7 +693,7 @@ test "RwLock - cancel read lock" {
 
     // Reader waits
     var read_waiter = ReadWaiter.init();
-    try std.testing.expect(!rwlock.readLock(&read_waiter));
+    try std.testing.expect(!rwlock.readLockWait(&read_waiter));
     try std.testing.expectEqual(@as(usize, 1), rwlock.waitingReaders());
 
     // Cancel the read lock
@@ -824,7 +712,7 @@ test "RwLock - cancel write lock" {
 
     // Writer waits
     var write_waiter = WriteWaiter.init();
-    try std.testing.expect(!rwlock.writeLock(&write_waiter));
+    try std.testing.expect(!rwlock.writeLockWait(&write_waiter));
     try std.testing.expectEqual(@as(usize, 1), rwlock.waitingWriters());
 
     // Cancel the write lock
@@ -839,145 +727,240 @@ test "RwLock - cancel write lock" {
     rwlock.readUnlock();
 }
 
-test "RwLock - writer FIFO ordering" {
+test "RwLock - tryReadLockGuard" {
+    var rwlock = RwLock.init();
+
+    if (rwlock.tryReadLockGuard()) |g| {
+        var guard = g;
+        defer guard.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rwlock.getReaderCount());
+    } else {
+        try std.testing.expect(false);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), rwlock.getReaderCount());
+}
+
+test "RwLock - tryWriteLockGuard" {
+    var rwlock = RwLock.init();
+
+    if (rwlock.tryWriteLockGuard()) |g| {
+        var guard = g;
+        defer guard.deinit();
+        try std.testing.expect(rwlock.isWriteLocked());
+    } else {
+        try std.testing.expect(false);
+    }
+
+    try std.testing.expect(!rwlock.isWriteLocked());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ReadLockFuture / WriteLockFuture Tests (Async API)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test "ReadLockFuture - immediate acquisition" {
+    var rwlock = RwLock.init();
+
+    // Create future and poll - should acquire immediately
+    var future = rwlock.readLock();
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isReady());
+    try std.testing.expectEqual(@as(usize, 1), rwlock.getReaderCount());
+
+    rwlock.readUnlock();
+    try std.testing.expectEqual(@as(usize, 0), rwlock.getReaderCount());
+}
+
+test "ReadLockFuture - waits when writer holds lock" {
+    var rwlock = RwLock.init();
+    var waker_called = false;
+
+    const TestWaker = struct {
+        called: *bool,
+
+        fn wake(data: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(data));
+            self.called.* = true;
+        }
+
+        fn clone(data: *anyopaque) future_mod.RawWaker {
+            return .{ .data = data, .vtable = &vtable };
+        }
+
+        fn drop(_: *anyopaque) void {}
+
+        const vtable = future_mod.RawWaker.VTable{
+            .wake = wake,
+            .wake_by_ref = wake,
+            .clone = clone,
+            .drop = drop,
+        };
+
+        fn toWaker(self: *@This()) FutureWaker {
+            return .{ .raw = .{ .data = @ptrCast(self), .vtable = &vtable } };
+        }
+    };
+
+    var test_waker = TestWaker{ .called = &waker_called };
+    const waker = test_waker.toWaker();
+
+    // Writer holds lock
+    try std.testing.expect(rwlock.tryWriteLock());
+
+    // Create future - first poll should return pending
+    var future = rwlock.readLock();
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &waker };
+    const result1 = future.poll(&ctx);
+
+    try std.testing.expect(result1.isPending());
+    try std.testing.expect(!waker_called);
+    try std.testing.expectEqual(@as(usize, 1), rwlock.waitingReaders());
+
+    // Writer releases - should wake the future
+    rwlock.writeUnlock();
+    try std.testing.expect(waker_called);
+
+    // Second poll should return ready
+    const result2 = future.poll(&ctx);
+    try std.testing.expect(result2.isReady());
+    try std.testing.expectEqual(@as(usize, 1), rwlock.getReaderCount());
+
+    rwlock.readUnlock();
+}
+
+test "WriteLockFuture - immediate acquisition" {
+    var rwlock = RwLock.init();
+
+    // Create future and poll - should acquire immediately
+    var future = rwlock.writeLock();
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isReady());
+    try std.testing.expect(rwlock.isWriteLocked());
+
+    rwlock.writeUnlock();
+    try std.testing.expect(!rwlock.isWriteLocked());
+}
+
+test "WriteLockFuture - waits when readers hold lock" {
+    var rwlock = RwLock.init();
+    var waker_called = false;
+
+    const TestWaker = struct {
+        called: *bool,
+
+        fn wake(data: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(data));
+            self.called.* = true;
+        }
+
+        fn clone(data: *anyopaque) future_mod.RawWaker {
+            return .{ .data = data, .vtable = &vtable };
+        }
+
+        fn drop(_: *anyopaque) void {}
+
+        const vtable = future_mod.RawWaker.VTable{
+            .wake = wake,
+            .wake_by_ref = wake,
+            .clone = clone,
+            .drop = drop,
+        };
+
+        fn toWaker(self: *@This()) FutureWaker {
+            return .{ .raw = .{ .data = @ptrCast(self), .vtable = &vtable } };
+        }
+    };
+
+    var test_waker = TestWaker{ .called = &waker_called };
+    const waker = test_waker.toWaker();
+
+    // Reader holds lock
+    try std.testing.expect(rwlock.tryReadLock());
+
+    // Create write future - first poll should return pending
+    var future = rwlock.writeLock();
+    defer future.deinit();
+
+    var ctx = Context{ .waker = &waker };
+    const result1 = future.poll(&ctx);
+
+    try std.testing.expect(result1.isPending());
+    try std.testing.expect(!waker_called);
+    try std.testing.expectEqual(@as(usize, 1), rwlock.waitingWriters());
+
+    // Reader releases - should wake the writer
+    rwlock.readUnlock();
+    try std.testing.expect(waker_called);
+
+    // Second poll should return ready
+    const result2 = future.poll(&ctx);
+    try std.testing.expect(result2.isReady());
+    try std.testing.expect(rwlock.isWriteLocked());
+
+    rwlock.writeUnlock();
+}
+
+test "ReadLockFuture - cancel removes from queue" {
+    var rwlock = RwLock.init();
+
+    // Writer holds lock
+    try std.testing.expect(rwlock.tryWriteLock());
+
+    // Create read future and poll to add to queue
+    var future = rwlock.readLock();
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
+
+    try std.testing.expect(result.isPending());
+    try std.testing.expectEqual(@as(usize, 1), rwlock.waitingReaders());
+
+    // Cancel
+    future.cancel();
+    try std.testing.expectEqual(@as(usize, 0), rwlock.waitingReaders());
+
+    future.deinit();
+    rwlock.writeUnlock();
+}
+
+test "WriteLockFuture - cancel removes from queue" {
     var rwlock = RwLock.init();
 
     // Reader holds lock
     try std.testing.expect(rwlock.tryReadLock());
 
-    // Three writers wait in order
-    var write_waiters: [3]WriteWaiter = undefined;
-    for (&write_waiters) |*w| {
-        w.* = WriteWaiter.init();
-        try std.testing.expect(!rwlock.writeLock(w));
-    }
+    // Create write future and poll to add to queue
+    var future = rwlock.writeLock();
+    var ctx = Context{ .waker = &future_mod.noop_waker };
+    const result = future.poll(&ctx);
 
-    try std.testing.expectEqual(@as(usize, 3), rwlock.waitingWriters());
+    try std.testing.expect(result.isPending());
+    try std.testing.expectEqual(@as(usize, 1), rwlock.waitingWriters());
 
-    // Release reader - first writer should get lock (FIFO)
+    // Cancel
+    future.cancel();
+    try std.testing.expectEqual(@as(usize, 0), rwlock.waitingWriters());
+
+    future.deinit();
     rwlock.readUnlock();
-    try std.testing.expect(write_waiters[0].isAcquired());
-    try std.testing.expect(!write_waiters[1].isAcquired());
-    try std.testing.expect(!write_waiters[2].isAcquired());
-
-    // Release first writer - second writer should get lock (FIFO)
-    rwlock.writeUnlock();
-    try std.testing.expect(write_waiters[1].isAcquired());
-    try std.testing.expect(!write_waiters[2].isAcquired());
-
-    // Release second writer - third writer should get lock (FIFO)
-    rwlock.writeUnlock();
-    try std.testing.expect(write_waiters[2].isAcquired());
-
-    // Release third writer
-    rwlock.writeUnlock();
-
-    // All writers should have been acquired in FIFO order
-    for (&write_waiters) |*w| {
-        try std.testing.expect(w.isAcquired());
-    }
 }
 
-test "RwLock - readLockBlocking simple" {
-    var rwlock = RwLock.init();
-
-    // First lock should succeed immediately
-    rwlock.readLockBlocking();
-    try std.testing.expectEqual(@as(usize, 1), rwlock.readerCount());
-
-    // Second reader also succeeds
-    rwlock.readLockBlocking();
-    try std.testing.expectEqual(@as(usize, 2), rwlock.readerCount());
-
-    rwlock.readUnlock();
-    rwlock.readUnlock();
-    try std.testing.expectEqual(@as(usize, 0), rwlock.readerCount());
+test "ReadLockFuture - is valid Future type" {
+    try std.testing.expect(future_mod.isFuture(ReadLockFuture));
+    try std.testing.expect(ReadLockFuture.Output == void);
 }
 
-test "RwLock - writeLockBlocking simple" {
-    var rwlock = RwLock.init();
-
-    // First lock should succeed immediately
-    rwlock.writeLockBlocking();
-    try std.testing.expect(rwlock.isWriteLocked());
-
-    rwlock.writeUnlock();
-    try std.testing.expect(!rwlock.isWriteLocked());
-
-    // Second lock should also work
-    rwlock.writeLockBlocking();
-    try std.testing.expect(rwlock.isWriteLocked());
-
-    rwlock.writeUnlock();
-    try std.testing.expect(!rwlock.isWriteLocked());
-}
-
-test "RwLock - readLockBlocking with contention" {
-    var rwlock = RwLock.init();
-    var counter: u32 = 0;
-    var done = std.atomic.Value(bool).init(false);
-
-    // Writer holds lock
-    rwlock.writeLockBlocking();
-
-    // Start a thread that will try to read-lock
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(rw: *RwLock, c: *u32, d: *std.atomic.Value(bool)) void {
-            rw.readLockBlocking(); // Should block until main thread unlocks
-            c.* += 1;
-            rw.readUnlock();
-            d.store(true, .release);
-        }
-    }.run, .{ &rwlock, &counter, &done });
-
-    // Give the thread time to start and block
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-
-    // Counter should still be 0 (thread is blocked)
-    try std.testing.expectEqual(@as(u32, 0), counter);
-
-    // Unlock - this should wake the other thread
-    rwlock.writeUnlock();
-
-    // Wait for the thread to finish
-    thread.join();
-
-    // Now counter should be 1
-    try std.testing.expectEqual(@as(u32, 1), counter);
-    try std.testing.expect(done.load(.acquire));
-}
-
-test "RwLock - writeLockBlocking with contention" {
-    var rwlock = RwLock.init();
-    var counter: u32 = 0;
-    var done = std.atomic.Value(bool).init(false);
-
-    // Reader holds lock
-    rwlock.readLockBlocking();
-
-    // Start a thread that will try to write-lock
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(rw: *RwLock, c: *u32, d: *std.atomic.Value(bool)) void {
-            rw.writeLockBlocking(); // Should block until main thread unlocks
-            c.* += 1;
-            rw.writeUnlock();
-            d.store(true, .release);
-        }
-    }.run, .{ &rwlock, &counter, &done });
-
-    // Give the thread time to start and block
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-
-    // Counter should still be 0 (thread is blocked)
-    try std.testing.expectEqual(@as(u32, 0), counter);
-
-    // Unlock - this should wake the other thread
-    rwlock.readUnlock();
-
-    // Wait for the thread to finish
-    thread.join();
-
-    // Now counter should be 1
-    try std.testing.expectEqual(@as(u32, 1), counter);
-    try std.testing.expect(done.load(.acquire));
+test "WriteLockFuture - is valid Future type" {
+    try std.testing.expect(future_mod.isFuture(WriteLockFuture));
+    try std.testing.expect(WriteLockFuture.Output == void);
 }

@@ -19,7 +19,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     // Initialize shutdown handler
-    var shutdown = io.Shutdown.init() catch |err| {
+    var shutdown = io.shutdown.Shutdown.init() catch |err| {
         std.debug.print("Failed to init shutdown handler: {}\n", .{err});
         std.debug.print("(This is normal in some restricted environments)\n", .{});
         return;
@@ -27,7 +27,7 @@ pub fn main() !void {
     defer shutdown.deinit();
 
     // Create listener
-    var listener = try io.listen("0.0.0.0:8080");
+    var listener = try io.net.listen("0.0.0.0:8080");
     defer listener.close();
 
     std.debug.print("Graceful Shutdown Demo\n", .{});

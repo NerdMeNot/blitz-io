@@ -93,6 +93,9 @@ pub const Shutdown = struct {
     /// Mutex for state changes
     mutex: std.Thread.Mutex,
 
+    /// Condition variable for waiting on pending work completion
+    pending_cond: std.Thread.Condition,
+
     const Self = @This();
 
     /// Initialize shutdown handler.
@@ -105,6 +108,7 @@ pub const Shutdown = struct {
             .trigger_signal = null,
             .pending_count = std.atomic.Value(usize).init(0),
             .mutex = .{},
+            .pending_cond = .{},
         };
     }
 
@@ -116,6 +120,7 @@ pub const Shutdown = struct {
             .trigger_signal = null,
             .pending_count = std.atomic.Value(usize).init(0),
             .mutex = .{},
+            .pending_cond = .{},
         };
     }
 
@@ -222,16 +227,28 @@ pub const Shutdown = struct {
 
     /// Wait for pending work with a custom timeout.
     pub fn waitPendingTimeout(self: *Self, timeout: Duration) bool {
-        const deadline = Instant.now().add(timeout);
+        const timeout_ns = timeout.asNanos();
 
-        while (self.pendingCount() > 0) {
-            if (!Instant.now().isBefore(deadline)) {
-                return false; // Timeout
-            }
-            std.Thread.sleep(1_000_000); // 1ms
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.pending_count.load(.acquire) > 0) {
+            self.pending_cond.timedWait(&self.mutex, timeout_ns) catch {
+                // Timed out - check one more time (might have been signaled)
+                return self.pending_count.load(.acquire) == 0;
+            };
         }
 
         return true;
+    }
+
+    /// Signal that pending count may have changed.
+    /// Called by WorkGuard when work completes.
+    fn signalPendingComplete(self: *Self) void {
+        // Only signal if count might have reached zero
+        if (self.pending_count.load(.acquire) == 0) {
+            self.pending_cond.broadcast();
+        }
     }
 };
 
@@ -310,6 +327,7 @@ pub const WorkGuard = struct {
         if (!self.completed) {
             self.completed = true;
             _ = self.shutdown.pending_count.fetchSub(1, .acq_rel);
+            self.shutdown.signalPendingComplete();
         }
     }
 

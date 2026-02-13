@@ -61,8 +61,6 @@
 //! try sockets[0].send("Hello from parent");
 //! const n = try sockets[1].recv(&buf);
 //! ```
-//!
-//! Reference: tokio/src/net/unix/mod.rs
 
 const std = @import("std");
 const builtin = @import("builtin");

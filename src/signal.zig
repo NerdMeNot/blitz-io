@@ -1,7 +1,25 @@
-//! Async Signal Handling
+//! # Async Signal Handling
 //!
 //! Provides async-aware signal handling that integrates with the
-//! blitz-io task system. Similar to tokio::signal module.
+//! blitz-io task system.
+//!
+//! ## Overview
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | `AsyncSignal` | Async signal handler with waiter-based API |
+//! | `Signal` | Signal type enum (SIGINT, SIGTERM, etc.) |
+//! | `SignalSet` | Set of signals to handle |
+//! | `SignalWaiter` | Waiter for signal notification |
+//! | `SignalFuture` | Future for use with Select/Join combinators |
+//!
+//! | Function | Description |
+//! |----------|-------------|
+//! | `AsyncSignal.ctrlC()` | Handle Ctrl+C (SIGINT) |
+//! | `AsyncSignal.terminate()` | Handle SIGTERM |
+//! | `AsyncSignal.shutdown()` | Handle SIGINT + SIGTERM |
+//! | `waitForCtrlC()` | Blocking wait for Ctrl+C |
+//! | `waitForShutdown()` | Blocking wait for shutdown signal |
 //!
 //! ## Usage
 //!
@@ -26,18 +44,17 @@
 //! - Permit-based semantics for signal-before-wait race
 //! - Multiple waiters can wait on the same signal
 //!
-//! Reference: tokio/src/signal/mod.rs
 
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
-const LinkedList = @import("util/linked_list.zig").LinkedList;
-const Pointers = @import("util/linked_list.zig").Pointers;
-const WakeList = @import("util/wake_list.zig").WakeList;
+const LinkedList = @import("internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("internal/util/linked_list.zig").Pointers;
+const WakeList = @import("internal/util/wake_list.zig").WakeList;
 
 // Re-export underlying signal types
-pub const signal_handler = @import("util/signal.zig");
+pub const signal_handler = @import("internal/util/signal.zig");
 pub const Signal = signal_handler.Signal;
 pub const SignalSet = signal_handler.SignalSet;
 pub const SignalHandler = signal_handler.SignalHandler;
@@ -63,6 +80,15 @@ pub const SignalWaiter = struct {
         return .{};
     }
 
+    /// Create a waiter with waker already configured.
+    /// Reduces the 3-step ceremony (init + setWaker + wait) to 2 steps.
+    pub fn initWithWaker(ctx: *anyopaque, wake_fn: WakerFn) Self {
+        return .{
+            .waker_ctx = ctx,
+            .waker = wake_fn,
+        };
+    }
+
     pub fn setWaker(self: *Self, ctx: *anyopaque, wake_fn: WakerFn) void {
         self.waker_ctx = ctx;
         self.waker = wake_fn;
@@ -76,9 +102,14 @@ pub const SignalWaiter = struct {
         }
     }
 
-    pub fn isComplete(self: *const Self) bool {
+    /// Check if the waiter is ready (signal received).
+    /// This is the unified completion check method across all sync primitives.
+    pub fn isReady(self: *const Self) bool {
         return self.notified;
     }
+
+    /// Check if complete (alias for isReady).
+    pub const isComplete = isReady;
 
     /// Get the signal that was received (if any).
     pub fn signal(self: *const Self) ?Signal {

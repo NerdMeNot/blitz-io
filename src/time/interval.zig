@@ -28,13 +28,12 @@
 //! - Compensates for drift (missed ticks don't accumulate delay)
 //! - Uses waiter pattern for async integration
 //!
-//! Reference: tokio/src/time/interval.rs
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-const LinkedList = @import("../util/linked_list.zig").LinkedList;
-const Pointers = @import("../util/linked_list.zig").Pointers;
+const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("../internal/util/linked_list.zig").Pointers;
 
 const time_types = @import("../time.zig");
 pub const Duration = time_types.Duration;
@@ -99,7 +98,7 @@ pub const MissedTickBehavior = enum {
     /// Skip missed ticks and schedule from now.
     skip,
 
-    /// Delay the next tick (default, matches Tokio).
+    /// Delay the next tick (default).
     delay,
 };
 
@@ -339,7 +338,7 @@ const driver_mod = @import("driver.zig");
 const TimerDriver = driver_mod.TimerDriver;
 const TimerHandle = driver_mod.TimerHandle;
 
-const timer_mod = @import("../coroutine/timer.zig");
+const timer_mod = @import("../internal/scheduler/TimerWheel.zig");
 const TimerEntry = timer_mod.TimerEntry;
 
 /// Tick using the TimerDriver for automatic wakeup.

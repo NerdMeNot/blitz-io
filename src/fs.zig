@@ -1,6 +1,31 @@
-//! Filesystem Module
+//! # Filesystem Module
 //!
 //! Provides file and directory operations for blitz-io.
+//!
+//! ## Overview
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | `File` | File handle for reading/writing |
+//! | `AsyncFile` | Async file handle using runtime I/O backend |
+//! | `ReadDir` | Directory entry iterator |
+//! | `DirEntry` | Entry returned from directory iteration |
+//! | `Metadata` | File metadata (size, timestamps, permissions) |
+//! | `OpenOptions` | Options for opening files |
+//!
+//! | Function | Description |
+//! |----------|-------------|
+//! | `readFile` | Read entire file contents |
+//! | `writeFile` | Write data to file (creates/truncates) |
+//! | `appendFile` | Append data to file |
+//! | `createDir` | Create a directory |
+//! | `createDirAll` | Create directory with parents |
+//! | `removeDir` | Remove empty directory |
+//! | `removeDirAll` | Remove directory recursively |
+//! | `readDir` | Iterate over directory entries |
+//! | `copy` | Copy a file |
+//! | `rename` | Rename/move file or directory |
+//! | `exists` | Check if path exists |
 //!
 //! ## Quick Start
 //!

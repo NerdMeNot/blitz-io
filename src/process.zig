@@ -1,6 +1,24 @@
-//! Process Module
+//! # Process Module
 //!
 //! Async-aware process spawning and management for the blitz-io runtime.
+//!
+//! ## Overview
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | `Command` | Command builder for spawning processes |
+//! | `Child` | Running child process |
+//! | `ExitStatus` | Process exit status |
+//! | `Stdio` | Stdin/stdout/stderr configuration |
+//! | `Output` | Collected stdout/stderr output |
+//! | `WaitWaiter` | Waiter for process completion |
+//!
+//! | Function | Description |
+//! |----------|-------------|
+//! | `run` | Execute command and wait for completion |
+//! | `output` | Execute command and collect output |
+//! | `shell` | Execute shell command string |
+//! | `shellOutput` | Execute shell command and collect output |
 //!
 //! ## Quick Start
 //!
@@ -62,7 +80,6 @@
 //! - Non-blocking wait with WNOHANG
 //! - Piped I/O integration with async streams
 //!
-//! Reference: tokio/src/process/mod.rs
 
 const std = @import("std");
 const builtin = @import("builtin");

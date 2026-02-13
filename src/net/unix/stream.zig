@@ -22,16 +22,14 @@
 //! defer stream.close();
 //! try stream.writeAll("Hello!");
 //! ```
-//!
-//! Reference: tokio/src/net/unix/stream.rs
 
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
-const LinkedList = @import("../../util/linked_list.zig").LinkedList;
-const Pointers = @import("../../util/linked_list.zig").Pointers;
+const LinkedList = @import("../../internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("../../internal/util/linked_list.zig").Pointers;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Unix Socket Address
@@ -101,6 +99,7 @@ pub const UnixAddr = struct {
 // Waiter
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Function pointer type for waking a suspended task.
 pub const WakerFn = *const fn (*anyopaque) void;
 
 pub const StreamWaiter = struct {

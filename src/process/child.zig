@@ -21,7 +21,6 @@
 //! const status = try child.waitBlocking();
 //! ```
 //!
-//! Reference: tokio/src/process/mod.rs
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,8 +28,8 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const windows = if (builtin.os.tag == .windows) std.os.windows else undefined;
 
-const LinkedList = @import("../util/linked_list.zig").LinkedList;
-const Pointers = @import("../util/linked_list.zig").Pointers;
+const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("../internal/util/linked_list.zig").Pointers;
 
 // Cross-platform file handle type
 const FileHandle = if (builtin.os.tag == .windows)

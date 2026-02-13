@@ -28,14 +28,14 @@
 //! - Thread-safe via internal mutex
 //! - Zero-allocation for timer registration (entries are stack-allocated by callers)
 //!
-//! Reference: tokio/src/time/driver/mod.rs
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const timer_mod = @import("../coroutine/timer.zig");
+const timer_mod = @import("../internal/scheduler/TimerWheel.zig");
 const TimerWheel = timer_mod.TimerWheel;
 const TimerEntry = timer_mod.TimerEntry;
+/// Function pointer type for waking a suspended task.
 pub const WakerFn = timer_mod.WakerFn;
 
 const time_types = @import("../time.zig");

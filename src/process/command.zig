@@ -17,7 +17,6 @@
 //!     .spawn();
 //! ```
 //!
-//! Reference: tokio/src/process/mod.rs, std::process::Command
 
 const std = @import("std");
 const builtin = @import("builtin");

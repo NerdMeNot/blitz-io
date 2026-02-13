@@ -1,6 +1,6 @@
 //! UDP Socket - Production-Quality Implementation
 //!
-//! Provides Tokio-level UDP networking with:
+//! Provides production-grade UDP networking with:
 //! - One-to-many: bind() + sendTo()/recvFrom() for multiple remotes
 //! - One-to-one: connect() + send()/recv() for single remote
 //! - Full socket options (broadcast, multicast, TTL, TOS)
@@ -29,8 +29,6 @@
 //! _ = try socket.trySend("hello");
 //! const n = try socket.tryRecv(&buf) orelse 0;
 //! ```
-//!
-//! Reference: tokio/src/net/udp.rs
 
 const std = @import("std");
 const posix = std.posix;
@@ -39,13 +37,16 @@ const builtin = @import("builtin");
 
 const Address = @import("address.zig").Address;
 const Duration = @import("../time.zig").Duration;
-const io = @import("../io.zig");
-const ScheduledIo = @import("../backend/scheduled_io.zig").ScheduledIo;
-const Ready = @import("../backend/scheduled_io.zig").Ready;
-const Interest = @import("../backend/scheduled_io.zig").Interest;
-const Waker = @import("../backend/scheduled_io.zig").Waker;
+const io = @import("../stream.zig");
+const ScheduledIo = @import("../internal/backend/scheduled_io.zig").ScheduledIo;
+const Ready = @import("../internal/backend/scheduled_io.zig").Ready;
+const Interest = @import("../internal/backend/scheduled_io.zig").Interest;
+const Waker = @import("../internal/backend/scheduled_io.zig").Waker;
+const FutureWaker = @import("../future/Waker.zig").Waker;
+const FutureContext = @import("../future/Waker.zig").Context;
+const FuturePollResult = @import("../future/Poll.zig").PollResult;
 const runtime_mod = @import("../runtime.zig");
-const IoDriver = @import("../io_driver.zig").IoDriver;
+const IoDriver = @import("../internal/io_driver.zig").IoDriver;
 
 // IP socket options (cross-platform definitions)
 // Linux values from linux/in.h, macOS/BSD values from netinet/in.h
@@ -213,17 +214,6 @@ pub const UdpSocket = struct {
         return n;
     }
 
-    /// Send all data to the connected peer (loops until complete or error).
-    pub fn sendAll(self: *UdpSocket, data: []const u8) !void {
-        // UDP sends are atomic - either all or nothing
-        while (true) {
-            if (try self.trySend(data)) |_| {
-                return;
-            }
-            // Would block - in async context, would yield here
-            std.Thread.sleep(1_000); // 1µs backoff
-        }
-    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Sending (one-to-many)
@@ -239,15 +229,6 @@ pub const UdpSocket = struct {
         return n;
     }
 
-    /// Send all data to address (loops until complete or error).
-    pub fn sendAllTo(self: *UdpSocket, data: []const u8, addr: Address) !void {
-        while (true) {
-            if (try self.trySendTo(data, addr)) |_| {
-                return;
-            }
-            std.Thread.sleep(1_000);
-        }
-    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Receiving (one-to-one, requires connect())
@@ -563,13 +544,13 @@ pub const UdpSocket = struct {
 
     /// Returns a future that sends data to the connected peer.
     /// The socket must be connected via `connect()` first.
-    pub fn sendAsync(self: *UdpSocket, data: []const u8) SendFuture {
+    pub fn send(self: *UdpSocket, data: []const u8) SendFuture {
         return .{ .socket = self, .data = data };
     }
 
     /// Returns a future that receives data from the connected peer.
     /// The socket must be connected via `connect()` first.
-    pub fn recvAsync(self: *UdpSocket, buf: []u8) RecvFuture {
+    pub fn recv(self: *UdpSocket, buf: []u8) RecvFuture {
         return .{ .socket = self, .buf = buf };
     }
 
@@ -578,17 +559,17 @@ pub const UdpSocket = struct {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Returns a future that sends data to a specific address.
-    pub fn sendToAsync(self: *UdpSocket, data: []const u8, addr: Address) SendToFuture {
+    pub fn sendTo(self: *UdpSocket, data: []const u8, addr: Address) SendToFuture {
         return .{ .socket = self, .data = data, .addr = addr };
     }
 
     /// Returns a future that receives data from any sender.
-    pub fn recvFromAsync(self: *UdpSocket, buf: []u8) RecvFromFuture {
+    pub fn recvFrom(self: *UdpSocket, buf: []u8) RecvFromFuture {
         return .{ .socket = self, .buf = buf };
     }
 
     /// Returns a future that peeks at data without consuming it.
-    pub fn peekAsync(self: *UdpSocket, buf: []u8) PeekFuture {
+    pub fn peek(self: *UdpSocket, buf: []u8) PeekFuture {
         return .{ .socket = self, .buf = buf };
     }
 
@@ -685,199 +666,297 @@ pub const UdpSocket = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Poll Result for Futures
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Result of polling a future.
-pub fn PollResult(comptime T: type) type {
-    return union(enum) {
-        ready: T,
-        pending,
-        err: anyerror,
-    };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // Async Futures
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Future for waiting until socket becomes readable.
 pub const ReadableFuture = struct {
+    pub const Output = anyerror!void;
+
     socket: *UdpSocket,
+    stored_waker: ?FutureWaker = null,
 
     /// Poll the future.
-    pub fn poll(self: *ReadableFuture, waker: Waker) PollResult(void) {
+    pub fn poll(self: *ReadableFuture, ctx: *FutureContext) FuturePollResult(Output) {
         // Try a zero-length peek to check readiness
         _ = posix.recv(self.socket.fd, &[_]u8{}, posix.MSG.PEEK | posix.MSG.DONTWAIT) catch |err| switch (err) {
             error.WouldBlock => {
                 // Register waker for read readiness
+                updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
-                    sio.setReaderWaker(waker);
+                    sio.setReaderWaker(bridgeWaker(&self.stored_waker));
                 }
                 return .pending;
             },
-            else => return .{ .err = err },
+            else => return .{ .ready = err },
         };
         return .{ .ready = {} };
+    }
+
+    pub fn deinit(self: *ReadableFuture) void {
+        cleanupStoredWaker(&self.stored_waker);
     }
 };
 
 /// Future for waiting until socket becomes writable.
 pub const WritableFuture = struct {
+    pub const Output = anyerror!void;
+
     socket: *UdpSocket,
+    stored_waker: ?FutureWaker = null,
 
     /// Poll the future.
-    pub fn poll(self: *WritableFuture, waker: Waker) PollResult(void) {
+    pub fn poll(self: *WritableFuture, ctx: *FutureContext) FuturePollResult(Output) {
         // Check write readiness via getsockopt
         const err_val = getU32Option(self.socket.fd, posix.SOL.SOCKET, posix.SO.ERROR) catch |err| {
-            return .{ .err = err };
+            return .{ .ready = err };
         };
         if (err_val != 0) {
-            return .{ .err = posix.unexpectedErrno(@enumFromInt(@as(u16, @intCast(err_val)))) };
+            return .{ .ready = posix.unexpectedErrno(@enumFromInt(@as(u16, @intCast(err_val)))) };
         }
 
         // Register waker for write readiness
         if (self.socket.scheduled_io) |sio| {
             // If already writable, return ready
-            const ready = sio.readiness();
-            if (ready.isWritable()) {
+            const event = sio.readiness();
+            if (event.ready.isWritable()) {
                 return .{ .ready = {} };
             }
-            sio.setWriterWaker(waker);
+            updateStoredWaker(&self.stored_waker, ctx);
+            sio.setWriterWaker(bridgeWaker(&self.stored_waker));
         }
 
         return .pending;
+    }
+
+    pub fn deinit(self: *WritableFuture) void {
+        cleanupStoredWaker(&self.stored_waker);
     }
 };
 
 /// Future for waiting until socket is ready for specified interest.
 pub const ReadyFuture = struct {
+    pub const Output = Ready;
+
     socket: *UdpSocket,
     interest: Interest,
+    stored_waker: ?FutureWaker = null,
 
     /// Poll the future.
-    pub fn poll(self: *ReadyFuture, waker: Waker) PollResult(Ready) {
+    pub fn poll(self: *ReadyFuture, ctx: *FutureContext) FuturePollResult(Output) {
         if (self.socket.scheduled_io) |sio| {
-            const ready = sio.readiness();
-            const interested = ready.intersection(self.interest.toReady());
-            if (!interested.isEmpty()) {
-                return .{ .ready = interested };
+            const event = sio.readiness();
+            // Match readiness against interest
+            var matched = Ready{};
+            if (self.interest.readable and event.ready.isReadable()) {
+                matched.readable = true;
+            }
+            if (self.interest.writable and event.ready.isWritable()) {
+                matched.writable = true;
+            }
+            if (matched.readable or matched.writable) {
+                return .{ .ready = matched };
             }
 
+            updateStoredWaker(&self.stored_waker, ctx);
             if (self.interest.readable) {
-                sio.setReaderWaker(waker);
+                sio.setReaderWaker(bridgeWaker(&self.stored_waker));
             }
             if (self.interest.writable) {
-                sio.setWriterWaker(waker);
+                sio.setWriterWaker(bridgeWaker(&self.stored_waker));
             }
         }
         return .pending;
+    }
+
+    pub fn deinit(self: *ReadyFuture) void {
+        cleanupStoredWaker(&self.stored_waker);
     }
 };
 
 /// Future for sending data (connected mode).
 pub const SendFuture = struct {
+    pub const Output = anyerror!usize;
+
     socket: *UdpSocket,
     data: []const u8,
+    stored_waker: ?FutureWaker = null,
 
     /// Poll the future.
-    pub fn poll(self: *SendFuture, waker: Waker) PollResult(usize) {
+    pub fn poll(self: *SendFuture, ctx: *FutureContext) FuturePollResult(Output) {
         const n = posix.send(self.socket.fd, self.data, 0) catch |err| switch (err) {
             error.WouldBlock => {
+                updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
-                    sio.setWriterWaker(waker);
+                    sio.setWriterWaker(bridgeWaker(&self.stored_waker));
                 }
                 return .pending;
             },
-            else => return .{ .err = err },
+            else => return .{ .ready = err },
         };
         return .{ .ready = n };
+    }
+
+    pub fn deinit(self: *SendFuture) void {
+        cleanupStoredWaker(&self.stored_waker);
     }
 };
 
 /// Future for receiving data (connected mode).
 pub const RecvFuture = struct {
+    pub const Output = anyerror!usize;
+
     socket: *UdpSocket,
     buf: []u8,
+    stored_waker: ?FutureWaker = null,
 
     /// Poll the future.
-    pub fn poll(self: *RecvFuture, waker: Waker) PollResult(usize) {
+    pub fn poll(self: *RecvFuture, ctx: *FutureContext) FuturePollResult(Output) {
         const n = posix.recv(self.socket.fd, self.buf, 0) catch |err| switch (err) {
             error.WouldBlock => {
+                updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
-                    sio.setReaderWaker(waker);
+                    sio.setReaderWaker(bridgeWaker(&self.stored_waker));
                 }
                 return .pending;
             },
-            else => return .{ .err = err },
+            else => return .{ .ready = err },
         };
         return .{ .ready = n };
+    }
+
+    pub fn deinit(self: *RecvFuture) void {
+        cleanupStoredWaker(&self.stored_waker);
     }
 };
 
 /// Future for sending data to a specific address.
 pub const SendToFuture = struct {
+    pub const Output = anyerror!usize;
+
     socket: *UdpSocket,
     data: []const u8,
     addr: Address,
+    stored_waker: ?FutureWaker = null,
 
     /// Poll the future.
-    pub fn poll(self: *SendToFuture, waker: Waker) PollResult(usize) {
+    pub fn poll(self: *SendToFuture, ctx: *FutureContext) FuturePollResult(Output) {
         const n = posix.sendto(self.socket.fd, self.data, 0, self.addr.sockaddr(), self.addr.len) catch |err| switch (err) {
             error.WouldBlock => {
+                updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
-                    sio.setWriterWaker(waker);
+                    sio.setWriterWaker(bridgeWaker(&self.stored_waker));
                 }
                 return .pending;
             },
-            else => return .{ .err = err },
+            else => return .{ .ready = err },
         };
         return .{ .ready = n };
+    }
+
+    pub fn deinit(self: *SendToFuture) void {
+        cleanupStoredWaker(&self.stored_waker);
     }
 };
 
 /// Future for receiving data from any sender.
 pub const RecvFromFuture = struct {
+    pub const Output = anyerror!UdpSocket.RecvFromResult;
+
     socket: *UdpSocket,
     buf: []u8,
+    stored_waker: ?FutureWaker = null,
 
     /// Poll the future.
-    pub fn poll(self: *RecvFromFuture, waker: Waker) PollResult(UdpSocket.RecvFromResult) {
+    pub fn poll(self: *RecvFromFuture, ctx: *FutureContext) FuturePollResult(Output) {
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
 
         const n = posix.recvfrom(self.socket.fd, self.buf, 0, addr.sockaddrMut(), &addr.len) catch |err| switch (err) {
             error.WouldBlock => {
+                updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
-                    sio.setReaderWaker(waker);
+                    sio.setReaderWaker(bridgeWaker(&self.stored_waker));
                 }
                 return .pending;
             },
-            else => return .{ .err = err },
+            else => return .{ .ready = err },
         };
         return .{ .ready = .{ .len = n, .addr = addr } };
+    }
+
+    pub fn deinit(self: *RecvFromFuture) void {
+        cleanupStoredWaker(&self.stored_waker);
     }
 };
 
 /// Future for peeking at data.
 pub const PeekFuture = struct {
+    pub const Output = anyerror!usize;
+
     socket: *UdpSocket,
     buf: []u8,
+    stored_waker: ?FutureWaker = null,
 
     /// Poll the future.
-    pub fn poll(self: *PeekFuture, waker: Waker) PollResult(usize) {
+    pub fn poll(self: *PeekFuture, ctx: *FutureContext) FuturePollResult(Output) {
         const n = posix.recv(self.socket.fd, self.buf, posix.MSG.PEEK) catch |err| switch (err) {
             error.WouldBlock => {
+                updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
-                    sio.setReaderWaker(waker);
+                    sio.setReaderWaker(bridgeWaker(&self.stored_waker));
                 }
                 return .pending;
             },
-            else => return .{ .err = err },
+            else => return .{ .ready = err },
         };
         return .{ .ready = n };
     }
+
+    pub fn deinit(self: *PeekFuture) void {
+        cleanupStoredWaker(&self.stored_waker);
+    }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Future Waker Bridge Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Update a stored Future Waker from poll context.
+fn updateStoredWaker(slot: *?FutureWaker, ctx: *FutureContext) void {
+    const new_waker = ctx.getWaker();
+    if (slot.*) |*old| {
+        if (!old.willWakeSame(new_waker)) {
+            old.deinit();
+            slot.* = new_waker.clone();
+        }
+    } else {
+        slot.* = new_waker.clone();
+    }
+}
+
+/// Clean up a stored Future Waker.
+fn cleanupStoredWaker(slot: *?FutureWaker) void {
+    if (slot.*) |*w| {
+        w.deinit();
+        slot.* = null;
+    }
+}
+
+/// Create a backend I/O Waker that bridges to a stored Future Waker.
+fn bridgeWaker(slot: *?FutureWaker) Waker {
+    return .{
+        .context = @ptrCast(slot),
+        .wake_fn = bridgeWakeFn,
+    };
+}
+
+fn bridgeWakeFn(ctx: *anyopaque) void {
+    const slot: *?FutureWaker = @ptrCast(@alignCast(ctx));
+    if (slot.*) |*w| {
+        w.wakeByRef();
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Helper Functions
@@ -1110,11 +1189,11 @@ test "UdpSocket - async futures creation" {
     _ = socket.readable();
     _ = socket.writable();
     _ = socket.ready(.{ .readable = true, .writable = false });
-    _ = socket.sendAsync("test");
-    _ = socket.recvAsync(&buf);
-    _ = socket.sendToAsync("test", server_addr);
-    _ = socket.recvFromAsync(&buf);
-    _ = socket.peekAsync(&buf);
+    _ = socket.send("test");
+    _ = socket.recv(&buf);
+    _ = socket.sendTo("test", server_addr);
+    _ = socket.recvFrom(&buf);
+    _ = socket.peek(&buf);
 }
 
 test "UdpSocket - reader/writer interfaces" {

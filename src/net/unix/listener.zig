@@ -2,7 +2,7 @@
 //!
 //! Async Unix domain socket listener for accepting connections.
 //!
-//! ## Usage
+//! ## Usage (Async - Default)
 //!
 //! ```zig
 //! const unix = @import("blitz-io").net.unix;
@@ -10,13 +10,17 @@
 //! var listener = try unix.UnixListener.bind("/tmp/my.sock");
 //! defer listener.close();
 //!
-//! while (true) {
-//!     const conn = try listener.accept();
-//!     // Handle conn.stream
-//! }
+//! // Async accept - returns a Future
+//! var accept_future = listener.accept();
+//! const result = accept_future.poll(ctx);  // Returns .pending or .ready
 //! ```
 //!
-//! Reference: tokio/src/net/unix/listener.rs
+//! ## Usage (Blocking - Explicit Opt-in)
+//!
+//! ```zig
+//! // Blocking accept - spins until connection available
+//! const conn = try listener.blockingAccept();
+//! ```
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,13 +30,20 @@ const stream_mod = @import("stream.zig");
 const UnixStream = stream_mod.UnixStream;
 const UnixAddr = stream_mod.UnixAddr;
 
-const LinkedList = @import("../../util/linked_list.zig").LinkedList;
-const Pointers = @import("../../util/linked_list.zig").Pointers;
+const LinkedList = @import("../../internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("../../internal/util/linked_list.zig").Pointers;
+
+// Future types
+const future_mod = @import("../../future.zig");
+const Context = future_mod.Context;
+const PollResult = future_mod.PollResult;
+const Waker = future_mod.Waker;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Function pointer type for waking a suspended task.
 pub const WakerFn = *const fn (*anyopaque) void;
 
 pub const AcceptWaiter = struct {
@@ -89,6 +100,115 @@ pub const AcceptResult = struct {
     /// Get just the stream, discarding the peer address.
     pub fn intoStream(self: AcceptResult) UnixStream {
         return self.stream;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AcceptFuture
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Future for async accept operations.
+///
+/// Polls the listener for incoming connections without blocking.
+/// Use with async runtime's spawn() or poll directly.
+pub const AcceptFuture = struct {
+    pub const Output = AcceptResult;
+    pub const Error = std.posix.AcceptError;
+
+    listener: *UnixListener,
+    stored_waker: ?Waker = null,
+    waiter: AcceptWaiter = .{},
+    state: State = .init,
+
+    const State = enum {
+        init,
+        waiting,
+        ready,
+    };
+
+    const Self = @This();
+
+    pub fn init(listener: *UnixListener) Self {
+        return .{ .listener = listener };
+    }
+
+    pub fn poll(self: *Self, ctx: *Context) PollResult(Output) {
+        switch (self.state) {
+            .init => {
+                // Try non-blocking accept first
+                if (self.listener.tryAccept()) |result| {
+                    self.state = .ready;
+                    return .{ .ready = result };
+                } else |err| {
+                    return .{ .err = err };
+                }
+
+                // Would block - set up waiter
+                self.stored_waker = ctx.getWaker().clone();
+                self.waiter.setWaker(@ptrCast(self), wakeCallback);
+
+                // Register waiter with listener
+                self.listener.mutex.lock();
+                self.listener.waiters.pushBack(&self.waiter);
+                self.listener.mutex.unlock();
+
+                self.state = .waiting;
+                return .pending;
+            },
+            .waiting => {
+                // Check if waiter was completed
+                if (self.waiter.isComplete()) {
+                    self.state = .ready;
+                    self.cleanupWaker();
+
+                    // Try to get the result
+                    if (self.listener.tryAccept()) |result| {
+                        return .{ .ready = result };
+                    } else |err| {
+                        return .{ .err = err };
+                    }
+                }
+
+                // Update waker if it changed (task migration)
+                if (self.stored_waker) |*old_waker| {
+                    const new_waker = ctx.getWaker();
+                    if (!old_waker.eql(new_waker)) {
+                        old_waker.deinit();
+                        self.stored_waker = new_waker.clone();
+                    }
+                }
+
+                return .pending;
+            },
+            .ready => {
+                // Already complete - try to get result
+                if (self.listener.tryAccept()) |result| {
+                    return .{ .ready = result };
+                } else |err| {
+                    return .{ .err = err };
+                }
+            },
+        }
+    }
+
+    fn wakeCallback(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.stored_waker) |*w| {
+            w.wakeByRef();
+        }
+    }
+
+    fn cleanupWaker(self: *Self) void {
+        if (self.stored_waker) |*w| {
+            w.deinit();
+            self.stored_waker = null;
+        }
+    }
+
+    /// Cancel the accept operation.
+    pub fn cancel(self: *Self) void {
+        self.listener.cancelAccept(&self.waiter);
+        self.cleanupWaker();
     }
 };
 
@@ -183,16 +303,9 @@ pub const UnixListener = struct {
         };
     }
 
-    /// Accept a connection (blocking).
-    pub fn accept(self: *Self) !AcceptResult {
-        while (true) {
-            if (try self.tryAccept()) |result| {
-                return result;
-            }
-            // In a real async context, we'd yield here
-            // For blocking, we just spin (not ideal but works)
-            std.Thread.yield();
-        }
+    /// Return a Future for async accept.
+    pub fn accept(self: *Self) AcceptFuture {
+        return AcceptFuture.init(self);
     }
 
     /// Async accept with waiter pattern.

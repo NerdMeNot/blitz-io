@@ -253,7 +253,7 @@ fn benchNotifyOne() u64 {
     for (0..OPS_PER_ITERATION) |_| {
         notify.notifyOne();
         var waiter = NotifyWaiter.init();
-        _ = notify.wait(&waiter);
+        _ = notify.waitWith(&waiter);
     }
 
     return @intCast(std.time.nanoTimestamp() - start);

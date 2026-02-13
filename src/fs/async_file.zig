@@ -48,13 +48,13 @@ const posix = std.posix;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-const backend_mod = @import("../backend.zig");
+const backend_mod = @import("../internal/backend.zig");
 const Backend = backend_mod.Backend;
 const BackendType = backend_mod.BackendType;
 const Operation = backend_mod.completion.Operation;
 const Completion = backend_mod.completion.Completion;
 
-const blocking_mod = @import("../blocking.zig");
+const blocking_mod = @import("../internal/blocking.zig");
 const BlockingPool = blocking_mod.BlockingPool;
 
 const runtime_mod = @import("../runtime.zig");
@@ -63,7 +63,7 @@ const Runtime = runtime_mod.Runtime;
 const OpenOptions = @import("open_options.zig").OpenOptions;
 const Metadata = @import("metadata.zig").Metadata;
 const Permissions = @import("metadata.zig").Permissions;
-const io = @import("../io.zig");
+const io = @import("../stream.zig");
 
 /// Async file handle that uses the runtime's I/O backend.
 pub const AsyncFile = struct {

@@ -40,7 +40,7 @@ const builtin = @import("builtin");
 const OpenOptions = @import("open_options.zig").OpenOptions;
 const Metadata = @import("metadata.zig").Metadata;
 const Permissions = @import("metadata.zig").Permissions;
-const io = @import("../io.zig");
+const io = @import("../stream.zig");
 
 /// A handle to an open file.
 pub const File = struct {

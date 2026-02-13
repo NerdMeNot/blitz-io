@@ -39,8 +39,6 @@
 //!     std.debug.print("{s}\n", .{line});
 //! }
 //! ```
-//!
-//! Reference: tokio/src/io/util/mod.rs
 
 // Buffered I/O
 pub const buf_reader = @import("buf_reader.zig");

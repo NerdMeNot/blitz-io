@@ -19,8 +19,6 @@
 //! // Send
 //! try socket.sendTo("Hello!", try unix.UnixAddr.fromPath("/tmp/other.sock"));
 //! ```
-//!
-//! Reference: tokio/src/net/unix/datagram/socket.rs
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,13 +27,14 @@ const posix = std.posix;
 const stream_mod = @import("stream.zig");
 const UnixAddr = stream_mod.UnixAddr;
 
-const LinkedList = @import("../../util/linked_list.zig").LinkedList;
-const Pointers = @import("../../util/linked_list.zig").Pointers;
+const LinkedList = @import("../../internal/util/linked_list.zig").LinkedList;
+const Pointers = @import("../../internal/util/linked_list.zig").Pointers;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Function pointer type for waking a suspended task.
 pub const WakerFn = *const fn (*anyopaque) void;
 
 pub const DatagramWaiter = struct {

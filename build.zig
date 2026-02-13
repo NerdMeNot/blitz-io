@@ -30,20 +30,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // Backend tests
-    const backend_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/backend.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const backend_tests = b.addTest(.{
-        .root_module = backend_test_mod,
-    });
-
-    const run_backend_tests = b.addRunArtifact(backend_tests);
-    test_step.dependOn(&run_backend_tests.step);
-
     // ========================================================================
     // Test Configuration (shared between test suites)
     // ========================================================================
@@ -53,174 +39,71 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // ========================================================================
-    // Integration Tests (tests/ directory)
-    // ========================================================================
-    const integration_step = b.step("test-integration", "Run integration tests");
-
-    inline for (.{
-        "tests/integration/scope_test.zig",
-        "tests/integration/runtime_test.zig",
-        "tests/integration/tcp_integration_test.zig",
-        "tests/integration/patterns_test.zig",
-    }) |test_file| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(test_file),
-            .target = target,
-            .optimize = optimize,
-        });
-        mod.addImport("blitz-io", blitz_io_mod);
-        mod.addImport("test_config", test_config_mod);
-
-        const t = b.addTest(.{ .root_module = mod });
-        integration_step.dependOn(&b.addRunArtifact(t).step);
-    }
+    // Common test utilities module
+    const common_mod = b.addModule("common", .{
+        .root_source_file = b.path("tests/common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // ========================================================================
     // Stress Tests
     // ========================================================================
     const stress_step = b.step("test-stress", "Run stress tests");
 
-    inline for (.{
-        "tests/stress/scope_stress_test.zig",
-        "tests/stress/channel_stress_test.zig",
-        "tests/stress/mutex_stress_test.zig",
-        "tests/stress/semaphore_stress_test.zig",
-        "tests/stress/rwlock_stress_test.zig",
-        "tests/stress/barrier_stress_test.zig",
-        "tests/stress/broadcast_stress_test.zig",
-        "tests/stress/notify_stress_test.zig",
-        "tests/stress/oneshot_stress_test.zig",
-        "tests/stress/watch_stress_test.zig",
-        "tests/stress/once_cell_stress_test.zig",
-        "tests/stress/io_stress_test.zig",
-        "tests/stress/concurrent_patterns_stress_test.zig",
-    }) |test_file| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(test_file),
-            .target = target,
-            .optimize = optimize,
-        });
-        mod.addImport("blitz-io", blitz_io_mod);
-        mod.addImport("test_config", test_config_mod);
+    const stress_mod = b.createModule(.{
+        .root_source_file = b.path("tests/stress/all.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    stress_mod.addImport("blitz-io", blitz_io_mod);
+    stress_mod.addImport("test_config", test_config_mod);
+    stress_mod.addImport("common", common_mod);
 
-        const t = b.addTest(.{ .root_module = mod });
-        stress_step.dependOn(&b.addRunArtifact(t).step);
-    }
+    const stress_tests = b.addTest(.{ .root_module = stress_mod });
+    stress_step.dependOn(&b.addRunArtifact(stress_tests).step);
 
     // ========================================================================
     // Robustness Tests
     // ========================================================================
     const robustness_step = b.step("test-robustness", "Run robustness tests");
 
-    inline for (.{
-        "tests/robustness/scope_robustness_test.zig",
-        "tests/robustness/address_robustness_test.zig",
-    }) |test_file| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(test_file),
-            .target = target,
-            .optimize = optimize,
-        });
-        mod.addImport("blitz-io", blitz_io_mod);
-        mod.addImport("test_config", test_config_mod);
+    const robustness_mod = b.createModule(.{
+        .root_source_file = b.path("tests/robustness/all.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    robustness_mod.addImport("blitz-io", blitz_io_mod);
+    robustness_mod.addImport("test_config", test_config_mod);
+    robustness_mod.addImport("common", common_mod);
 
-        const t = b.addTest(.{ .root_module = mod });
-        robustness_step.dependOn(&b.addRunArtifact(t).step);
-    }
+    const robustness_tests = b.addTest(.{ .root_module = robustness_mod });
+    robustness_step.dependOn(&b.addRunArtifact(robustness_tests).step);
 
     // ========================================================================
-    // Fuzz Tests
-    // ========================================================================
-    const fuzz_step = b.step("test-fuzz", "Run fuzz tests");
-
-    inline for (.{
-        "tests/fuzz/address_fuzz_test.zig",
-    }) |test_file| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(test_file),
-            .target = target,
-            .optimize = optimize,
-        });
-        mod.addImport("blitz-io", blitz_io_mod);
-
-        const t = b.addTest(.{ .root_module = mod });
-        fuzz_step.dependOn(&b.addRunArtifact(t).step);
-    }
-
-    // ========================================================================
-    // Concurrency Tests
+    // Concurrency Tests (Loom-style)
     // ========================================================================
     const concurrency_step = b.step("test-concurrency", "Run concurrency tests");
 
-    inline for (.{
-        "tests/concurrency/task_state_test.zig",
-        "tests/concurrency/work_steal_test.zig",
-    }) |test_file| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(test_file),
-            .target = target,
-            .optimize = optimize,
-        });
-        mod.addImport("blitz-io", blitz_io_mod);
-
-        const t = b.addTest(.{ .root_module = mod });
-        concurrency_step.dependOn(&b.addRunArtifact(t).step);
-    }
-
-    // Also add concurrency testing framework tests
-    const concurrency_framework_mod = b.createModule(.{
-        .root_source_file = b.path("src/test/concurrency.zig"),
+    const concurrency_mod = b.createModule(.{
+        .root_source_file = b.path("tests/concurrency/all.zig"),
         .target = target,
         .optimize = optimize,
     });
+    concurrency_mod.addImport("blitz-io", blitz_io_mod);
+    concurrency_mod.addImport("test_config", test_config_mod);
+    concurrency_mod.addImport("common", common_mod);
 
-    const concurrency_framework_tests = b.addTest(.{
-        .root_module = concurrency_framework_mod,
-    });
-    concurrency_step.dependOn(&b.addRunArtifact(concurrency_framework_tests).step);
-
-    // Atomic log tests
-    const atomic_log_mod = b.createModule(.{
-        .root_source_file = b.path("src/test/atomic_log.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const atomic_log_tests = b.addTest(.{
-        .root_module = atomic_log_mod,
-    });
-    concurrency_step.dependOn(&b.addRunArtifact(atomic_log_tests).step);
-
-    // ========================================================================
-    // Interop Tests
-    // ========================================================================
-    const interop_step = b.step("test-interop", "Run interoperability tests");
-
-    inline for (.{
-        "tests/interop/tcp_interop_test.zig",
-    }) |test_file| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(test_file),
-            .target = target,
-            .optimize = optimize,
-        });
-        mod.addImport("blitz-io", blitz_io_mod);
-
-        const t = b.addTest(.{ .root_module = mod });
-        interop_step.dependOn(&b.addRunArtifact(t).step);
-    }
+    const concurrency_tests = b.addTest(.{ .root_module = concurrency_mod });
+    concurrency_step.dependOn(&b.addRunArtifact(concurrency_tests).step);
 
     // ========================================================================
     // All Tests
     // ========================================================================
     const test_all_step = b.step("test-all", "Run all tests");
     test_all_step.dependOn(test_step);
-    test_all_step.dependOn(integration_step);
     test_all_step.dependOn(stress_step);
     test_all_step.dependOn(robustness_step);
-    test_all_step.dependOn(fuzz_step);
-    test_all_step.dependOn(interop_step);
     test_all_step.dependOn(concurrency_step);
 
     // ========================================================================
@@ -344,7 +227,7 @@ pub fn build(b: *std.Build) void {
     // Benchmarks
     // ========================================================================
     const bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/bench.zig"),
+        .root_source_file = b.path("bench/blitz_bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -367,6 +250,44 @@ pub fn build(b: *std.Build) void {
 
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    // MPMC test (temporary - for debugging scheduler wakeup bug)
+    const mpmc_mod = b.createModule(.{
+        .root_source_file = b.path("bench/mpmc_test.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    mpmc_mod.addImport("blitz-io", blitz_io_mod);
+    const mpmc_exe = b.addExecutable(.{
+        .name = "mpmc_test",
+        .root_module = mpmc_mod,
+    });
+    const run_mpmc = b.addRunArtifact(mpmc_exe);
+    const mpmc_step = b.step("mpmc-test", "Run MPMC wakeup test");
+    mpmc_step.dependOn(&run_mpmc.step);
+
+    // Comparison benchmark (Blitz-IO vs Tokio)
+    const compare_mod = b.createModule(.{
+        .root_source_file = b.path("bench/compare.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    const compare_exe = b.addExecutable(.{
+        .name = "compare",
+        .root_module = compare_mod,
+    });
+
+    const install_compare = b.addInstallArtifact(compare_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "bench" } },
+    });
+
+    const run_compare = b.addRunArtifact(compare_exe);
+    run_compare.step.dependOn(&install_compare.step);
+    run_compare.step.dependOn(&install_bench.step); // Ensure blitz_bench is built first
+
+    const compare_step = b.step("compare", "Run Blitz-IO vs Tokio comparison benchmark");
+    compare_step.dependOn(&run_compare.step);
 
     // ========================================================================
     // Documentation

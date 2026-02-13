@@ -13,8 +13,6 @@
 //! // Copy with custom buffer size
 //! const bytes = try io.copyBuf(source_reader, dest_writer, &buffer);
 //! ```
-//!
-//! Reference: tokio/src/io/util/copy.rs
 
 const std = @import("std");
 

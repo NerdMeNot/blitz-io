@@ -15,8 +15,6 @@
 //!     std.debug.print("{s}\n", .{line});
 //! }
 //! ```
-//!
-//! Reference: tokio/src/io/util/buf_reader.rs
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
