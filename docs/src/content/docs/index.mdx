@@ -1,26 +1,15 @@
 ---
 title: Introduction
 description: blitz-io is a high-performance async I/O runtime for Zig, inspired by Tokio. Lightweight tasks, serious throughput.
-template: splash
-hero:
-  tagline: Tokio-style async I/O for Zig. Lightweight tasks, serious throughput.
-  actions:
-    - text: Get Started
-      link: /getting-started/installation/
-      icon: right-arrow
-      variant: primary
-    - text: View on GitHub
-      link: https://github.com/NerdMeNot/blitz-io
-      icon: external
 ---
 
 import { Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
 
-## What is blitz-io?
-
-blitz-io is a **production-grade async I/O runtime** for Zig. It provides a work-stealing scheduler, zero-allocation synchronization primitives, structured channels, networking, and timers -- everything needed to build high-concurrency servers and services.
+**blitz-io** is a production-grade async I/O runtime for Zig. It provides a work-stealing scheduler, zero-allocation synchronization primitives, structured channels, networking, and timers -- everything needed to build high-concurrency servers and services.
 
 It is the I/O counterpart to [Blitz](https://github.com/NerdMeNot/blitz) (CPU parallelism), analogous to how Tokio complements Rayon in the Rust ecosystem.
+
+## Quick Example
 
 ```zig
 const io = @import("blitz-io");
@@ -48,8 +37,6 @@ fn echo(stream: io.net.TcpStream) void {
     }
 }
 ```
-
----
 
 ## Key Features
 
@@ -79,8 +66,6 @@ fn echo(stream: io.net.TcpStream) void {
   </Card>
 </CardGrid>
 
----
-
 ## Why blitz-io?
 
 ### Compared to Other Zig Async Options
@@ -95,10 +80,6 @@ fn echo(stream: io.net.TcpStream) void {
 | Blocking pool | Yes (auto-scaling, 512 threads) | No | Manual | TBD |
 | Graceful shutdown | Built-in signal handling | Cancellation support | Manual | TBD |
 | Coroutine model | Stackless (~256-512 B/task) | Stackful (growable stacks) | N/A | TBD |
-
-### Battle-Tested Design
-
-blitz-io's architecture is ported from Tokio, the Rust async runtime with years of production edge-case fixes. Every scheduler optimization, every synchronization primitive, every platform-specific workaround has been studied and adapted for Zig's semantics.
 
 ### Two-Tier API
 
@@ -117,27 +98,6 @@ const handle = try io.task.spawnFuture(lock_future);
 ```
 
 This lets you choose the right tool: `tryX()` for hot paths where blocking is unacceptable, and the Future-based API when you can yield to the scheduler.
-
----
-
-## Module Overview
-
-| Module | Description |
-|--------|-------------|
-| `io.task` | Task spawning: `spawn`, `spawnFuture`, `spawnBlocking`, `joinAll`, `race`, `select` |
-| `io.sync` | Synchronization: Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell |
-| `io.channel` | Message passing: Channel, Oneshot, Broadcast, Watch, Selector |
-| `io.net` | Networking: TCP, UDP, Unix sockets, DNS resolution |
-| `io.fs` | Filesystem operations |
-| `io.stream` | I/O streams: Reader, Writer, buffered I/O |
-| `io.time` | Duration, Instant, Sleep, Interval, Deadline |
-| `io.signal` | Signal handling (SIGINT, SIGTERM) |
-| `io.process` | Process spawning and piped I/O |
-| `io.shutdown` | Graceful shutdown coordination |
-| `io.async_ops` | Future combinators: Timeout, Select2, Join2, Race |
-| `io.future` | Low-level future types: Poll, Waker, Context, Compose |
-
----
 
 ## Benchmark Highlights
 
@@ -177,47 +137,22 @@ All measurements on Apple M3, nanoseconds per operation.
 
 **Overall: blitz-io wins 14/18 benchmarks.** Memory efficiency: 50 B/op average vs Tokio's 1348 B/op -- **27x less memory** per operation.
 
----
+## Module Overview
 
-## Architecture at a Glance
-
-```
-+------------------------------------------------------------------+
-|                       User Application                           |
-|             io.run(fn) / Runtime.init() + rt.run()               |
-+------------------------------------------------------------------+
-                              |
-+------------------------------------------------------------------+
-|                        Public API                                |
-|  io.task    io.sync    io.channel    io.net    io.fs    io.time  |
-|  io.signal  io.process io.shutdown   io.stream io.async_ops     |
-+------------------------------------------------------------------+
-                              |
-+------------------------------------------------------------------+
-|                     Runtime Core                                 |
-|  +------------------+  +---------------+  +------------------+   |
-|  |    Scheduler     |  |   I/O Driver  |  |   Timer Wheel    |   |
-|  | - LIFO slot      |  | - Submit ops  |  | - Hierarchical   |   |
-|  | - Local queue    |  | - Poll events |  | - Tick-based     |   |
-|  |   (256-slot ring)|  | - Complete    |  | - Cancel support |   |
-|  | - Global inject  |  +---------------+  +------------------+   |
-|  | - Work stealing  |                                            |
-|  | - Coop budget    |  +--------------------------------------+  |
-|  |   (128 polls)    |  |          Blocking Pool               |  |
-|  +------------------+  |  Auto-scaling up to 512 threads      |  |
-|                        +--------------------------------------+  |
-+------------------------------------------------------------------+
-                              |
-+------------------------------------------------------------------+
-|                    Platform Backend                               |
-|  +----------+  +----------+  +----------+  +----------+         |
-|  | io_uring |  |  kqueue  |  |   IOCP   |  |  epoll   |         |
-|  | (Linux)  |  | (macOS)  |  | (Windows)|  |(fallback)|         |
-|  +----------+  +----------+  +----------+  +----------+         |
-+------------------------------------------------------------------+
-```
-
----
+| Module | Description |
+|--------|-------------|
+| `io.task` | Task spawning: `spawn`, `spawnFuture`, `spawnBlocking`, `joinAll`, `race`, `select` |
+| `io.sync` | Synchronization: Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell |
+| `io.channel` | Message passing: Channel, Oneshot, Broadcast, Watch, Selector |
+| `io.net` | Networking: TCP, UDP, Unix sockets, DNS resolution |
+| `io.fs` | Filesystem operations |
+| `io.stream` | I/O streams: Reader, Writer, buffered I/O |
+| `io.time` | Duration, Instant, Sleep, Interval, Deadline |
+| `io.signal` | Signal handling (SIGINT, SIGTERM) |
+| `io.process` | Process spawning and piped I/O |
+| `io.shutdown` | Graceful shutdown coordination |
+| `io.async_ops` | Future combinators: Timeout, Select2, Join2, Race |
+| `io.future` | Low-level future types: Poll, Waker, Context, Compose |
 
 ## Next Steps
 
