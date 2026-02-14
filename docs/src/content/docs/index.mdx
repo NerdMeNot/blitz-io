@@ -61,8 +61,8 @@ fn echo(stream: io.net.TcpStream) void {
     Nanosecond-precision Duration and Instant types. Hierarchical timer wheel, async Sleep, recurring Interval, and Deadline/Timeout combinators.
   </Card>
 
-  <Card title="Stackless Futures" icon="seti:zig">
-    Each task is a state machine at ~256-512 bytes, not a full coroutine stack at 16-64KB. This enables millions of concurrent tasks with predictable memory usage.
+  <Card title="Stackless by Choice" icon="seti:zig">
+    Each task is a compiler-generated state machine at ~256-512 bytes, not a full coroutine stack (16-64KB). Stackful coroutines offer nicer ergonomics, but stackless wins where it counts: predictable memory, cache-friendly layout, and millions of concurrent tasks without blowing through RAM. Same tradeoff Tokio made -- we side with Tokio.
   </Card>
 </CardGrid>
 
@@ -79,7 +79,7 @@ fn echo(stream: io.net.TcpStream) void {
 | Cooperative budgeting | Yes (128 polls/tick) | No | N/A | TBD |
 | Blocking pool | Yes (auto-scaling, 512 threads) | No | Manual | TBD |
 | Graceful shutdown | Built-in signal handling | Cancellation support | Manual | TBD |
-| Coroutine model | Stackless (~256-512 B/task) | Stackful (growable stacks) | N/A | TBD |
+| Coroutine model | Stackless by choice (~256-512 B/task) | Stackful (growable stacks) | N/A | TBD |
 
 ### Two-Tier API
 

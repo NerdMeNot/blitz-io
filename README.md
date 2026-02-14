@@ -417,7 +417,7 @@ Memory efficiency: blitz-io averages **50.2 B/op** vs Tokio's **1347.6 B/op** --
 
 ### Key Design Decisions
 
-1. **Stackless futures**: Each task is a state machine (~256-512 bytes) rather than a full coroutine stack (16-64KB). This enables millions of concurrent tasks.
+1. **Stackless by choice**: blitz-io deliberately uses stackless futures -- each task is a compiler-generated state machine at ~256-512 bytes rather than a full coroutine stack (16-64KB). Stackful coroutines offer nicer ergonomics (suspend anywhere, natural call stacks), but stackless wins on the metrics that matter for a high-performance runtime: predictable memory (no stack growth surprises), cache-friendly layout, and the ability to run millions of concurrent tasks without blowing through memory. This is the same tradeoff Tokio and Go made in opposite directions -- we side with Tokio.
 
 2. **Tokio-style state machine**: Single 64-bit packed atomic with CAS transitions for task state. The `notified` bit is cleared atomically in `transitionToIdle`, returning previous state to detect missed wakeups.
 

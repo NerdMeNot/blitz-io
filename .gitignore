@@ -8,12 +8,13 @@ tokio/
 tigerbeetle/
 zio/
 
-# Test and benchmark binaries
+# Test and benchmark binaries (Mach-O / ELF executables)
 test_bounded
 blitz_bench_test
 mpmc_test
+*.exe
 
-# Rust build artifacts
+# Rust build artifacts (entire target directory)
 bench/rust_bench/target/
 
 # Editor/IDE
@@ -22,12 +23,13 @@ bench/rust_bench/target/
 *.swp
 *.swo
 *~
-.DS_Store
 
 # Coverage
 coverage/
 *.gcda
 *.gcno
+*.profraw
+*.profdata
 
 # Logs
 *.log
@@ -35,6 +37,7 @@ coverage/
 # Local development
 .env
 .env.local
+.env.*
 
 # Temporary files
 *.tmp
@@ -44,9 +47,23 @@ coverage/
 docs/node_modules/
 docs/dist/
 docs/.astro/
+docs/bun.lock
 
-# Benchmark results (keep committed ones in benchmarks/)
+# Benchmark results (keep committed ones in bench/)
 bench-results/
 
 # OS files
+.DS_Store
 Thumbs.db
+Desktop.ini
+._*
+
+# Debug info
+*.dSYM/
+*.pdb
+*.ilk
+
+# Archives (shouldn't be committed)
+*.tar.gz
+*.zip
+*.7z
