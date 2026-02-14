@@ -81,23 +81,24 @@ fn echo(stream: io.net.TcpStream) void {
 | Graceful shutdown | Built-in signal handling | Cancellation support | Manual | TBD |
 | Coroutine model | Stackless by choice (~256-512 B/task) | Stackful (growable stacks) | N/A | TBD |
 
-### Two-Tier API
+### Two-Tier API -- Use Without a Runtime
 
-Every async primitive provides two access patterns:
+Every async primitive provides two access patterns, and they have different runtime requirements:
 
 ```zig
-// Non-blocking: returns immediately
+// Tier 1: No runtime needed -- works anywhere, even in main()
+var mutex = io.sync.Mutex.init();
 if (mutex.tryLock()) {
     defer mutex.unlock();
     // critical section
 }
 
-// Async: returns a Future for the scheduler
+// Tier 2: Requires the runtime (io.run or Runtime.init)
 var lock_future = mutex.lock();
 const handle = try io.task.spawnFuture(lock_future);
 ```
 
-This lets you choose the right tool: `tryX()` for hot paths where blocking is unacceptable, and the Future-based API when you can yield to the scheduler.
+The `tryX()` tier (`tryLock`, `tryAcquire`, `trySend`, `tryRecv`) and all filesystem/networking operations work without starting a runtime. Use them in CLI tools, scripts, or libraries that don't need async. The Future-based tier (`lock()`, `acquire()`, `task.spawn()`) requires the runtime and panics without one. See [Basic Concepts](/getting-started/basic-concepts/) for the full breakdown.
 
 ## Benchmark Highlights
 

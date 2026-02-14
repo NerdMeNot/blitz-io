@@ -3,7 +3,11 @@ title: Runtime
 description: Creating and configuring the blitz-io runtime, spawning tasks, and managing the application lifecycle.
 ---
 
-The `Runtime` is the entry point for every blitz-io application. It owns the work-stealing scheduler, the blocking thread pool, and the I/O driver. All async tasks execute within the context of a runtime.
+The `Runtime` is the engine that drives Future-based async tasks to completion. It owns the work-stealing scheduler, the blocking thread pool, and the I/O driver.
+
+:::note[Not everything needs the runtime]
+The `tryX()` APIs (`tryLock`, `tryAcquire`, `trySend`, `tryRecv`) and all synchronous filesystem/networking operations work **without** a runtime. You only need the runtime for Future-based APIs (`lock()`, `acquire()`, `task.spawn()`), async file I/O, and signal handling. Calling a runtime-dependent API outside of a runtime panics with `"Not running inside a blitz-io runtime"`. See [Basic Concepts](/getting-started/basic-concepts/) for the full breakdown.
+:::
 
 ## Zero-config entry point
 

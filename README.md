@@ -427,7 +427,7 @@ Memory efficiency: blitz-io averages **50.2 B/op** vs Tokio's **1347.6 B/op** --
 
 5. **Zero-allocation waiters**: Waiter structs are embedded directly in `LockFuture`/`AcquireFuture` types. No heap allocation per contended wait.
 
-6. **Two-tier API**: Every sync primitive and channel offers `tryX()` (non-blocking, returns immediately) and `x()` (returns a Future for the scheduler). Use the right tier for your context.
+6. **Two-tier API**: Every sync primitive and channel offers `tryX()` (non-blocking, returns immediately) and `x()` (returns a Future for the scheduler). The `tryX()` tier works **without** a runtime -- you can use `tryLock()`, `trySend()`, `tryRecv()`, and all filesystem/networking operations in plain code without ever calling `io.run()`. The Future-based tier (`lock()`, `acquire()`, `task.spawn()`) requires the runtime and will panic if called outside one. See [Basic Concepts](https://nerdmenot.github.io/blitz-io/getting-started/basic-concepts/) for the full breakdown.
 
 ## Best Practices
 

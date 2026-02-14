@@ -388,42 +388,91 @@ const handle = try io.task.spawn(fetchUser, .{id});
 
 ## The Two-Tier API Pattern
 
-Every sync primitive and channel in blitz-io provides two tiers:
+Every sync primitive and channel in blitz-io provides two tiers. Understanding the difference is critical because **they have different runtime requirements**.
 
-### Tier 1: `tryX()` -- Non-Blocking
+### Tier 1: `tryX()` -- No Runtime Required
 
-Returns immediately. Use when you can handle failure without yielding.
+These are pure atomic/lock-free operations that work anywhere -- in `main()`, in a plain thread, in a library, without ever starting a runtime. They return immediately with a success/failure result.
 
 ```zig
-// Non-blocking lock attempt
-if (mutex.tryLock()) {
-    defer mutex.unlock();
-    // critical section
-} else {
-    // Lock is held, do something else
-}
+const io = @import("blitz-io");
 
-// Non-blocking channel receive
-switch (ch.tryRecv()) {
-    .ok => |item| processItem(item),
-    .empty => {}, // No data available
-    .closed => break,
+pub fn main() !void {
+    // No io.run(), no Runtime.init() -- just plain code.
+
+    var mutex = io.sync.Mutex.init();
+    if (mutex.tryLock()) {
+        defer mutex.unlock();
+        // critical section
+    }
+
+    var sem = io.sync.Semaphore.init(3);
+    if (sem.tryAcquire(1)) {
+        defer sem.release(1);
+        // got permit
+    }
 }
 ```
 
-### Tier 2: `x()` -- Future-Based
-
-Returns a Future that can be spawned or polled. Use when you want to yield to the scheduler while waiting.
+Filesystem operations are also runtime-free -- they are synchronous wrappers around OS calls:
 
 ```zig
-// Async lock -- yields to scheduler if contended
-var lock_future = mutex.lock();
-const handle = try io.task.spawnFuture(lock_future);
-
-// Async channel send with backpressure
-var send_future = ch.send(item);
-const handle2 = try io.task.spawnFuture(send_future);
+// All of these work without a runtime
+const data = try io.fs.readFile(allocator, "config.json");
+try io.fs.writeFile("output.txt", "Hello!");
+var file = try io.fs.File.open("data.bin");
+defer file.close();
 ```
+
+Networking convenience functions (`net.listen`, `TcpStream.tryRead`, `UdpSocket.tryRecv`) also work without a runtime -- they are non-blocking OS socket operations.
+
+### Tier 2: `x()` -- Runtime Required
+
+These return a `Future` that must be driven by the scheduler. If you call these **outside** a runtime context, the program **panics** with:
+
+```
+Not running inside a blitz-io runtime
+```
+
+```zig
+const io = @import("blitz-io");
+
+pub fn main() !void {
+    try io.run(myApp); // Start the runtime first
+}
+
+fn myApp() void {
+    var mutex = io.sync.Mutex.init();
+
+    // Future-based lock -- yields to scheduler if contended
+    var lock_future = mutex.lock();
+    const handle = try io.task.spawnFuture(lock_future);
+
+    // task.spawn, task.sleep, task.joinAll -- all require the runtime
+    const h = try io.task.spawn(myFunc, .{});
+    io.task.sleep(io.time.Duration.fromSecs(1));
+}
+```
+
+### What Requires What
+
+| API | Runtime needed? | What happens without runtime? |
+|-----|----------------|-------------------------------|
+| `mutex.tryLock()`, `sem.tryAcquire()`, `rwlock.tryReadLock()` | No | Works fine |
+| `ch.trySend()`, `ch.tryRecv()` | No | Works fine |
+| `fs.readFile()`, `File.open()`, `readDir()` | No | Works fine (synchronous I/O) |
+| `net.listen()`, `stream.tryRead()`, `stream.writeAll()` | No | Works fine (blocking I/O) |
+| `Duration`, `Instant`, `Instant.now()` | No | Works fine (just time math) |
+| `Mutex.init()`, `Semaphore.init()`, `Channel.init()` | No | Works fine (just initialization) |
+| `mutex.lock()`, `sem.acquire()` (Future API) | **Yes** | Future returned, but panics when spawned without runtime |
+| `task.spawn()`, `task.spawnFuture()`, `task.spawnBlocking()` | **Yes** | **Panics**: "Not running inside a blitz-io runtime" |
+| `task.sleep()`, `task.joinAll()`, `task.race()` | **Yes** | **Panics** |
+| `fs.readFileAsync()`, `AsyncFile` | **Yes** | Requires runtime I/O backend |
+| `shutdown.Shutdown`, `signal.AsyncSignal` | **Yes** | Requires runtime for async waiting |
+
+:::tip[Rule of thumb]
+If the function name starts with `try` or is a standard file/socket operation, it works without a runtime. If it returns a `Future`, needs `task.spawn`, or has "async" in its name, it needs the runtime.
+:::
 
 ### Choosing the Right Tier
 
@@ -435,6 +484,8 @@ const handle2 = try io.task.spawnFuture(send_future);
 | Waiting for the next message | `recv()` (Future) |
 | Checking semaphore availability | `tryAcquire(n)` |
 | Rate limiting with backpressure | `acquire(n)` (Future) |
+| CLI tool, simple script | `tryX()` everywhere, no runtime needed |
+| Server handling many connections | Use the runtime + Future APIs |
 
 ---
 
